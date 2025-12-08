@@ -5,10 +5,10 @@ WORKDIR /app
 # Копируем файлы
 COPY . .
 
-# Установка зависимостей
+# Устанавливаем зависимости
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ВАЖНО: проброс переменных окружения из Railway
+# Пробрасываем переменные Railway внутрь контейнера
 ENV TG_API_ID=${TG_API_ID}
 ENV TG_API_HASH=${TG_API_HASH}
 ENV SESSION_NAME=${SESSION_NAME}
@@ -17,5 +17,4 @@ ENV YAGPT_API_KEY=${YAGPT_API_KEY}
 ENV YAGPT_FOLDER_ID=${YAGPT_FOLDER_ID}
 ENV LOG_LEVEL=${LOG_LEVEL}
 
-# Запуск
 CMD ["python", "samastroi_telethon.py"]
