@@ -1,20 +1,22 @@
 FROM python:3.11-slim
 
+# Чтобы Python не создавал .pyc и всё писал сразу в stdout
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Рабочая директория внутри контейнера
 WORKDIR /app
 
-# Копируем файлы
-COPY . .
-
-# Устанавливаем зависимости
+# Ставим зависимости
+COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Пробрасываем переменные Railway внутрь контейнера
-ENV TG_API_ID=${TG_API_ID}
-ENV TG_API_HASH=${TG_API_HASH}
-ENV SESSION_NAME=${SESSION_NAME}
-ENV ADMIN_ID=${ADMIN_ID}
-ENV YAGPT_API_KEY=${YAGPT_API_KEY}
-ENV YAGPT_FOLDER_ID=${YAGPT_FOLDER_ID}
-ENV LOG_LEVEL=${LOG_LEVEL}
+# На всякий случай создаём директории под данные/логи
+RUN mkdir -p /app/data /app/logs
 
+# Основные файлы бота
+COPY samastroi_telethon.py /app/
+COPY samastroi_telethon.session /app/
+
+# Старт команды
 CMD ["python", "samastroi_telethon.py"]
