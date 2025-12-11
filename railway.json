@@ -1,0 +1,46 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "dockerfile",
+    "dockerfilePath": "Dockerfile"
+  },
+  "startCommand": "python samastroi_scraper.py",
+  "variables": {
+    "YAGPT_API_KEY": {
+      "description": "API-ключ YandexGPT",
+      "required": true
+    },
+    "YAGPT_FOLDER_ID": {
+      "description": "Yandex Cloud folder id",
+      "required": true
+    },
+    "BOT_TOKEN": {
+      "description": "Telegram Bot Token (@BotFather)",
+      "required": true
+    },
+    "TARGET_CHAT_ID": {
+      "description": "ID группы или чата, куда отправлять карточки (например, -1001234567890)",
+      "required": true
+    },
+    "ADMIN_IDS": {
+      "description": "ID администраторов через запятую (например, 398960707,777464055)",
+      "required": false
+    },
+    "LOG_LEVEL": {
+      "description": "Уровень логов (DEBUG/INFO/WARNING/ERROR)",
+      "required": false
+    },
+    "SCAN_INTERVAL": {
+      "description": "Интервал между сканированиями каналов, секунд",
+      "required": false
+    },
+    "TELECOM_LOCATOR_BASE_URL": {
+      "description": "Базовый URL сервиса telecom-locator",
+      "required": false
+    },
+    "TELECOM_LOCATOR_API_KEY": {
+      "description": "API-ключ для telecom-locator",
+      "required": false
+    }
+  }
+}
