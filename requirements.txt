@@ -1,5 +1,0 @@
-telethon
-python-dotenv
-httpx
-requests
-loguru
