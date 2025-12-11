@@ -2,108 +2,383 @@ import asyncio
 import json
 import os
 import re
+from dataclasses import dataclass, asdict
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from loguru import logger
+from urllib.parse import quote_plus
 
-# ---------------------------------------------------------------------
-#  ЗАГРУЗКА .env и БАЗОВЫЕ ПУТИ
-# ---------------------------------------------------------------------
+# ------------------ ЗАГРУЗКА НАСТРОЕК (.env) ------------------ #
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-LOGS_DIR = BASE_DIR / "logs"
-ONZS_DIR = DATA_DIR / "onzs"
+BASE_DIR = os.path.dirname(__file__)
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+load_dotenv(ENV_PATH)
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-ONZS_DIR.mkdir(parents=True, exist_ok=True)
+# Telegram Bot API
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0") or "0")
 
-load_dotenv(BASE_DIR / ".env")
+# Администраторы (для /risk и служебных команд)
+ADMIN_IDS: List[int] = []
+_raw_admin_ids = os.getenv("ADMIN_IDS", "").strip()
+if _raw_admin_ids:
+    for part in _raw_admin_ids.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ADMIN_IDS.append(int(part))
+        except ValueError:
+            logger.warning(f"Не могу распарсить ADMIN_ID '{part}'")
 
-# ---------------------------------------------------------------------
-#  КОНФИГ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
-# ---------------------------------------------------------------------
-
+# YandexGPT настройки
 YAGPT_API_KEY = os.getenv("YAGPT_API_KEY", "").strip()
 YAGPT_FOLDER_ID = os.getenv("YAGPT_FOLDER_ID", "").strip()
 
+# Яндекс Геокодер (для адрес -> координаты)
+YANDEX_GEOCODER_KEY = os.getenv("YANDEX_GEOCODER_KEY", "").strip()
+
+# Уровень логирования
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-TELECOM_LOCATOR_BASE_URL = os.getenv("TELECOM_LOCATOR_BASE_URL", "").strip()
-TELECOM_LOCATOR_API_KEY = os.getenv("TELECOM_LOCATOR_API_KEY", "").strip()
+# Порог вероятности самостроя по умолчанию
+DEFAULT_MIN_RISK_PROBABILITY = int(os.getenv("MIN_RISK_PROBABILITY", "10") or "10")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0") or "0")
-NEWS_THREAD_ID = int(os.getenv("NEWS_THREAD_ID", "0") or "0")
+# Настройки Telethon для работы с @rs_search_bot
+TG_API_ID = int(os.getenv("TG_API_ID", "0") or "0")
+TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
+SESSION_NAME = os.getenv("SESSION_NAME", "samastroi_rs_session").strip()
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "600") or "600")
+# ID бота Росреестра
+RS_SEARCH_BOT = "rs_search_bot"  # @rs_search_bot
 
-# Список админов для обучения (через запятую: ADMIN_IDS=111,222,333)
-ADMIN_IDS_ENV = os.getenv("ADMIN_IDS", "").strip()
-if ADMIN_IDS_ENV:
-    ADMIN_IDS: Set[int] = {
-        int(x)
-        for x in ADMIN_IDS_ENV.replace(" ", "").split(",")
-        if x
-    }
-else:
-    ADMIN_IDS = set()  # пусто → обучать могут все
+# ------------------ ДИРЕКТОРИИ И ФАЙЛЫ ------------------ #
 
-TELEGRAM_API_URL = (
-    f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
-)
+DATA_DIR = os.path.join(BASE_DIR, "data")
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
 
-# ---------------------------------------------------------------------
-#  ЛОГИРОВАНИЕ
-# ---------------------------------------------------------------------
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+GROUPS_FILE = os.path.join(DATA_DIR, "groups.txt")
+KEYWORDS_FILE = os.path.join(DATA_DIR, "keywords.txt")
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+MONITORING_LOG = os.path.join(DATA_DIR, "monitoring.log")
+ANALYTICS_LOG = os.path.join(DATA_DIR, "analytics.log")
+YAGPT_DATASET = os.path.join(DATA_DIR, "yagpt_dataset.jsonl")
+NEWS_FILE = os.path.join(DATA_DIR, "news.jsonl")
+ONZS_DIR = os.path.join(DATA_DIR, "onzs")
+os.makedirs(ONZS_DIR, exist_ok=True)
+
+# ------------------ ЛОГИ ------------------ #
 
 logger.remove()
 logger.add(
-    LOGS_DIR / "samastroi_scraper.log",
+    os.path.join(LOGS_DIR, "scraper.log"),
     rotation="10 MB",
     encoding="utf-8",
     level=LOG_LEVEL,
 )
 logger.add(lambda m: print(m, end=""), level=LOG_LEVEL)
 
-# ---------------------------------------------------------------------
-#  ФАЙЛЫ ДАННЫХ
-# ---------------------------------------------------------------------
 
-GROUPS_FILE = DATA_DIR / "groups.txt"
-KEYWORDS_FILE = DATA_DIR / "keywords.txt"
-STATE_FILE = DATA_DIR / "state.json"
-CARDS_FILE = DATA_DIR / "cards.jsonl"
-YAGPT_DATASET_FILE = DATA_DIR / "yagpt_dataset.jsonl"
-SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
-MONITORING_LOG = DATA_DIR / "monitoring.log"
-ANALYTICS_LOG = DATA_DIR / "analytics.log"
+def ensure_file(path: str, default: str = ""):
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(default)
 
-for path, default in [
-    (GROUPS_FILE, "# @username каналов/чатов, по одному в строке\n"),
+
+for fpath, default in [
+    (GROUPS_FILE, "# @username каналов, по одному в строке\n@podmoskow\n"),
     (
         KEYWORDS_FILE,
-        "самострой\nстройка\nстроительство\nстройплощадка\nнадзор\nзастройщик\nразрешение на строительство\nввод в эксплуатацию\n",
+        "самострой\nстройка\nстроительство\nнадзор\nштраф\nразрешение на строительство\nразрешение на ввод\nучасток\nземельный участок\n",
     ),
-    (STATE_FILE, "{}"),
-    (CARDS_FILE, ""),
-    (YAGPT_DATASET_FILE, ""),
-    (SUBSCRIBERS_FILE, "[]"),
     (MONITORING_LOG, ""),
     (ANALYTICS_LOG, ""),
+    (YAGPT_DATASET, ""),
+    (NEWS_FILE, ""),
 ]:
-    if not path.exists():
-        path.write_text(default, encoding="utf-8")
+    ensure_file(fpath, default)
 
-# ---------------------------------------------------------------------
-#  ОНЗС: СПРАВОЧНИК
-# ---------------------------------------------------------------------
+
+def read_lines(path: str) -> List[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        return [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+
+
+def append_line(path: str, text: str):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"[{now}] {text}\n")
+
+
+def append_jsonl(path: str, obj: dict):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+# ------------------ СОСТОЯНИЕ (state.json) ------------------ #
+
+
+@dataclass
+class BotState:
+    last_post_ids: Dict[str, int]
+    user_subscriptions: Dict[str, List[int]]  # user_id -> [1..12]
+    user_paused: Dict[str, bool]
+    min_risk_probability: int
+
+    @staticmethod
+    def default() -> "BotState":
+        return BotState(
+            last_post_ids={},
+            user_subscriptions={},
+            user_paused={},
+            min_risk_probability=DEFAULT_MIN_RISK_PROBABILITY,
+        )
+
+
+def load_state() -> BotState:
+    if not os.path.exists(STATE_FILE):
+        return BotState.default()
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return BotState(
+            last_post_ids=data.get("last_post_ids", {}),
+            user_subscriptions=data.get("user_subscriptions", {}),
+            user_paused=data.get("user_paused", {}),
+            min_risk_probability=int(
+                data.get("min_risk_probability", DEFAULT_MIN_RISK_PROBABILITY)
+            ),
+        )
+    except Exception as e:
+        logger.error(f"Ошибка чтения {STATE_FILE}: {e}")
+        return BotState.default()
+
+
+def save_state(state: BotState):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(asdict(state), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка записи {STATE_FILE}: {e}")
+
+
+STATE = load_state()
+
+# ------------------ YANDEX GPT ------------------ #
+
+YAGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+
+
+async def call_yandex_gpt_json(prompt: str, temperature: float = 0.2) -> Optional[Dict[str, Any]]:
+    """
+    Вызывает YandexGPT и пытается распарсить JSON из ответа (внутри ```json ... ```).
+    Ожидаемый формат:
+    {
+      "object_type": "...",
+      "violation_type": "...",
+      "address": "...",
+      "okrug_city": "...",
+      "cadastral_number": "...",
+      "risk_probability": 0-100,
+      "risk_score": 0-100,
+      "risk_level": "низкий/средний/высокий",
+      "summary": "..."
+    }
+    """
+    if not (YAGPT_API_KEY and YAGPT_FOLDER_ID):
+        logger.warning("YAGPT не настроен (нет API_KEY или FOLDER_ID).")
+        return None
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Api-Key {YAGPT_API_KEY}",
+        "x-folder-id": YAGPT_FOLDER_ID,
+    }
+
+    system_prompt = (
+        "Ты помощник инспектора Главгосстройнадзора Московской области. "
+        "По тексту сообщения из Telegram нужно понять, есть ли признаки самовольного строительства "
+        "и, если да, структурировать данные в JSON: объект, адрес, кадастровый номер, риск и краткое описание."
+        "Отвечай строго одним JSON-объектом, без комментариев, без текста до и после."
+    )
+
+    payload = {
+        "modelUri": f"gpt://{YAGPT_FOLDER_ID}/yandexgpt/latest",
+        "completionOptions": {
+            "maxTokens": 400,
+            "temperature": temperature,
+            "stream": False,
+        },
+        "messages": [
+            {"role": "system", "text": system_prompt},
+            {"role": "user", "text": prompt},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=40) as client:
+            resp = await client.post(YAGPT_URL, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.error(f"Ошибка при обращении к YandexGPT: {e}")
+        append_line(ANALYTICS_LOG, f"YAGPT_ERROR: {e}")
+        return None
+
+    try:
+        text = data["result"]["alternatives"][0]["message"]["text"]
+        text = text.strip()
+        # Срезаем ```json ... ``` если есть
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z]*", "", text)
+            text = re.sub(r"```$", "", text).strip()
+        obj = json.loads(text)
+        return obj
+    except Exception as e:
+        logger.error(f"Не удалось распарсить JSON из YAGPT: {e}; raw={data}")
+        append_line(ANALYTICS_LOG, f"YAGPT_JSON_PARSE_ERROR: {e}")
+        return None
+
+
+# ------------------ КООРДИНАТЫ / РОСРЕЕСТР ------------------ #
+
+def extract_coords(text: str) -> Optional[Tuple[float, float]]:
+    """
+    Ищем в тексте координаты вида 56.054712 37.148884 или 56.054712, 37.148884.
+    """
+    pattern = r"(\d{1,2}\.\d{5,})[,\s]+(\d{1,2}\.\d{5,})"
+    m = re.search(pattern, text)
+    if not m:
+        return None
+    try:
+        lat = float(m.group(1))
+        lon = float(m.group(2))
+        return lat, lon
+    except ValueError:
+        return None
+
+
+async def geocode_address(address: str) -> Optional[Tuple[float, float]]:
+    """
+    Преобразует адрес в координаты через Яндекс Геокодер.
+    """
+    if not (YANDEX_GEOCODER_KEY and address):
+        return None
+
+    url = "https://geocode-maps.yandex.ru/1.x/"
+    params = {
+        "apikey": YANDEX_GEOCODER_KEY,
+        "format": "json",
+        "geocode": address,
+        "lang": "ru_RU",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+        member = (
+            data["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]
+        )
+        pos = member["Point"]["pos"]  # "37.620393 55.75396"
+        lon_str, lat_str = pos.split()
+        return float(lat_str), float(lon_str)
+    except Exception as e:
+        logger.error(f"Ошибка геокодера для '{address}': {e}")
+        return None
+
+
+# ------------------ TELETHON для @rs_search_bot ------------------ #
+
+from telethon import TelegramClient, events
+
+if TG_API_ID == 0 or not TG_API_HASH:
+    logger.warning("TG_API_ID/TG_API_HASH не заданы — интеграция с @rs_search_bot работать не будет.")
+    RS_CLIENT: Optional[TelegramClient] = None
+else:
+    RS_CLIENT = TelegramClient(SESSION_NAME, TG_API_ID, TG_API_HASH)
+
+
+async def ensure_rs_client_started():
+    if RS_CLIENT is None:
+        return
+    if not RS_CLIENT.is_connected():
+        await RS_CLIENT.start()
+
+
+async def query_rs_search_bot_by_coords(lat: float, lon: float) -> Optional[str]:
+    """
+    Отправляет координаты в @rs_search_bot и возвращает его ответ (текст).
+    Формат координат: "56.007403 37.869397".
+    """
+    if RS_CLIENT is None:
+        return None
+
+    await ensure_rs_client_started()
+
+    coords_text = f"{lat:.6f} {lon:.6f}"
+    try:
+        bot_entity = await RS_CLIENT.get_entity(RS_SEARCH_BOT)
+        await RS_CLIENT.send_message(bot_entity, coords_text)
+
+        @RS_CLIENT.on(events.NewMessage(from_users=bot_entity))
+        async def handler(event):
+            pass
+
+        # Ждем ответа 15 секунд
+        resp = await RS_CLIENT.wait_for(
+            events.NewMessage(from_users=bot_entity), timeout=15
+        )
+        return resp.raw_text
+    except Exception as e:
+        logger.error(f"Ошибка запроса к @rs_search_bot: {e}")
+        return None
+
+
+def extract_rosreestr_block(text: str) -> Optional[str]:
+    """
+    Из ответа @rs_search_bot вынимаем две ключевые строки:
+    - 'Кад. номер ЗУ ...'
+    - 'RU.. от ....'
+    И формируем блок:
+      Кад. номер ЗУ ...
+      
+      RU...
+    """
+    if not text:
+        return None
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    kad_line = None
+    ru_line = None
+    for line in lines:
+        if kad_line is None and line.startswith("Кад. номер"):
+            kad_line = line
+        if ru_line is None and line.startswith("RU"):
+            ru_line = line
+        if kad_line and ru_line:
+            break
+
+    if not kad_line and not ru_line:
+        return None
+
+    parts = []
+    if kad_line:
+        parts.append(kad_line)
+    if ru_line:
+        if parts:
+            parts.append("")
+        parts.append(ru_line)
+    return "\n".join(parts)
+
+
+# ------------------ ONZS МАППИНГ ------------------ #
 
 ONZS_MAPPING: Dict[int, List[str]] = {
     1: [
@@ -122,11 +397,30 @@ ONZS_MAPPING: Dict[int, List[str]] = {
         "руза",
         "шаховская",
     ],
-    3: ["химки", "солнечногорск", "долгопрудный", "лобня", "клин"],
-    4: ["мытищи", "королев"],
-    5: ["пушкинский", "сергиево-посад", "сергиев посад"],
-    6: ["подольск", "серпухов", "чехов"],
-    7: ["домодедово", "ленинский"],
+    3: [
+        "химки",
+        "солнечногорск",
+        "долгопрудный",
+        "лобня",
+        "клин",
+    ],
+    4: [
+        "мытищи",
+        "королев",
+    ],
+    5: [
+        "пушкинский",
+        "сергиево-посад",
+    ],
+    6: [
+        "подольск",
+        "серпухов",
+        "чехов",
+    ],
+    7: [
+        "домодедово",
+        "ленинский",
+    ],
     8: [
         "щелково",
         "звездный городок",
@@ -135,632 +429,572 @@ ONZS_MAPPING: Dict[int, List[str]] = {
         "черноголовка",
         "электросталь",
     ],
-    9: ["люберцы", "котельники", "лыткарино", "балашиха", "реутов"],
+    9: [
+        "люберц",
+        "котельник",
+        "лыткарин",
+        "балаших",
+        "реутов",
+    ],
     10: [
-        "коломна",
+        "коломн",
         "воскресенск",
         "зарайск",
-        "кашир",
+        "кашира",
         "луховиц",
         "раменск",
-        "бронницы",
-        "жуковский",
+        "бронниц",
+        "жуковск",
         "серебряные пруды",
         "ступино",
     ],
-    11: ["дмитров", "дубна", "талдом"],
-    12: ["орехово-зуев", "егорьевск", "павлово-посад", "шатура"],
+    11: [
+        "дмитров",
+        "дубна",
+        "талдом",
+    ],
+    12: [
+        "орехово-зуево",
+        "егорьевск",
+        "павлово-посад",
+        "шатур",
+    ],
 }
 
-ONZS_PROMPT_TEXT = """
-ОНзС 1 - Одинцовский г.о.; Наро-Фоминский г.о. (Одинцовский г.о., г.о. Власиха, г.о. Краснознаменск, Наро-Фоминский г.о., г.о. Можайск)
-ОНзС 2 - г.о. Красногорск; м.о. Истра (г.о. Красногорск, м.о. Истра, г.о. Восход, Волоколамский м.о., м.о. Лотошино, Рузский м.о., м.о. Шаховская)
-ОНзС 3 - г.о. Химки; г.о. Солнечногорск (г.о. Химки, г.о. Солнечногорск, г.о. Долгопрудный, г.о. Лобня, г.о. Клин)
-ОНзС 4 - г.о. Мытищи (г.о. Мытищи, г.о. Королев)
-ОНзС 5 - г.о. Пушкинский (г.о. Пушкинский, Сергиево-Посадский г.о.)
-ОНзС 6 - г.о. Подольск (г.о. Подольск, г.о. Серпухов, м.о. Чехов)
-ОНзС 7 - г.о. Домодедово (г.о. Домодедово, Ленинский г.о.)
-ОНзС 8 - г.о. Щелково (г.о. Щелково, г.о. Звездный городок, г.о. Лосино-Петровский, г.о. Фрязино, г.о. Черноголовка, г.о. Электросталь)
-ОНзС 9 - г.о. Люберцы; г.о. Балашиха (г.о. Люберцы, г.о. Котельники, г.о. Лыткарино, г.о. Балашиха, г.о. Реутов)
-ОНзС 10 - г.о. Коломна; г.о. Ступино (г.о. Коломна, г.о. Воскресенск, м.о. Зарайск, г.о. Кашира, м.о. Луховицы, Раменский м.о., г.о. Бронницы, г.о. Жуковский, м.о. Серебряные Пруды, г.о. Ступино)
-ОНзС 11 - Дмитровский м.о. (Дмитровский м.о., г.о. Дубна, Талдомский г.о.)
-ОНзС 12 - Орехово-Зуевский г.о. (Орехово-Зуевский г.о., м.о. Егорьевск, Павлово-Посадский г.о., м.о. Шатура)
-"""
 
-# ---------------------------------------------------------------------
-#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ---------------------------------------------------------------------
-
-
-def read_lines(path: Path) -> List[str]:
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
-
-
-def append_line(path: Path, text: str) -> None:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with path.open("a", encoding="utf-8") as f:
-        f.write(f"[{now}] {text}\n")
-
-
-def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-
-
-def load_state() -> Dict[str, Any]:
-    try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def save_state(state: Dict[str, Any]) -> None:
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def load_subscribers() -> Set[int]:
-    try:
-        data = json.loads(SUBSCRIBERS_FILE.read_text(encoding="utf-8"))
-        return {int(x) for x in data}
-    except Exception:
-        return set()
-
-
-def save_subscribers(subs: Set[int]) -> None:
-    SUBSCRIBERS_FILE.write_text(
-        json.dumps(sorted(list(subs))), encoding="utf-8"
-    )
-
-
-SUBSCRIBERS: Set[int] = load_subscribers()
-
-# ---------------------------------------------------------------------
-#  YANDEX GPT
-# ---------------------------------------------------------------------
-
-YAGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-
-
-async def call_yandex_gpt(prompt: str, temperature: float = 0.2) -> Optional[str]:
-    if not (YAGPT_API_KEY and YAGPT_FOLDER_ID):
-        logger.warning("YandexGPT не настроен (нет API_KEY или FOLDER_ID).")
-        return None
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Api-Key {YAGPT_API_KEY}",
-        "x-folder-id": YAGPT_FOLDER_ID,
-    }
-
-    payload = {
-        "modelUri": f"gpt://{YAGPT_FOLDER_ID}/yandexgpt/latest",
-        "completionOptions": {
-            "maxTokens": 512,
-            "temperature": temperature,
-            "stream": False,
-        },
-        "messages": [
-            {
-                "role": "system",
-                "text": (
-                    "Ты помощник инспектора Главгосстройнадзора Московской области. "
-                    "Твоя задача — находить признаки САМОСТРОЯ и структурировать информацию.\n\n"
-                    "Классифицируй сообщение и ответь СТРОГО в виде JSON БЕЗ ``` и комментариев.\n"
-                    "Структура JSON:\n"
-                    "{\n"
-                    '  "object_type": "тип объекта",\n'
-                    '  "violation_type": "тип нарушения",\n'
-                    '  "address": "полный адрес, если есть",\n'
-                    '  "okrug_city": "муниципалитет/город",\n'
-                    '  "cadastral_number": "кадастровый номер или пусто",\n'
-                    '  "risk_probability": 0-100,\n'
-                    '  "risk_score": 0-100,\n'
-                    '  "risk_level": "низкий/средний/высокий",\n'
-                    '  "summary": "кратко по сути на русском",\n'
-                    '  "municipality": "муниципалитет (например, Химки, Подольск и т.п.)",\n'
-                    '  "onzs_number": 0-12  // номер ОНзС, 0 если определить нельзя\n'
-                    "}\n\n"
-                    "Информация об округах и ОНзС:\n"
-                    f"{ONZS_PROMPT_TEXT}\n"
-                    "Если это явно не про строительство в Московской области, ставь risk_probability и risk_score близко к 0, "
-                    "onzs_number = 0, summary всё равно сформулируй."
-                ),
-            },
-            {
-                "role": "user",
-                "text": prompt,
-            },
-        ],
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=40) as client:
-            resp = await client.post(YAGPT_URL, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            text = data["result"]["alternatives"][0]["message"]["text"]
-            return text
-    except Exception as e:
-        logger.error(f"Ошибка при обращении к YandexGPT: {e}")
-        append_line(ANALYTICS_LOG, f"YAGPT_ERROR: {e}")
-        return None
-
-
-def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
+def detect_onzs_by_text(text: str) -> int:
     """
-    YandexGPT иногда заворачивает JSON в ``` ... ```.
-    Пытаемся вытащить подстроку между первым '{' и последней '}'.
+    Простейшее определение ОНзС по тексту (адрес, округ, город).
     """
-    if not text:
-        return None
-    try:
-        # если вдруг уже голый JSON
-        return json.loads(text)
-    except Exception:
-        pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    candidate = text[start : end + 1]
-    try:
-        return json.loads(candidate)
-    except Exception:
-        logger.error(f"Не удалось распарсить JSON из YAGPT: raw={text!r}")
-        return None
-
-
-def infer_onzs_from_location(location_text: str) -> int:
-    """
-    Простая эвристика по подстрокам, если YAGPT не смог.
-    """
-    if not location_text:
-        return 0
-    lower = location_text.lower()
-    for num, subs in ONZS_MAPPING.items():
-        for s in subs:
-            if s in lower:
-                return num
+    t = text.lower()
+    for onzs, patterns in ONZS_MAPPING.items():
+        for p in patterns:
+            if p in t:
+                return onzs
     return 0
 
 
-async def analyze_case_with_yagpt(
-    channel: str, text: str, post_url: str
-) -> Optional[Dict[str, Any]]:
-    prompt = (
-        f"Канал: @{channel}\n"
-        f"Ссылка на сообщение: {post_url}\n\n"
-        f"Текст сообщения:\n{text}\n"
-    )
-
-    raw = await call_yandex_gpt(prompt)
-    if raw is None:
-        return None
-
-    data = extract_json_from_text(raw)
-    if data is None:
-        return None
-
-    object_type = data.get("object_type") or ""
-    violation_type = data.get("violation_type") or ""
-    address = data.get("address") or ""
-    okrug_city = data.get("okrug_city") or ""
-    cadastral_number = data.get("cadastral_number") or ""
-    risk_probability = int(float(data.get("risk_probability") or 0))
-    risk_score = int(float(data.get("risk_score") or 0))
-    risk_level = (data.get("risk_level") or "").strip() or "не определён"
-    summary = data.get("summary") or ""
-    municipality = data.get("municipality") or okrug_city or address
-
-    onzs_number = int(data.get("onzs_number") or 0)
-    if onzs_number not in range(1, 13):
-        onzs_number = infer_onzs_from_location(municipality)
-
-    result: Dict[str, Any] = {
-        "object_type": object_type,
-        "violation_type": violation_type,
-        "address": address,
-        "okrug_city": okrug_city,
-        "cadastral_number": cadastral_number,
-        "risk_probability": risk_probability,
-        "risk_score": risk_score,
-        "risk_level": risk_level,
-        "summary": summary,
-        "municipality": municipality,
-        "onzs_number": onzs_number,
-        "source_channel": channel,
-        "post_url": post_url,
-        "created_at": datetime.utcnow().isoformat(),
-        "raw_model_json": data,
-    }
-    return result
-
-
-# ---------------------------------------------------------------------
-#  ФОРМИРОВАНИЕ КАРТОЧКИ И СОХРАНЕНИЕ
-# ---------------------------------------------------------------------
+# ------------------ КОНСТРУКЦИЯ КАРТОЧЕК ------------------ #
 
 
 def build_card_text(card: Dict[str, Any]) -> str:
-    ch = card.get("source_channel", "")
-    post_url = card.get("post_url", "")
+    """
+    Формируем текст карточки по данным, которые вернул YandexGPT + Росреестр.
+    """
+    channel = card.get("channel", "-")
+    post_id = card.get("post_id", "-")
+    original_url = card.get("original_url", "-")
+
     object_type = card.get("object_type") or "-"
     violation_type = card.get("violation_type") or "-"
     address = card.get("address") or "-"
     okrug_city = card.get("okrug_city") or "-"
-    cadastral_number = card.get("cadastral_number") or "-"
-    risk_probability = card.get("risk_probability", 0)
-    risk_score = card.get("risk_score", 0)
+    cadastral_number = card.get("cadastral_number") or card.get("rosreestr_kad") or "-"
+    risk_probability = card.get("risk_probability")
+    risk_score = card.get("risk_score")
     risk_level = card.get("risk_level") or "-"
     summary = card.get("summary") or "-"
-    onzs_number = card.get("onzs_number") or 0
+    rosreestr_block = card.get("rosreestr_block") or "-"
 
-    lines = []
-    lines.append(f"🔍 Найдено в @{ch}")
-    lines.append("")
-    lines.append("🏗 Объект и нарушение")
-    lines.append(f"• Тип объекта: {object_type}")
-    lines.append(f"• Тип нарушения: {violation_type}")
-    lines.append(f"• Адрес: {address}")
-    lines.append(f"• Округ/город: {okrug_city}")
-    lines.append(f"• Кадастровый номер: {cadastral_number or '-'}")
-    lines.append(f"• ОНзС: {onzs_number or '-'}")
-    lines.append(f"📈 Вероятность самостроя: {risk_probability}%")
-    lines.append(f"🧠 Итоговый риск ИИ: {risk_level} ({risk_score} из 100)")
-    lines.append("")
-    lines.append("📝 Кратко по сути:")
-    lines.append(summary)
-    lines.append("")
-    lines.append("📑 Данные Росреестра")
-    lines.append("📘 Данные НСПД (nspd.gov.ru)")
-    lines.append("• Вид объекта недвижимости: -")
-    lines.append("• Вид земельного участка: -")
-    lines.append("• Дата присвоения: -")
-    lines.append("• Кадастровый номер: -")
-    lines.append("• Кадастровый квартал: -")
-    lines.append("• Адрес: -")
-    lines.append("• Площадь уточненная: -")
-    lines.append("• Статус: -")
-    lines.append("• Категория земель: -")
-    lines.append("• Вид разрешенного использования: -")
-    lines.append("• Форма собственности: -")
-    lines.append("• Кадастровая стоимость: -")
-    lines.append("• Удельный показатель кадастровой стоимости: -")
-    lines.append("")
-    if post_url:
-        lines.append("🔗 Открыть оригинал сообщения")
-        lines.append(post_url)
-    lines.append("")
-    lines.append(
-        "🧠 Обучение: ответь на эту карточку кнопками «в работу», «неверно» или «привязать»."
+    if risk_probability is None:
+        risk_probability = 0
+    if risk_score is None:
+        risk_score = risk_probability
+
+    text_lines = []
+
+    text_lines.append(f"Найдено в {channel}")
+    text_lines.append("")
+    text_lines.append("🏗 Объект и нарушение")
+    text_lines.append(f"• Тип объекта: {object_type}")
+    text_lines.append(f"• Тип нарушения: {violation_type}")
+    text_lines.append(f"• Адрес: {address}")
+    text_lines.append(f"• Округ/город: {okrug_city}")
+    text_lines.append(f"• Кадастровый номер: {cadastral_number}")
+    text_lines.append(
+        f"📈 Вероятность самостроя: {risk_probability}%"
     )
-    return "\n".join(lines)
+    text_lines.append(f"🧠 Итоговый риск ИИ: {risk_level} ({risk_score} из 100)")
+    text_lines.append("")
+    text_lines.append("📝 Кратко по сути:")
+    text_lines.append(summary)
+    text_lines.append("")
+
+    text_lines.append("📑 Данные Росреестра")
+    text_lines.append(rosreestr_block if rosreestr_block != "-" else "нет данных")
+    text_lines.append("")
+
+    text_lines.append(f"🔗 Открыть оригинал сообщения ({original_url})")
+    text_lines.append("")
+    text_lines.append(
+        "🧠 Обучение: ответь на эту карточку словами «в работу», «неверно» или «привязать» "
+        "или нажми соответствующую кнопку под карточкой."
+    )
+
+    text_lines.append("")
+    text_lines.append(card.get("source_excerpt", "Фрагмент исходного сообщения недоступен."))
+
+    return "\n".join(text_lines)
 
 
-def save_card_to_onzs_files(card: Dict[str, Any]) -> None:
-    append_jsonl(CARDS_FILE, card)
-
-    all_file = ONZS_DIR / "onzs_all.jsonl"
-    append_jsonl(all_file, card)
-
-    onzs_number = int(card.get("onzs_number") or 0)
-    if onzs_number in range(1, 13):
-        onzs_file = ONZS_DIR / f"onzs_{onzs_number}.jsonl"
-        append_jsonl(onzs_file, card)
-
-
-def build_inline_keyboard(channel: str, post_id: int) -> Dict[str, Any]:
+def build_inline_keyboard(card: Dict[str, Any], channel: str, post_id: int) -> Dict[str, Any]:
     """
-    callback_data формата: train:<action>:<channel>:<post_id>
+    Инлайн-клавиатура:
+      • в работу / неверно / привязать
+      • 📍 Посмотреть на карте (если есть адрес)
     """
     card_key = f"{channel}:{post_id}"
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "в работу",
-                    "callback_data": f"train:work:{card_key}",
-                },
-                {
-                    "text": "неверно",
-                    "callback_data": f"train:wrong:{card_key}",
-                },
-                {
-                    "text": "привязать",
-                    "callback_data": f"train:attach:{card_key}",
-                },
-            ]
+
+    keyboard: List[List[Dict[str, Any]]] = [
+        [
+            {
+                "text": "в работу",
+                "callback_data": f"train:work:{card_key}",
+            },
+            {
+                "text": "неверно",
+                "callback_data": f"train:wrong:{card_key}",
+            },
+            {
+                "text": "привязать",
+                "callback_data": f"train:attach:{card_key}",
+            },
         ]
-    }
+    ]
+
+    address = (card.get("address") or "").strip()
+    if address and address != "-":
+        try:
+            query = quote_plus(address)
+            map_url = f"https://yandex.ru/maps/?text={query}"
+            keyboard.append(
+                [
+                    {
+                        "text": "📍 Посмотреть на карте",
+                        "url": map_url,
+                    }
+                ]
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при формировании ссылки на карту: {e}")
+
+    return {"inline_keyboard": keyboard}
 
 
-def build_reply_keyboard() -> Dict[str, Any]:
-    return {
-        "keyboard": [
-            [{"text": "Старт"}, {"text": "Стоп"}],
-            [{"text": "ОНзС 1"}, {"text": "ОНзС 2"}, {"text": "ОНзС 3"}],
-            [{"text": "ОНзС 4"}, {"text": "ОНзС 5"}, {"text": "ОНзС 6"}],
-            [{"text": "ОНзС 7"}, {"text": "ОНзС 8"}, {"text": "ОНзС 9"}],
-            [{"text": "ОНзС 10"}, {"text": "ОНзС 11"}, {"text": "ОНзС 12"}],
-        ],
-        "resize_keyboard": True,
-        "is_persistent": True,
-    }
+# ------------------ Telegram Bot API (отправка сообщений) ------------------ #
+
+TG_API_BASE = "https://api.telegram.org"
 
 
-# ---------------------------------------------------------------------
-#  TELEGRAM API
-# ---------------------------------------------------------------------
+async def tg_request(method: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{TG_API_BASE}/bot{BOT_TOKEN}/{method}"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, json=data)
+        r.raise_for_status()
+        return r.json()
 
 
-async def tg_request(
-    method: str, payload: Dict[str, Any]
-) -> Optional[Dict[str, Any]]:
-    if not TELEGRAM_API_URL:
+async def send_card_to_tg_group(card: Dict[str, Any]) -> Optional[int]:
+    """
+    Отправляем карточку в целевой чат + тему «Новости» (если есть).
+    """
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN не задан — не могу отправлять карточки в Telegram.")
         return None
-    url = f"{TELEGRAM_API_URL}/{method}"
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(url, json=payload)
-            data = resp.json()
-            if not data.get("ok"):
-                logger.error(f"Telegram API error {method}: {data}")
-            return data
-    except Exception as e:
-        logger.error(f"Telegram API exception {method}: {e}")
+    if TARGET_CHAT_ID == 0:
+        logger.error("TARGET_CHAT_ID не задан — некуда отправлять карточки.")
         return None
 
-
-async def send_card_to_tg_group(
-    card: Dict[str, Any], channel: str, post_id: int
-) -> Optional[int]:
     text = build_card_text(card)
-    payload: Dict[str, Any] = {
+    channel = card.get("channel", "-")
+    post_id = card.get("post_id", 0)
+    markup = build_inline_keyboard(card, channel, post_id)
+
+    data: Dict[str, Any] = {
         "chat_id": TARGET_CHAT_ID,
         "text": text,
-        "disable_web_page_preview": False,
-        "reply_markup": build_inline_keyboard(channel, post_id),
+        "parse_mode": "HTML",  # текст без HTML, но пусть будет
+        "disable_web_page_preview": True,
+        "reply_markup": markup,
     }
-    if NEWS_THREAD_ID:
-        payload["message_thread_id"] = NEWS_THREAD_ID
 
-    resp = await tg_request("sendMessage", payload)
-    if resp and resp.get("ok"):
-        msg_id = resp["result"]["message_id"]
-        return msg_id
-    return None
+    try:
+        resp = await tg_request("sendMessage", data)
+        if not resp.get("ok"):
+            logger.error(f"Telegram API error: {resp}")
+            return None
+        message_id = resp["result"]["message_id"]
+        return message_id
+    except Exception as e:
+        logger.error(f"Ошибка отправки карточки в Telegram: {e}")
+        return None
 
 
-async def send_card_to_subscribers(
-    card: Dict[str, Any], channel: str, post_id: int
-) -> None:
-    """
-    Отправляет карточку всем, кто нажал Старт — с теми же кнопками обучения.
-    """
-    if not SUBSCRIBERS or not BOT_TOKEN:
+# ------------------ ПОДПИСКИ ПОЛЬЗОВАТЕЛЕЙ НА ОНзС ------------------ #
+
+async def send_tg_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
+    if not BOT_TOKEN:
         return
-
-    text = build_card_text(card)
-    markup = build_inline_keyboard(channel, post_id)
-
-    async with httpx.AsyncClient(timeout=20) as client:
-        to_remove: Set[int] = set()
-        for user_id in list(SUBSCRIBERS):
-            try:
-                resp = await client.post(
-                    f"{TELEGRAM_API_URL}/sendMessage",
-                    json={
-                        "chat_id": user_id,
-                        "text": text,
-                        "reply_markup": markup,
-                    },
-                )
-                data = resp.json()
-                if not data.get("ok") and data.get("error_code") == 403:
-                    logger.warning(
-                        f"Пользователь {user_id} заблокировал бота — удаляю из подписчиков."
-                    )
-                    to_remove.add(user_id)
-            except Exception as e:
-                logger.error(f"Ошибка отправки карточки подписчику {user_id}: {e}")
-
-        if to_remove:
-            for uid in to_remove:
-                SUBSCRIBERS.discard(uid)
-            save_subscribers(SUBSCRIBERS)
+    data: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+    try:
+        await tg_request("sendMessage", data)
+    except Exception as e:
+        logger.error(f"Ошибка send_tg_message: {e}")
 
 
-async def send_control_keyboard() -> None:
-    if not BOT_TOKEN or not TARGET_CHAT_ID:
-        return
-    await tg_request(
-        "sendMessage",
-        {
-            "chat_id": TARGET_CHAT_ID,
-            "text": "Панель Samostroi Scraper:",
-            "reply_markup": build_reply_keyboard(),
-        },
+def build_onzs_keyboard(selected: List[int]) -> Dict[str, Any]:
+    buttons = []
+    row = []
+    for i in range(1, 13):
+        text = f"{i} {'✅' if i in selected else ''}"
+        row.append({"text": text, "callback_data": f"onzs:{i}"})
+        if len(row) == 4:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append(
+        [
+            {
+                "text": "Все ОНзС",
+                "callback_data": "onzs:all",
+            }
+        ]
+    )
+    return {"inline_keyboard": buttons}
+
+
+async def broadcast_card_to_subscribers(card: Dict[str, Any], main_message_id: Optional[int] = None):
+    """
+    Рассылаем карточку подписчикам по их выбранным ОНзС (если не на паузе).
+    Для простоты: пока рассылаем только основной карточкой в общий чат,
+    а подписки можно использовать позже.
+    """
+    # Здесь можно реализовать личные рассылки по user_subscriptions,
+    # сейчас в основном фокус на общем чате.
+    return
+
+
+# ------------------ ОБРАБОТКА ПУБЛИЧНЫХ КАНАЛОВ (WEB SCRAPING) ------------------ #
+
+TELEGRAM_WEB_BASE = "https://t.me"
+
+
+async def fetch_channel_page(username: str) -> str:
+    """
+    Забираем HTML публичного канала через веб-страницу /s/<username>.
+    """
+    url = f"{TELEGRAM_WEB_BASE}/s/{username.lstrip('@')}"
+    logger.info(f"Запрос веб-страницы канала: {url}")
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+        r = await client.get(url)
+        if r.status_code in (301, 302, 303, 307, 308):
+            logger.error(
+                f"Redirect response '{r.status_code} {r.reason_phrase}' for url '{url}'\n"
+                f"Redirect location: '{r.headers.get('Location')}'"
+            )
+            raise RuntimeError(f"Redirect for {url}")
+        r.raise_for_status()
+        return r.text
+
+
+def parse_posts_from_html(html: str) -> List[Tuple[int, str]]:
+    """
+    Очень упрощенный парсер: ищем блоки data-post="channel/12345" и рядом текст.
+    В реале лучше использовать парсер HTML, но тут делаем на основе регулярки.
+    """
+    posts: List[Tuple[int, str]] = []
+
+    for m in re.finditer(r'data-post="[^/]+/(\d+)"', html):
+        msg_id = int(m.group(1))
+        # Грубый захват фрагмента текста вокруг ID
+        start = max(0, m.start() - 2000)
+        end = min(len(html), m.end() + 2000)
+        snippet = html[start:end]
+        snippet = re.sub(r"<[^>]+>", " ", snippet)  # вырезаем теги
+        snippet = re.sub(r"\s+", " ", snippet)
+        posts.append((msg_id, snippet))
+
+    # Убираем дубликаты и сортируем
+    unique = {}
+    for msg_id, text in posts:
+        if msg_id not in unique:
+            unique[msg_id] = text
+    result = sorted(unique.items(), key=lambda x: x[0])
+    return result
+
+
+async def analyze_case_with_yagpt(channel: str, msg_id: int, text: str, original_url: str) -> Optional[Dict[str, Any]]:
+    """
+    Постобработка одного кандидата:
+     1) Вызов YandexGPT -> JSON-структура
+     2) Попытка найти координаты / адрес и запросить @rs_search_bot
+     3) Определение ОНзС
+    """
+    prompt = (
+        f"Канал: {channel}\n"
+        f"ID сообщения: {msg_id}\n\n"
+        f"Текст:\n{text}\n\n"
+        "Сформируй JSON-объект с полями:\n"
+        "{\n"
+        '  "object_type": "тип объекта",\n'
+        '  "violation_type": "тип нарушения (если есть признаки самостроя)",\n'
+        '  "address": "адрес (если указан)",\n'
+        '  "okrug_city": "муниципалитет/город (если указан)",\n'
+        '  "cadastral_number": "кадастровый номер (если есть)",\n'
+        '  "risk_probability": 0-100,\n'
+        '  "risk_score": 0-100,\n'
+        '  "risk_level": "низкий/средний/высокий",\n'
+        '  "summary": "краткое описание ситуации"\n'
+        "}"
     )
 
+    yagpt_data = await call_yandex_gpt_json(prompt)
+    if not yagpt_data:
+        return None
 
-# ---------------------------------------------------------------------
-#  ОБРАБОТКА TELEGRAM-ОБНОВЛЕНИЙ (Старт/Стоп, ОНзС, КНОПКИ)
-# ---------------------------------------------------------------------
+    card: Dict[str, Any] = {
+        "channel": channel,
+        "post_id": msg_id,
+        "original_url": original_url,
+        "source_excerpt": text[:500] + ("..." if len(text) > 500 else ""),
+    }
 
-LAST_UPDATE_ID: int = 0
+    for key in [
+        "object_type",
+        "violation_type",
+        "address",
+        "okrug_city",
+        "cadastral_number",
+        "risk_probability",
+        "risk_score",
+        "risk_level",
+        "summary",
+    ]:
+        if key in yagpt_data:
+            card[key] = yagpt_data[key]
+
+    # Порог по вероятности
+    rp = int(card.get("risk_probability") or 0)
+    if rp < STATE.min_risk_probability:
+        logger.info(
+            f"Карточка отклонена по порогу вероятности: {rp}% < {STATE.min_risk_probability}%"
+        )
+        return None
+
+    # Координаты -> @rs_search_bot
+    rosreestr_block = None
+    coords = extract_coords(text)
+    if not coords and card.get("address"):
+        coords = await geocode_address(card["address"])
+
+    if coords:
+        lat, lon = coords
+        rs_resp = await query_rs_search_bot_by_coords(lat, lon)
+        rosreestr_block = extract_rosreestr_block(rs_resp or "")
+    card["rosreestr_block"] = rosreestr_block or "-"
+
+    # ОНзС по адресу/муниципалитету
+    onzs_text_source = f"{card.get('address', '')} {card.get('okrug_city', '')}"
+    card["onzs"] = detect_onzs_by_text(onzs_text_source)
+
+    return card
 
 
-async def handle_message_update(update: Dict[str, Any]) -> None:
-    msg = update["message"]
-    chat = msg["chat"]
-    chat_id = chat["id"]
-    text = (msg.get("text") or "").strip()
-    if not text:
-        return
-
-    from_user = msg.get("from") or {}
-    user_id = msg.get("from", {}).get("id")
-
+async def process_public_post(channel: str, msg_id: int, text: str):
+    """
+    Обработка одного поста в публичном канале:
+     - Поиск ключевых слов
+     - Вызов YandexGPT
+     - Сохранение карточки
+     - Отправка в Telegram
+    """
+    keywords = read_lines(KEYWORDS_FILE)
     lower = text.lower()
+    matched = [kw for kw in keywords if kw.lower() in lower]
+    if not matched:
+        return
 
-    start_triggers = {"старт", "/start"}
-    stop_triggers = {"стоп", "/stop"}
-    if lower in start_triggers:
-        SUBSCRIBERS.add(int(user_id))
-        save_subscribers(SUBSCRIBERS)
-        await tg_request(
-            "sendMessage",
+    logger.info(f"[MATCH] @{channel}: пост {msg_id}, ключевые слова {matched}")
+
+    original_url = f"https://t.me/{channel}/{msg_id}"
+
+    card = await analyze_case_with_yagpt(
+        channel=f"@{channel}", msg_id=msg_id, text=text, original_url=original_url
+    )
+    if not card:
+        return
+
+    append_jsonl(NEWS_FILE, card)
+    onzs = int(card.get("onzs") or 0)
+    if onzs in range(1, 13):
+        onzs_file = os.path.join(ONZS_DIR, f"onzs_{onzs}.jsonl")
+        append_jsonl(onzs_file, card)
+
+    # Лог
+    append_line(
+        MONITORING_LOG,
+        json.dumps(
             {
-                "chat_id": chat_id,
-                "text": "✅ Вы подписались: бот будет присылать вам карточки в личные сообщения.",
-                "reply_markup": build_reply_keyboard(),
+                "channel": channel,
+                "msg_id": msg_id,
+                "keywords": matched,
+                "card": card,
             },
-        )
-        return
-    if lower in stop_triggers:
-        if int(user_id) in SUBSCRIBERS:
-            SUBSCRIBERS.discard(int(user_id))
-            save_subscribers(SUBSCRIBERS)
-            text_resp = "⏸ Вы отписались: бот больше не будет присылать вам карточки в личку."
-        else:
-            text_resp = "Вы и так не подписаны на личную рассылку."
-        await tg_request(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text_resp,
-                "reply_markup": build_reply_keyboard(),
-            },
-        )
-        return
-
-    # Кнопки "ОНзС N"
-    m = re.match(r"онзс\s*(\d+)", lower)
-    if m:
-        n = int(m.group(1))
-        if 1 <= n <= 12:
-            file_path = ONZS_DIR / f"onzs_{n}.jsonl"
-            if file_path.exists():
-                count = sum(1 for _ in file_path.open("r", encoding="utf-8"))
-            else:
-                count = 0
-            await tg_request(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": f"📂 В папке ОНзС {n} сохранено карточек: {count}.",
-                    "reply_markup": build_reply_keyboard(),
-                },
-            )
-        else:
-            await tg_request(
-                "sendMessage",
-                {
-                    "chat_id": chat_id,
-                    "text": "Номер ОНзС должен быть от 1 до 12.",
-                    "reply_markup": build_reply_keyboard(),
-                },
-            )
-        return
-
-    # Любое другое сообщение — просто обновляем клавиатуру
-    await tg_request(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": "Используйте клавиатуру ниже для управления ботом.",
-            "reply_markup": build_reply_keyboard(),
-        },
+            ensure_ascii=False,
+        ),
     )
 
+    msg_id_sent = await send_card_to_tg_group(card)
+    await broadcast_card_to_subscribers(card, msg_id_sent)
 
-async def handle_callback_update(update: Dict[str, Any]) -> None:
-    cb = update["callback_query"]
-    data = cb.get("data") or ""
-    from_user = cb.get("from") or {}
-    user_id = int(from_user.get("id"))
-    callback_id = cb.get("id")
 
-    message = cb.get("message") or {}
-    chat_id = message.get("chat", {}).get("id")
+async def scan_once():
+    """
+    Один проход по списку каналов из groups.txt
+    """
+    groups = read_lines(GROUPS_FILE)
+    for raw in groups:
+        username = raw.lstrip("@")
+        try:
+            html = await fetch_channel_page(username)
+            posts = parse_posts_from_html(html)
+            last_seen = int(STATE.last_post_ids.get(username, 0))
+            new_posts = [(mid, txt) for (mid, txt) in posts if mid > last_seen]
+            if not new_posts:
+                logger.info(f"Новых постов в @{username} не найдено.")
+                continue
+
+            logger.info(f"Найдено новых постов в @{username}: {len(new_posts)}")
+
+            for mid, txt in new_posts:
+                await process_public_post(username, mid, txt)
+                if mid > last_seen:
+                    last_seen = mid
+
+            STATE.last_post_ids[username] = last_seen
+            save_state(STATE)
+
+        except Exception as e:
+            logger.error(f"Ошибка при обработке канала @{username}: {e}")
+
+
+# ------------------ ОБРАБОТКА CALLBACK (ОБУЧЕНИЕ YAGPT) ------------------ #
+
+async def handle_callback_query(callback_query: Dict[str, Any]):
+    """
+    Обработка callback_data формата train:<action>:<channel>:<post_id>
+    и onzs:<номер>
+    """
+    data = callback_query.get("data", "")
+    from_id = callback_query.get("from", {}).get("id")
+    message = callback_query.get("message", {})
     message_id = message.get("message_id")
+    chat_id = message.get("chat", {}).get("id")
 
-    # Разбираем data
-    parts = data.split(":")
-    if len(parts) < 3 or parts[0] != "train":
-        # Просто ответим, чтобы кнопка "крутилась" недолго
+    if data.startswith("train:"):
+        _, action, key = data.split(":", 2)
+        channel, post_id_str = key.split(":", 1)
+        label_map = {
+            "work": "в_работу",
+            "wrong": "неверно",
+            "attach": "привязать",
+        }
+        label = label_map.get(action, action)
+        rec = {
+            "text": message.get("text", ""),
+            "label": label,
+            "timestamp": datetime.now().isoformat(),
+            "from_id": from_id,
+        }
+        append_jsonl(YAGPT_DATASET, rec)
+        append_line(ANALYTICS_LOG, f"DECISION: {label} by {from_id}")
+
+        # Убираем кнопки с карточки для всех
+        try:
+            await tg_request(
+                "editMessageReplyMarkup",
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "reply_markup": {"inline_keyboard": []},
+                },
+            )
+        except Exception as e:
+            logger.error(f"Ошибка editMessageReplyMarkup: {e}")
+
+        # Ответ пользователю (notification)
         await tg_request(
             "answerCallbackQuery",
-            {"callback_query_id": callback_id, "text": "Ок"},
+            {
+                "callback_query_id": callback_query.get("id"),
+                "text": f"Решение зафиксировано: {label}",
+                "show_alert": False,
+            },
         )
-        return
 
-    action = parts[1]  # work / wrong / attach
-    card_key = ":".join(parts[2:])
-    label_map = {
-        "work": "в_работу",
-        "wrong": "неверно",
-        "attach": "привязать",
-    }
-    label = label_map.get(action, action)
+    elif data.startswith("onzs:"):
+        val = data.split(":", 1)[1]
+        user_key = str(from_id)
+        if val == "all":
+            STATE.user_subscriptions[user_key] = list(range(1, 13))
+        else:
+            try:
+                onzs_num = int(val)
+            except ValueError:
+                return
+            subs = STATE.user_subscriptions.get(user_key, [])
+            if onzs_num in subs:
+                subs.remove(onzs_num)
+            else:
+                subs.append(onzs_num)
+            STATE.user_subscriptions[user_key] = sorted(subs)
 
-    # Проверка прав: если ADMIN_IDS не пустой — только они
-    if ADMIN_IDS:
-        can_train = user_id in ADMIN_IDS
-    else:
-        can_train = True
-
-    if can_train:
-        rec = {
-            "card_key": card_key,
-            "label": label,
-            "user_id": user_id,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-        append_jsonl(YAGPT_DATASET_FILE, rec)
-        append_line(ANALYTICS_LOG, f"TRAIN: {rec}")
-        answer_text = "✅ Решение зафиксировано и добавлено в датасет."
-    else:
-        answer_text = "ℹ️ Обучение учитывается только от администратора."
-
-    # Убираем кнопки под этим сообщением для всех
-    if chat_id and message_id:
+        save_state(STATE)
+        new_kb = build_onzs_keyboard(STATE.user_subscriptions.get(user_key, []))
         await tg_request(
             "editMessageReplyMarkup",
             {
                 "chat_id": chat_id,
                 "message_id": message_id,
-                "reply_markup": {"inline_keyboard": []},
+                "reply_markup": new_kb,
+            },
+        )
+        await tg_request(
+            "answerCallbackQuery",
+            {
+                "callback_query_id": callback_query.get("id"),
+                "text": "Настройки ОНзС обновлены",
+                "show_alert": False,
             },
         )
 
-    await tg_request(
-        "answerCallbackQuery",
-        {"callback_query_id": callback_id, "text": answer_text, "show_alert": False},
-    )
+
+# ------------------ ПРИЁМ UPDATE'ов от Telegram (WEBHOOK/POLLING) ------------------ #
+
+OFFSET = 0
 
 
-async def poll_updates_loop() -> None:
-    global LAST_UPDATE_ID
+async def poll_updates():
+    global OFFSET
     if not BOT_TOKEN:
+        logger.warning("BOT_TOKEN не задан — часть функционала (управление ботом) не будет работать.")
         return
 
-    logger.info("Запускаю цикл получения обновлений Telegram (getUpdates)...")
     while True:
         try:
-            params: Dict[str, Any] = {"timeout": 30}
-            if LAST_UPDATE_ID:
-                params["offset"] = LAST_UPDATE_ID + 1
-
-            async with httpx.AsyncClient(timeout=35) as client:
+            async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.get(
-                    f"{TELEGRAM_API_URL}/getUpdates", params=params
+                    f"{TG_API_BASE}/bot{BOT_TOKEN}/getUpdates",
+                    params={"offset": OFFSET, "timeout": 30},
                 )
+                resp.raise_for_status()
                 data = resp.json()
         except Exception as e:
             logger.error(f"Ошибка getUpdates: {e}")
@@ -768,190 +1002,148 @@ async def poll_updates_loop() -> None:
             continue
 
         if not data.get("ok"):
-            logger.error(f"Ошибка getUpdates: {data}")
             await asyncio.sleep(5)
             continue
 
-        for upd in data.get("result", []):
-            LAST_UPDATE_ID = upd["update_id"]
-            if "message" in upd:
-                await handle_message_update(upd)
-            elif "callback_query" in upd:
-                await handle_callback_update(upd)
+        for update in data.get("result", []):
+            OFFSET = update["update_id"] + 1
+            await handle_update(update)
 
 
-# ---------------------------------------------------------------------
-#  WEB-SCRAPING TELEGRAM PUBLIC CHANNELS
-# ---------------------------------------------------------------------
+async def handle_update(update: Dict[str, Any]):
+    if "message" in update:
+        await handle_message(update["message"])
+    if "callback_query" in update:
+        await handle_callback_query(update["callback_query"])
 
 
-async def fetch_channel_page(channel: str) -> Optional[str]:
-    url = f"https://t.me/s/{channel}"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0 Safari/537.36"
-        )
-    }
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(url, headers=headers, follow_redirects=False)
-            if resp.status_code == 302:
-                logger.warning(
-                    f"Redirect при обращении к {url}: {resp.headers.get('Location')}"
-                )
-                return None
-            resp.raise_for_status()
-            return resp.text
-    except Exception as e:
-        logger.error(f"Ошибка загрузки канала {channel}: {e}")
-        return None
+async def handle_message(message: Dict[str, Any]):
+    chat_id = message.get("chat", {}).get("id")
+    from_id = message.get("from", {}).get("id")
+    text = message.get("text", "") or ""
 
-
-def parse_public_posts(
-    channel: str, html: str
-) -> List[Tuple[int, str, str]]:
-    """
-    Возвращает список (post_id, text, url).
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    results: List[Tuple[int, str, str]] = []
-
-    for msg in soup.select("div.tgme_widget_message_wrap"):
-        date_a = msg.select_one("a.tgme_widget_message_date")
-        if not date_a:
-            continue
-        href = date_a.get("href", "")
-        m = re.search(r"/(\d+)$", href)
-        if not m:
-            continue
-        post_id = int(m.group(1))
-        text_div = msg.select_one("div.tgme_widget_message_text")
-        text = text_div.get_text("\n", strip=True) if text_div else ""
-        if not text:
-            continue
-        results.append((post_id, text, href))
-
-    results.sort(key=lambda x: x[0])
-    return results
-
-
-async def process_public_post(
-    channel: str,
-    post_id: int,
-    text: str,
-    post_url: str,
-    keywords: List[str],
-) -> None:
-    lower = text.lower()
-    matched = [kw for kw in keywords if kw.lower() in lower]
-    if not matched:
+    if not text:
         return
 
-    logger.info(f"[MATCH] @{channel}: пост {post_id}, ключевые слова {matched}")
-    append_line(
-        MONITORING_LOG,
-        json.dumps(
-            {
-                "channel": channel,
-                "post_id": post_id,
-                "keywords": matched,
-                "text": text[:500],
-            },
-            ensure_ascii=False,
-        ),
+    if text.startswith("/"):
+        cmd, *args = text.split()
+        if cmd == "/start":
+            await cmd_start(chat_id, from_id)
+        elif cmd == "/stop":
+            await cmd_stop(chat_id, from_id)
+        elif cmd == "/risk":
+            await cmd_risk(chat_id, from_id, args)
+        return
+
+    # Обучение по тексту-ответу на карточку
+    reply_to = message.get("reply_to_message")
+    if reply_to and reply_to.get("text"):
+        lower = text.strip().lower()
+        if lower in ("в работу", "в_работу", "работа"):
+            label = "в_работу"
+        elif lower in ("неверно", "не относится", "не относится.", "не наш"):
+            label = "неверно"
+        elif lower in ("привязать", "привязка"):
+            label = "привязать"
+        else:
+            return
+
+        rec = {
+            "text": reply_to.get("text", ""),
+            "label": label,
+            "timestamp": datetime.now().isoformat(),
+            "from_id": from_id,
+        }
+        append_jsonl(YAGPT_DATASET, rec)
+        append_line(ANALYTICS_LOG, f"DECISION_REPLY: {label} by {from_id}")
+        await send_tg_message(chat_id, f"✅ Решение зафиксировано: {label}")
+
+
+async def cmd_start(chat_id: int, user_id: int):
+    user_key = str(user_id)
+    subs = STATE.user_subscriptions.get(user_key, [])
+    kb = build_onzs_keyboard(subs)
+    STATE.user_paused[user_key] = False
+    save_state(STATE)
+    text = (
+        "👋 Привет! Это бот мониторинга самовольного строительства.\n\n"
+        "Ниже выбери, по каким ОНзС ты хочешь получать карточки.\n"
+        "Можно отметить несколько, либо нажать «Все ОНзС»."
     )
+    await send_tg_message(chat_id, text, kb)
 
-    analysis = await analyze_case_with_yagpt(channel, text, post_url)
-    if not analysis:
-        logger.warning(f"YAGPT вернул пустой результат для @{channel}/{post_id}")
+
+async def cmd_stop(chat_id: int, user_id: int):
+    user_key = str(user_id)
+    STATE.user_paused[user_key] = True
+    save_state(STATE)
+    await send_tg_message(chat_id, "⏸ Показ карточек для тебя приостановлен. Чтобы возобновить — набери /start.")
+
+
+async def cmd_risk(chat_id: int, user_id: int, args: List[str]):
+    if user_id not in ADMIN_IDS:
+        await send_tg_message(chat_id, "Эта команда доступна только администраторам.")
         return
 
-    card = analysis.copy()
-    card["telegram_post_id"] = post_id
-
-    save_card_to_onzs_files(card)
-
-    # В группу
-    await send_card_to_tg_group(card, channel, post_id)
-    # Подписчикам
-    await send_card_to_subscribers(card, channel, post_id)
-
-
-async def scan_once(state: Dict[str, Any]) -> None:
-    groups_raw = read_lines(GROUPS_FILE)
-    if not groups_raw:
-        logger.warning("В groups.txt нет ни одного канала для мониторинга.")
+    if not args:
+        await send_tg_message(
+            chat_id,
+            f"Текущий порог вероятности самостроя: {STATE.min_risk_probability}%.\n"
+            f"Измени командой: /risk 25 (от 0 до 100).",
+        )
         return
 
-    keywords = read_lines(KEYWORDS_FILE)
-    if not keywords:
-        logger.warning("В keywords.txt нет ключевых слов.")
+    try:
+        val = int(args[0])
+    except ValueError:
+        await send_tg_message(chat_id, "Укажи число от 0 до 100, например: /risk 15")
         return
 
-    for grp in groups_raw:
-        channel = grp.lstrip("@")
-        logger.info(f"Обработка канала @{channel} ...")
-        html = await fetch_channel_page(channel)
-        if not html:
-            continue
+    if not (0 <= val <= 100):
+        await send_tg_message(chat_id, "Число должно быть от 0 до 100.")
+        return
 
-        posts = parse_public_posts(channel, html)
-        if not posts:
-            logger.info(f"В @{channel} нет постов или не удалось распарсить.")
-            continue
-
-        last_processed = int(state.get(channel, 0) or 0)
-        new_posts = [p for p in posts if p[0] > last_processed]
-        if not new_posts:
-            logger.info(f"Новых постов в @{channel} не найдено.")
-            continue
-
-        logger.info(f"Найдено новых постов в @{channel}: {len(new_posts)}")
-        for post_id, text, url in new_posts:
-            await process_public_post(channel, post_id, text, url, keywords)
-            state[channel] = max(state.get(channel, 0), post_id)
-
-        save_state(state)
+    STATE.min_risk_probability = val
+    save_state(STATE)
+    await send_tg_message(chat_id, f"✅ Новый порог вероятности самостроя: {val}%.")
 
 
-async def scan_loop() -> None:
-    state = load_state()
-    while True:
-        try:
-            await scan_once(state)
-        except Exception as e:
-            logger.error(f"Ошибка в scan_once: {e}")
-        await asyncio.sleep(SCAN_INTERVAL)
+# ------------------ MAIN ------------------ #
 
+async def main():
+    logger.info("🚀 Запуск Samastroi Scraper (public channels via web + rs_search_bot + карта)...")
 
-# ---------------------------------------------------------------------
-#  MAIN
-# ---------------------------------------------------------------------
-
-
-async def main() -> None:
+    # Проверка критических параметров
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не задан в .env")
-        return
-    if not TARGET_CHAT_ID:
+    if TARGET_CHAT_ID == 0:
         logger.error("TARGET_CHAT_ID не задан в .env")
-        return
 
-    logger.info("🚀 Запуск Samastroi Scraper (public channels via web)...")
+    # Запускаем Telethon-клиент для @rs_search_bot
+    if RS_CLIENT is not None:
+        await RS_CLIENT.start()
+        me = await RS_CLIENT.get_me()
+        logger.info(f"Telethon-сессия активна: {me}")
 
-    # Показать клавиатуру в группе
-    await send_control_keyboard()
-
+    # Параллельно: опрос публичных каналов и опрос Bot API (getUpdates)
     await asyncio.gather(
-        scan_loop(),
-        poll_updates_loop(),
+        scanner_loop(),
+        poll_updates(),
     )
+
+
+async def scanner_loop():
+    while True:
+        try:
+            await scan_once()
+        except Exception as e:
+            logger.error(f"Ошибка в scanner_loop: {e}")
+        await asyncio.sleep(180)  # интервал между полными проходами по каналам
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Остановка Samastroi Scraper по Ctrl+C")
+        logger.info("Остановка бота по Ctrl+C")
+        append_line(ANALYTICS_LOG, "STOPPED BY KEYBOARD")
