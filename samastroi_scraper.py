@@ -1,1405 +1,1149 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-SAMASTROI SCRAPER (single-file)
-- Telegram web-scrape of public channels (t.me/s/<channel>)
-- Card generation + persistent storage (/app/data)
-- Inline buttons: ✅ В работу / ❌ Неверно / 📎 Привязать (admins only)
-- Training dataset JSONL + history JSONL (never deleted by code changes if DATA_DIR is persistent)
-- Admin menu (/admin): stats, plot, threshold, admins management
-- YandexGPT probability enrichment + adaptive (rule-based) prior + few-shot prompt steering
-- Auto-filter cards below probability threshold
-"""
-
-import os
+import asyncio
 import json
-import time
-import uuid
-import logging
-import threading
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any, Tuple
+import os
+import re
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-import requests
-from bs4 import BeautifulSoup
+import httpx
+from dotenv import load_dotenv
+from loguru import logger
+from urllib.parse import quote_plus
 
+# ------------------ ЗАГРУЗКА НАСТРОЕК (.env) ------------------ #
 
-# ==========================================================
-# LOGGING
-# ==========================================================
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-log = logging.getLogger("samastroi_scraper")
+BASE_DIR = os.path.dirname(__file__)
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+load_dotenv(ENV_PATH)
 
+# Telegram Bot API
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0") or "0")
 
-# ==========================================================
-# STORAGE PATHS (Persistent if DATA_DIR is mounted)
-# ==========================================================
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+# Администраторы (для /risk и служебных команд)
+ADMIN_IDS: List[int] = []
+_raw_admin_ids = os.getenv("ADMIN_IDS", "").strip()
+if _raw_admin_ids:
+    for part in _raw_admin_ids.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ADMIN_IDS.append(int(part))
+        except ValueError:
+            logger.warning(f"Не могу распарсить ADMIN_ID '{part}'")
+
+# YandexGPT настройки
+YAGPT_API_KEY = os.getenv("YAGPT_API_KEY", "").strip()
+YAGPT_FOLDER_ID = os.getenv("YAGPT_FOLDER_ID", "").strip()
+
+# Яндекс Геокодер (для адрес -> координаты)
+YANDEX_GEOCODER_KEY = os.getenv("YANDEX_GEOCODER_KEY", "").strip()
+
+# Уровень логирования
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Порог вероятности самостроя по умолчанию
+DEFAULT_MIN_RISK_PROBABILITY = int(os.getenv("MIN_RISK_PROBABILITY", "10") or "10")
+
+# Настройки Telethon для работы с @rs_search_bot
+TG_API_ID = int(os.getenv("TG_API_ID", "0") or "0")
+TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
+SESSION_NAME = os.getenv("SESSION_NAME", "samastroi_rs_session").strip()
+
+# ID бота Росреестра
+RS_SEARCH_BOT = "rs_search_bot"  # @rs_search_bot
+
+# ------------------ ДИРЕКТОРИИ И ФАЙЛЫ ------------------ #
+
+DATA_DIR = os.path.join(BASE_DIR, "data")
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR, exist_ok=True)
 
-CARDS_DIR = os.path.join(DATA_DIR, "cards")
-os.makedirs(CARDS_DIR, exist_ok=True)
+GROUPS_FILE = os.path.join(DATA_DIR, "groups.txt")
+KEYWORDS_FILE = os.path.join(DATA_DIR, "keywords.txt")
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+MONITORING_LOG = os.path.join(DATA_DIR, "monitoring.log")
+ANALYTICS_LOG = os.path.join(DATA_DIR, "analytics.log")
+YAGPT_DATASET = os.path.join(DATA_DIR, "yagpt_dataset.jsonl")
+NEWS_FILE = os.path.join(DATA_DIR, "news.jsonl")
+ONZS_DIR = os.path.join(DATA_DIR, "onzs")
+os.makedirs(ONZS_DIR, exist_ok=True)
 
-TRAINING_DATASET = os.path.join(DATA_DIR, "training_dataset.jsonl")  # immutable append-only log
-HISTORY_CARDS = os.path.join(DATA_DIR, "history_cards.jsonl")        # immutable append-only log
-ADMINS_FILE = os.path.join(DATA_DIR, "admins.json")
-SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
-ADAPTIVE_RULES_FILE = os.path.join(DATA_DIR, "adaptive_rules.json")
+# ------------------ ЛОГИ ------------------ #
+
+logger.remove()
+logger.add(
+    os.path.join(LOGS_DIR, "scraper.log"),
+    rotation="10 MB",
+    encoding="utf-8",
+    level=LOG_LEVEL,
+)
+logger.add(lambda m: print(m, end=""), level=LOG_LEVEL)
 
 
-def ensure_file(path: str, default_content: Optional[str] = None) -> None:
+def ensure_file(path: str, default: str = ""):
     if not os.path.exists(path):
         with open(path, "w", encoding="utf-8") as f:
-            if default_content is not None:
-                f.write(default_content)
-        log.info(f"Created file: {path}")
+            f.write(default)
 
 
-ensure_file(TRAINING_DATASET)
-ensure_file(HISTORY_CARDS)
-ensure_file(ADMINS_FILE, default_content="[]")
-ensure_file(SETTINGS_FILE, default_content="{}")
-ensure_file(ADAPTIVE_RULES_FILE, default_content="{}")
+for fpath, default in [
+    (GROUPS_FILE, "# @username каналов, по одному в строке\n@podmoskow\n"),
+    (
+        KEYWORDS_FILE,
+        "самострой\nстройка\nстроительство\nнадзор\nштраф\nразрешение на строительство\nразрешение на ввод\nучасток\nземельный участок\n",
+    ),
+    (MONITORING_LOG, ""),
+    (ANALYTICS_LOG, ""),
+    (YAGPT_DATASET, ""),
+    (NEWS_FILE, ""),
+]:
+    ensure_file(fpath, default)
 
 
-# ==========================================================
-# DEFAULT ADMINS + ADMIN STORAGE
-# ==========================================================
-DEFAULT_ADMINS = [
-    5685586625,
-    272923789,
-    398960707,
-    777464055,
-    978125225,
-]
+def read_lines(path: str) -> List[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        return [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
 
 
-def load_admins() -> List[int]:
-    try:
-        with open(ADMINS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            admins = []
-            for x in data:
-                try:
-                    admins.append(int(x))
-                except Exception:
-                    continue
-            # If file is empty list — restore defaults (common Railway first-run case)
-            if not admins:
-                admins = list(DEFAULT_ADMINS)
-                with open(ADMINS_FILE, "w", encoding="utf-8") as wf:
-                    json.dump(admins, wf, ensure_ascii=False)
-            log.info(f"Loaded admins: {admins}")
-            return admins
-    except Exception as e:
-        log.error(f"Failed to load admins.json: {e}")
-
-    # fallback
-    try:
-        with open(ADMINS_FILE, "w", encoding="utf-8") as wf:
-            json.dump(DEFAULT_ADMINS, wf, ensure_ascii=False)
-    except Exception:
-        pass
-    log.info(f"Restored default admins: {DEFAULT_ADMINS}")
-    return list(DEFAULT_ADMINS)
+def append_line(path: str, text: str):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"[{now}] {text}\n")
 
 
-ADMINS: List[int] = load_admins()
-
-
-def save_admins() -> None:
-    with open(ADMINS_FILE, "w", encoding="utf-8") as f:
-        json.dump(ADMINS, f, ensure_ascii=False)
-    log.info(f"Saved admins: {ADMINS}")
-
-
-def is_admin(user_id: int) -> bool:
-    return int(user_id) in set(ADMINS)
-
-
-def add_admin(user_id: int) -> bool:
-    uid = int(user_id)
-    if uid in ADMINS:
-        return False
-    ADMINS.append(uid)
-    save_admins()
-    return True
-
-
-def remove_admin(user_id: int) -> bool:
-    uid = int(user_id)
-    if uid not in ADMINS:
-        return False
-    ADMINS.remove(uid)
-    save_admins()
-    return True
-
-
-# ==========================================================
-# SETTINGS (threshold etc.)
-# ==========================================================
-def load_settings() -> Dict[str, Any]:
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    return {}
-
-
-def save_settings(settings: Dict[str, Any]) -> None:
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
-
-
-SETTINGS = load_settings()
-DEFAULT_THRESHOLD = int(os.getenv("PROB_THRESHOLD", str(SETTINGS.get("prob_threshold", 0) or 0)))
-
-
-def get_threshold() -> int:
-    v = SETTINGS.get("prob_threshold", DEFAULT_THRESHOLD)
-    try:
-        v = int(v)
-    except Exception:
-        v = DEFAULT_THRESHOLD
-    if v < 0:
-        v = 0
-    if v > 100:
-        v = 100
-    return v
-
-
-def set_threshold(v: int) -> int:
-    v = int(v)
-    if v < 0:
-        v = 0
-    if v > 100:
-        v = 100
-    SETTINGS["prob_threshold"] = v
-    save_settings(SETTINGS)
-    return v
-
-
-# ==========================================================
-# TARGET CHAT / BOT API
-# ==========================================================
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1003502443229"))
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
-
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
-MAX_CARDS_LIST = int(os.getenv("MAX_CARDS_LIST", "20"))
-MAX_HISTORY_EVENTS = int(os.getenv("MAX_HISTORY_EVENTS", "50"))
-TARGET_DATASET_SIZE = int(os.getenv("TARGET_DATASET_SIZE", "5000"))
-
-if not BOT_TOKEN:
-    log.warning("BOT_TOKEN is not set. Sending cards and admin controls will not work.")
-log.info(f"Cards will be sent to chat_id: {TARGET_CHAT_ID}")
-log.info(f"DATA_DIR={DATA_DIR} (must be persistent volume if you want training/history to survive redeploys)")
-
-
-# ==========================================================
-# KEYWORDS
-# ==========================================================
-KEYWORDS = [
-    "стройка", "строительство", "самострой", "котлован", "фундамент",
-    "арматура", "многоквартирный", "жилой комплекс", "кран", "экскаватор",
-    "строители", "проверка", "застройщик", "разрешение", "рнс", "благоустройство",
-    "снос", "надзор", "мчс", "инженер", "штраф",
-]
-KEYWORDS_LOWER = [k.lower() for k in KEYWORDS]
-
-
-def normalize_text(text: str) -> str:
-    if not isinstance(text, str):
-        return ""
-    t = text.replace("\n", " ").replace("\t", " ")
-    t = " ".join(t.split())
-    return t.lower().strip()
-
-
-def detect_keywords(text: str) -> List[str]:
-    t = text.lower()
-    return [kw for kw in KEYWORDS_LOWER if kw in t]
-
-
-# ==========================================================
-# ADAPTIVE RULES (rule-based "fine-tuning")
-# ==========================================================
-def load_adaptive_rules() -> Dict[str, Any]:
-    try:
-        with open(ADAPTIVE_RULES_FILE, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_adaptive_rules(obj: Dict[str, Any]) -> None:
-    with open(ADAPTIVE_RULES_FILE, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
-
-ADAPTIVE = load_adaptive_rules()
-# Structure:
-# {
-#   "keywords": {"стройка": {"work": 12, "wrong": 3}, ...},
-#   "channels": {"tipkhimki": {"work": 2, "wrong": 7}, ...}
-# }
-
-
-def _inc_counter(d: Dict[str, Any], key: str, label: str) -> None:
-    bucket = d.setdefault(key, {"work": 0, "wrong": 0, "attach": 0})
-    if label not in bucket:
-        bucket[label] = 0
-    bucket[label] += 1
-
-
-def update_adaptive_from_training(label: str, text: str, channel: str = "") -> None:
-    label = label.lower()
-    if label not in ("work", "wrong", "attach"):
-        return
-
-    # only work/wrong affect "probability", attach is neutral
-    if label in ("work", "wrong"):
-        kws = detect_keywords(normalize_text(text))
-        kw_stats = ADAPTIVE.setdefault("keywords", {})
-        for kw in kws:
-            _inc_counter(kw_stats, kw, label)
-
-        if channel:
-            ch_stats = ADAPTIVE.setdefault("channels", {})
-            _inc_counter(ch_stats, channel, label)
-
-        save_adaptive_rules(ADAPTIVE)
-
-
-def compute_rule_prior(text: str, channel: str = "") -> Optional[float]:
-    """
-    Returns prior probability 0..100 derived from adaptive keyword/channel stats.
-    If no adaptive data yet, returns None.
-    """
-    kw_stats = (ADAPTIVE.get("keywords") or {})
-    ch_stats = (ADAPTIVE.get("channels") or {})
-
-    signals: List[float] = []
-    t_norm = normalize_text(text)
-    kws = detect_keywords(t_norm)
-
-    def score_bucket(bucket: Dict[str, Any]) -> Optional[float]:
-        try:
-            w = int(bucket.get("work", 0))
-            r = int(bucket.get("wrong", 0))
-            n = w + r
-            if n <= 0:
-                return None
-            # score in [-1, +1]
-            s = (w - r) / n
-            return float(s)
-        except Exception:
-            return None
-
-    for kw in kws:
-        b = kw_stats.get(kw)
-        if isinstance(b, dict):
-            s = score_bucket(b)
-            if s is not None:
-                signals.append(s)
-
-    if channel and channel in ch_stats and isinstance(ch_stats[channel], dict):
-        s = score_bucket(ch_stats[channel])
-        if s is not None:
-            signals.append(s)
-
-    if not signals:
-        return None
-
-    # Aggregate and map to [0..100]
-    avg = sum(signals) / len(signals)
-    prior = (avg + 1.0) * 50.0
-    if prior < 0:
-        prior = 0.0
-    if prior > 100:
-        prior = 100.0
-    return prior
-
-
-# ==========================================================
-# TRAINING / HISTORY LOGS (append-only)
-# ==========================================================
-def append_jsonl(path: str, obj: Dict[str, Any]) -> None:
-    obj = dict(obj)
+def append_jsonl(path: str, obj: dict):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
-def log_training_event(card_id: str, label: str, from_user: int, text: str = "", channel: str = "") -> None:
-    rec = {
-        "timestamp": int(time.time()),
-        "card_id": card_id,
-        "label": label,
-        "from_user": int(from_user),
-        "text": text,
-        "channel": channel,
-    }
-    append_jsonl(TRAINING_DATASET, rec)
-    update_adaptive_from_training(label, text=text, channel=channel)
-    log.info(f"[TRAIN] {label.upper()} card_id={card_id} user={from_user}")
+# ------------------ СОСТОЯНИЕ (state.json) ------------------ #
 
 
-def append_history(event: Dict[str, Any]) -> None:
-    event = dict(event)
-    event["ts"] = int(time.time())
-    append_jsonl(HISTORY_CARDS, event)
+@dataclass
+class BotState:
+    last_post_ids: Dict[str, int]
+    user_subscriptions: Dict[str, List[int]]  # user_id -> [1..12]
+    user_paused: Dict[str, bool]
+    min_risk_probability: int
+
+    @staticmethod
+    def default() -> "BotState":
+        return BotState(
+            last_post_ids={},
+            user_subscriptions={},
+            user_paused={},
+            min_risk_probability=DEFAULT_MIN_RISK_PROBABILITY,
+        )
 
 
-# ==========================================================
-# TELEGRAM WEB SCRAPE
-# ==========================================================
-def fetch_channel_page(url: str) -> Optional[str]:
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+def load_state() -> BotState:
+    if not os.path.exists(STATE_FILE):
+        return BotState.default()
     try:
-        r = requests.get(url, headers=headers, timeout=15)
-        if r.status_code != 200:
-            log.error(f"HTTP {r.status_code} for {url}")
-            return None
-        return r.text
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return BotState(
+            last_post_ids=data.get("last_post_ids", {}),
+            user_subscriptions=data.get("user_subscriptions", {}),
+            user_paused=data.get("user_paused", {}),
+            min_risk_probability=int(
+                data.get("min_risk_probability", DEFAULT_MIN_RISK_PROBABILITY)
+            ),
+        )
     except Exception as e:
-        log.error(f"Request error {url}: {e}")
+        logger.error(f"Ошибка чтения {STATE_FILE}: {e}")
+        return BotState.default()
+
+
+def save_state(state: BotState):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(asdict(state), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка записи {STATE_FILE}: {e}")
+
+
+STATE = load_state()
+
+# ------------------ YANDEX GPT ------------------ #
+
+YAGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+
+
+async def call_yandex_gpt_json(prompt: str, temperature: float = 0.2) -> Optional[Dict[str, Any]]:
+    """
+    Вызывает YandexGPT и пытается распарсить JSON из ответа (внутри ```json ... ```).
+    Ожидаемый формат:
+    {
+      "object_type": "...",
+      "violation_type": "...",
+      "address": "...",
+      "okrug_city": "...",
+      "cadastral_number": "...",
+      "risk_probability": 0-100,
+      "risk_score": 0-100,
+      "risk_level": "низкий/средний/высокий",
+      "summary": "..."
+    }
+    """
+    if not (YAGPT_API_KEY and YAGPT_FOLDER_ID):
+        logger.warning("YAGPT не настроен (нет API_KEY или FOLDER_ID).")
+        return None
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Api-Key {YAGPT_API_KEY}",
+        "x-folder-id": YAGPT_FOLDER_ID,
+    }
+
+    system_prompt = (
+        "Ты помощник инспектора Главгосстройнадзора Московской области. "
+        "По тексту сообщения из Telegram нужно понять, есть ли признаки самовольного строительства "
+        "и, если да, структурировать данные в JSON: объект, адрес, кадастровый номер, риск и краткое описание."
+        "Отвечай строго одним JSON-объектом, без комментариев, без текста до и после."
+    )
+
+    payload = {
+        "modelUri": f"gpt://{YAGPT_FOLDER_ID}/yandexgpt/latest",
+        "completionOptions": {
+            "maxTokens": 400,
+            "temperature": temperature,
+            "stream": False,
+        },
+        "messages": [
+            {"role": "system", "text": system_prompt},
+            {"role": "user", "text": prompt},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=40) as client:
+            resp = await client.post(YAGPT_URL, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.error(f"Ошибка при обращении к YandexGPT: {e}")
+        append_line(ANALYTICS_LOG, f"YAGPT_ERROR: {e}")
+        return None
+
+    try:
+        text = data["result"]["alternatives"][0]["message"]["text"]
+        text = text.strip()
+        # Срезаем ```json ... ``` если есть
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z]*", "", text)
+            text = re.sub(r"```$", "", text).strip()
+        obj = json.loads(text)
+        return obj
+    except Exception as e:
+        logger.error(f"Не удалось распарсить JSON из YAGPT: {e}; raw={data}")
+        append_line(ANALYTICS_LOG, f"YAGPT_JSON_PARSE_ERROR: {e}")
         return None
 
 
-def iso_to_epoch_seconds(iso_str: str) -> Optional[int]:
+# ------------------ КООРДИНАТЫ / РОСРЕЕСТР ------------------ #
+
+def extract_coords(text: str) -> Optional[Tuple[float, float]]:
     """
-    Telegram page uses <time datetime="2025-12-15T10:22:08+00:00">.
-    Convert to epoch seconds.
+    Ищем в тексте координаты вида 56.054712 37.148884 или 56.054712, 37.148884.
     """
-    if not iso_str or not isinstance(iso_str, str):
+    pattern = r"(\d{1,2}\.\d{5,})[,\s]+(\d{1,2}\.\d{5,})"
+    m = re.search(pattern, text)
+    if not m:
         return None
     try:
-        # Python 3.11: fromisoformat supports "+00:00"
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    except Exception:
+        lat = float(m.group(1))
+        lon = float(m.group(2))
+        return lat, lon
+    except ValueError:
         return None
 
 
-def extract_posts(html: str) -> List[Dict[str, Any]]:
-    soup = BeautifulSoup(html, "html.parser")
-    messages = soup.find_all("div", class_="tgme_widget_message")
-    posts: List[Dict[str, Any]] = []
-
-    for msg in messages:
-        try:
-            msg_id = msg.get("data-post", "")  # e.g. "channel/123"
-            text_block = msg.find("div", class_="tgme_widget_message_text")
-            text = text_block.get_text(" ", strip=True) if text_block else ""
-
-            date_block = msg.find("time", class_="time")
-            ts = None
-            if date_block and date_block.get("datetime"):
-                ts = iso_to_epoch_seconds(date_block.get("datetime"))
-            if ts is None:
-                ts = int(time.time())
-
-            links = []
-            for a in msg.find_all("a", href=True):
-                href = a["href"]
-                if href.startswith("http"):
-                    links.append(href)
-
-            posts.append({"id": msg_id, "text": text, "timestamp": ts, "links": links})
-        except Exception as e:
-            log.error(f"Post parse error: {e}")
-
-    return posts
-
-
-CHANNEL_LIST = [
-    "tipkhimki", "lobnya", "dolgopacity", "vkhimki",
-    "podslushanovsolnechnogorske", "klingorod", "mspeaks",
-    "pushkino_official", "podmoskow", "trofimovonline",
-    "Tipichnoe_Pushkino", "chp_sergiev_posad", "kraftyou",
-    "kontext_channel", "podslushano_ivanteevka", "pushkino_live",
-    "life_sergiev_posad", "Podslushano_Vidnoe", "novosti_vidnoe",
-    "mchs_vidnoe", "mchs_mo", "domodedovop", "bobrovotoday",
-    "nedvizha", "developers_policy"
-]
-
-
-def process_channel(channel_username: str) -> List[Dict[str, Any]]:
-    url = f"https://t.me/s/{channel_username}"
-    html = fetch_channel_page(url)
-    if not html:
-        return []
-
-    posts = extract_posts(html)
-    hits: List[Dict[str, Any]] = []
-
-    for p in posts:
-        t_norm = normalize_text(p["text"])
-        found = detect_keywords(t_norm)
-        if found:
-            hits.append({
-                "channel": channel_username,
-                "post_id": p["id"],
-                "text": p["text"],
-                "links": p["links"],
-                "timestamp": p["timestamp"],
-                "keywords": found,
-            })
-
-    return hits
-
-
-def scan_once() -> List[Dict[str, Any]]:
-    all_hits: List[Dict[str, Any]] = []
-    for ch in CHANNEL_LIST:
-        try:
-            hits = process_channel(ch)
-            if hits:
-                log.info(f"@{ch}: hits={len(hits)}")
-            all_hits.extend(hits)
-        except Exception as e:
-            log.error(f"Channel @{ch} error: {e}")
-    return all_hits
-
-
-# ==========================================================
-# CARD MODEL
-# ==========================================================
-def generate_card_id() -> str:
-    return str(uuid.uuid4())[:12]
-
-
-def card_path(card_id: str) -> str:
-    return os.path.join(CARDS_DIR, f"{card_id}.json")
-
-
-def save_card(card: Dict[str, Any]) -> None:
-    with open(card_path(card["card_id"]), "w", encoding="utf-8") as f:
-        json.dump(card, f, ensure_ascii=False, indent=2)
-
-
-def load_card(card_id: str) -> Optional[Dict[str, Any]]:
-    p = card_path(card_id)
-    if not os.path.exists(p):
+async def geocode_address(address: str) -> Optional[Tuple[float, float]]:
+    """
+    Преобразует адрес в координаты через Яндекс Геокодер.
+    """
+    if not (YANDEX_GEOCODER_KEY and address):
         return None
+
+    url = "https://geocode-maps.yandex.ru/1.x/"
+    params = {
+        "apikey": YANDEX_GEOCODER_KEY,
+        "format": "json",
+        "geocode": address,
+        "lang": "ru_RU",
+    }
     try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+        member = (
+            data["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]
+        )
+        pos = member["Point"]["pos"]  # "37.620393 55.75396"
+        lon_str, lat_str = pos.split()
+        return float(lat_str), float(lon_str)
+    except Exception as e:
+        logger.error(f"Ошибка геокодера для '{address}': {e}")
         return None
+
+
+# ------------------ TELETHON для @rs_search_bot ------------------ #
+
+from telethon import TelegramClient, events
+
+if TG_API_ID == 0 or not TG_API_HASH:
+    logger.warning("TG_API_ID/TG_API_HASH не заданы — интеграция с @rs_search_bot работать не будет.")
+    RS_CLIENT: Optional[TelegramClient] = None
+else:
+    RS_CLIENT = TelegramClient(SESSION_NAME, TG_API_ID, TG_API_HASH)
+
+
+async def ensure_rs_client_started():
+    if RS_CLIENT is None:
+        return
+    if not RS_CLIENT.is_connected():
+        await RS_CLIENT.start()
+
+
+async def query_rs_search_bot_by_coords(lat: float, lon: float) -> Optional[str]:
+    """
+    Отправляет координаты в @rs_search_bot и возвращает его ответ (текст).
+    Формат координат: "56.007403 37.869397".
+    """
+    if RS_CLIENT is None:
+        return None
+
+    await ensure_rs_client_started()
+
+    coords_text = f"{lat:.6f} {lon:.6f}"
+    try:
+        bot_entity = await RS_CLIENT.get_entity(RS_SEARCH_BOT)
+        await RS_CLIENT.send_message(bot_entity, coords_text)
+
+        @RS_CLIENT.on(events.NewMessage(from_users=bot_entity))
+        async def handler(event):
+            pass
+
+        # Ждем ответа 15 секунд
+        resp = await RS_CLIENT.wait_for(
+            events.NewMessage(from_users=bot_entity), timeout=15
+        )
+        return resp.raw_text
+    except Exception as e:
+        logger.error(f"Ошибка запроса к @rs_search_bot: {e}")
+        return None
+
+
+def extract_rosreestr_block(text: str) -> Optional[str]:
+    """
+    Из ответа @rs_search_bot вынимаем две ключевые строки:
+    - 'Кад. номер ЗУ ...'
+    - 'RU.. от ....'
+    И формируем блок:
+      Кад. номер ЗУ ...
+      
+      RU...
+    """
+    if not text:
+        return None
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    kad_line = None
+    ru_line = None
+    for line in lines:
+        if kad_line is None and line.startswith("Кад. номер"):
+            kad_line = line
+        if ru_line is None and line.startswith("RU"):
+            ru_line = line
+        if kad_line and ru_line:
+            break
+
+    if not kad_line and not ru_line:
+        return None
+
+    parts = []
+    if kad_line:
+        parts.append(kad_line)
+    if ru_line:
+        if parts:
+            parts.append("")
+        parts.append(ru_line)
+    return "\n".join(parts)
+
+
+# ------------------ ONZS МАППИНГ ------------------ #
+
+ONZS_MAPPING: Dict[int, List[str]] = {
+    1: [
+        "одинцовский",
+        "наро-фоминский",
+        "власиха",
+        "краснознаменск",
+        "можайск",
+    ],
+    2: [
+        "красногорск",
+        "истра",
+        "восход",
+        "волоколамск",
+        "лотошино",
+        "руза",
+        "шаховская",
+    ],
+    3: [
+        "химки",
+        "солнечногорск",
+        "долгопрудный",
+        "лобня",
+        "клин",
+    ],
+    4: [
+        "мытищи",
+        "королев",
+    ],
+    5: [
+        "пушкинский",
+        "сергиево-посад",
+    ],
+    6: [
+        "подольск",
+        "серпухов",
+        "чехов",
+    ],
+    7: [
+        "домодедово",
+        "ленинский",
+    ],
+    8: [
+        "щелково",
+        "звездный городок",
+        "лосино-петровский",
+        "фрязино",
+        "черноголовка",
+        "электросталь",
+    ],
+    9: [
+        "люберц",
+        "котельник",
+        "лыткарин",
+        "балаших",
+        "реутов",
+    ],
+    10: [
+        "коломн",
+        "воскресенск",
+        "зарайск",
+        "кашира",
+        "луховиц",
+        "раменск",
+        "бронниц",
+        "жуковск",
+        "серебряные пруды",
+        "ступино",
+    ],
+    11: [
+        "дмитров",
+        "дубна",
+        "талдом",
+    ],
+    12: [
+        "орехово-зуево",
+        "егорьевск",
+        "павлово-посад",
+        "шатур",
+    ],
+}
+
+
+def detect_onzs_by_text(text: str) -> int:
+    """
+    Простейшее определение ОНзС по тексту (адрес, округ, город).
+    """
+    t = text.lower()
+    for onzs, patterns in ONZS_MAPPING.items():
+        for p in patterns:
+            if p in t:
+                return onzs
+    return 0
+
+
+# ------------------ КОНСТРУКЦИЯ КАРТОЧЕК ------------------ #
 
 
 def build_card_text(card: Dict[str, Any]) -> str:
-    ts = card.get("timestamp")
-    dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M") if isinstance(ts, int) else "—"
-    keywords = ", ".join(card.get("keywords", [])) or "—"
-    links = card.get("links") or []
-    links_str = "\n".join(links) if links else "нет ссылок"
+    """
+    Формируем текст карточки по данным, которые вернул YandexGPT + Росреестр.
+    """
+    channel = card.get("channel", "-")
+    post_id = card.get("post_id", "-")
+    original_url = card.get("original_url", "-")
 
-    lines = [
-        "🔎 Обнаружено подозрительное сообщение",
-        f"Источник: @{card.get('channel','—')}",
-        f"Дата: {dt}",
-        f"ID поста: {card.get('post_id','—')}",
-        "",
-        f"🔑 Ключевые слова: {keywords}",
-        "",
-        "📝 Текст сообщения:",
-        card.get("text", "") or "—",
-        "",
-        "📎 Ссылки:",
-        links_str,
-        "",
-        f"🆔 ID карточки: {card.get('card_id')}",
-    ]
+    object_type = card.get("object_type") or "-"
+    violation_type = card.get("violation_type") or "-"
+    address = card.get("address") or "-"
+    okrug_city = card.get("okrug_city") or "-"
+    cadastral_number = card.get("cadastral_number") or card.get("rosreestr_kad") or "-"
+    risk_probability = card.get("risk_probability")
+    risk_score = card.get("risk_score")
+    risk_level = card.get("risk_level") or "-"
+    summary = card.get("summary") or "-"
+    rosreestr_block = card.get("rosreestr_block") or "-"
 
-    # AI block
-    ai = card.get("ai") or {}
-    prob = ai.get("probability_final")
-    comment = ai.get("comment")
-    if prob is not None or comment:
-        lines.append("")
-        lines.append(f"🤖 Вероятность самостроя: {float(prob):.1f}%" if prob is not None else "🤖 Вероятность самостроя: —")
-        if comment:
-            lines.append(f"💬 Комментарий ИИ: {comment}")
+    if risk_probability is None:
+        risk_probability = 0
+    if risk_score is None:
+        risk_score = risk_probability
 
-    return "\n".join(lines)
+    text_lines = []
 
+    text_lines.append(f"Найдено в {channel}")
+    text_lines.append("")
+    text_lines.append("🏗 Объект и нарушение")
+    text_lines.append(f"• Тип объекта: {object_type}")
+    text_lines.append(f"• Тип нарушения: {violation_type}")
+    text_lines.append(f"• Адрес: {address}")
+    text_lines.append(f"• Округ/город: {okrug_city}")
+    text_lines.append(f"• Кадастровый номер: {cadastral_number}")
+    text_lines.append(
+        f"📈 Вероятность самостроя: {risk_probability}%"
+    )
+    text_lines.append(f"🧠 Итоговый риск ИИ: {risk_level} ({risk_score} из 100)")
+    text_lines.append("")
+    text_lines.append("📝 Кратко по сути:")
+    text_lines.append(summary)
+    text_lines.append("")
 
-# ==========================================================
-# YANDEXGPT INTEGRATION (prompt steering with few-shot)
-# ==========================================================
-YAGPT_API_KEY = os.getenv("YAGPT_API_KEY", "").strip()
-YAGPT_FOLDER_ID = os.getenv("YAGPT_FOLDER_ID", "").strip()
-YAGPT_ENDPOINT = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-YAGPT_MODEL = os.getenv("YAGPT_MODEL", "gpt://{folder_id}/yandexgpt/latest")
+    text_lines.append("📑 Данные Росреестра")
+    text_lines.append(rosreestr_block if rosreestr_block != "-" else "нет данных")
+    text_lines.append("")
 
-
-def tail_training_examples(limit: int = 6) -> List[Dict[str, Any]]:
-    if not os.path.exists(TRAINING_DATASET):
-        return []
-    try:
-        with open(TRAINING_DATASET, "r", encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f.readlines() if ln.strip()]
-    except Exception:
-        return []
-    out: List[Dict[str, Any]] = []
-    for ln in lines[::-1]:
-        try:
-            obj = json.loads(ln)
-        except Exception:
-            continue
-        label = (obj.get("label") or "").lower()
-        txt = (obj.get("text") or "").strip()
-        if label in ("work", "wrong") and txt:
-            out.append({"label": label, "text": txt[:800]})
-            if len(out) >= limit:
-                break
-    return out[::-1]
-
-
-def build_few_shot_block() -> str:
-    examples = tail_training_examples(limit=6)
-    if not examples:
-        return ""
-    parts = ["Примеры решений инспектора (для калибровки):"]
-    for ex in examples:
-        lab = "САМOСТРОЙ (в работу)" if ex["label"] == "work" else "НЕ САМOСТРОЙ (неверно)"
-        parts.append(f"- Пример: {lab}\n  Текст: {ex['text']}")
-    return "\n".join(parts) + "\n\n"
-
-
-def call_yandex_gpt_json(text: str) -> Optional[Dict[str, Any]]:
-    if not YAGPT_API_KEY or not YAGPT_FOLDER_ID:
-        return None
-
-    model_uri = YAGPT_MODEL.format(folder_id=YAGPT_FOLDER_ID)
-    few_shot = build_few_shot_block()
-
-    prompt = (
-        "Ты помощник инспектора строительного надзора.\n"
-        "Ниже дан текст сообщения из Telegram.\n"
-        "Твоя задача: оценить вероятность, что сообщение связано с самовольным/незаконным строительством (самострой).\n\n"
-        f"{few_shot}"
-        "Правила ответа:\n"
-        "1) probability: число 0..100\n"
-        "2) comment: короткое пояснение (1-2 предложения)\n"
-        "Верни строго JSON без лишнего текста.\n\n"
-        f"Текст сообщения:\n{text}"
+    text_lines.append(f"🔗 Открыть оригинал сообщения ({original_url})")
+    text_lines.append("")
+    text_lines.append(
+        "🧠 Обучение: ответь на эту карточку словами «в работу», «неверно» или «привязать» "
+        "или нажми соответствующую кнопку под карточкой."
     )
 
-    body = {
-        "modelUri": model_uri,
-        "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": 220},
-        "messages": [{"role": "user", "text": prompt}],
-    }
-    headers = {
-        "Authorization": f"Api-Key {YAGPT_API_KEY}",
-        "x-folder-id": YAGPT_FOLDER_ID,
-        "Content-Type": "application/json",
-    }
+    text_lines.append("")
+    text_lines.append(card.get("source_excerpt", "Фрагмент исходного сообщения недоступен."))
 
-    try:
-        resp = requests.post(YAGPT_ENDPOINT, headers=headers, json=body, timeout=25)
-        data = resp.json()
-    except Exception as e:
-        log.error(f"YandexGPT request error: {e}")
-        return None
-
-    try:
-        out_text = data["result"]["alternatives"][0]["message"]["text"]
-    except Exception:
-        log.error(f"YandexGPT unexpected response: {data}")
-        return None
-
-    # extract JSON object safely
-    s = (out_text or "").strip()
-    if not s.startswith("{"):
-        a = s.find("{")
-        b = s.rfind("}")
-        if a != -1 and b != -1 and b > a:
-            s = s[a:b+1]
-
-    try:
-        return json.loads(s)
-    except Exception:
-        log.error(f"YandexGPT JSON parse error. raw={out_text}")
-        return None
+    return "\n".join(text_lines)
 
 
-def enrich_card_with_ai(card: Dict[str, Any]) -> None:
-    text = card.get("text") or ""
-    channel = card.get("channel") or ""
-    prior = compute_rule_prior(text, channel=channel)  # may be None
+def build_inline_keyboard(card: Dict[str, Any], channel: str, post_id: int) -> Dict[str, Any]:
+    """
+    Инлайн-клавиатура:
+      • в работу / неверно / привязать
+      • 📍 Посмотреть на карте (если есть адрес)
+    """
+    card_key = f"{channel}:{post_id}"
 
-    yagpt_prob = None
-    yagpt_comment = ""
-
-    obj = call_yandex_gpt_json(text) if (YAGPT_API_KEY and YAGPT_FOLDER_ID) else None
-    if isinstance(obj, dict):
-        try:
-            yagpt_prob = float(obj.get("probability"))
-        except Exception:
-            yagpt_prob = None
-        yagpt_comment = (obj.get("comment") or "").strip()
-
-    # combine
-    final_prob = None
-    if yagpt_prob is not None and prior is not None:
-        # Blend AI + adaptive prior
-        final_prob = 0.75 * yagpt_prob + 0.25 * prior
-    elif yagpt_prob is not None:
-        final_prob = yagpt_prob
-    elif prior is not None:
-        final_prob = prior
-
-    # clamp
-    if final_prob is not None:
-        if final_prob < 0:
-            final_prob = 0.0
-        if final_prob > 100:
-            final_prob = 100.0
-
-    card.setdefault("ai", {})
-    if yagpt_prob is not None:
-        card["ai"]["probability_yagpt"] = yagpt_prob
-    if prior is not None:
-        card["ai"]["probability_prior"] = prior
-    if final_prob is not None:
-        card["ai"]["probability_final"] = float(final_prob)
-    if yagpt_comment:
-        card["ai"]["comment"] = yagpt_comment
-
-
-def generate_card(hit: Dict[str, Any]) -> Dict[str, Any]:
-    cid = generate_card_id()
-    card = {
-        "card_id": cid,
-        "channel": hit["channel"],
-        "post_id": hit["post_id"],
-        "timestamp": hit["timestamp"],
-        "text": hit["text"],
-        "keywords": hit["keywords"],
-        "links": hit["links"],
-        "status": "new",          # new/sent/filtered/in_work/wrong/bind
-        "history": [],
-    }
-    enrich_card_with_ai(card)
-    save_card(card)
-    return card
-
-
-# ==========================================================
-# TELEGRAM SENDING + INLINE KEYBOARD
-# ==========================================================
-def build_card_keyboard(card_id: str) -> Dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "✅ В работу", "callback_data": f"card:{card_id}:work"},
-                {"text": "❌ Неверно", "callback_data": f"card:{card_id}:wrong"},
-            ],
-            [{"text": "📎 Привязать", "callback_data": f"card:{card_id}:bind"}],
+    keyboard: List[List[Dict[str, Any]]] = [
+        [
+            {
+                "text": "в работу",
+                "callback_data": f"train:work:{card_key}",
+            },
+            {
+                "text": "неверно",
+                "callback_data": f"train:wrong:{card_key}",
+            },
+            {
+                "text": "привязать",
+                "callback_data": f"train:attach:{card_key}",
+            },
         ]
-    }
+    ]
+
+    address = (card.get("address") or "").strip()
+    if address and address != "-":
+        try:
+            query = quote_plus(address)
+            map_url = f"https://yandex.ru/maps/?text={query}"
+            keyboard.append(
+                [
+                    {
+                        "text": "📍 Посмотреть на карте",
+                        "url": map_url,
+                    }
+                ]
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при формировании ссылки на карту: {e}")
+
+    return {"inline_keyboard": keyboard}
 
 
-def send_telegram(method: str, payload: Dict[str, Any], timeout: int = 20) -> Optional[Dict[str, Any]]:
-    if not TELEGRAM_API_URL:
+# ------------------ Telegram Bot API (отправка сообщений) ------------------ #
+
+TG_API_BASE = "https://api.telegram.org"
+
+
+async def tg_request(method: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{TG_API_BASE}/bot{BOT_TOKEN}/{method}"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, json=data)
+        r.raise_for_status()
+        return r.json()
+
+
+async def send_card_to_tg_group(card: Dict[str, Any]) -> Optional[int]:
+    """
+    Отправляем карточку в целевой чат + тему «Новости» (если есть).
+    """
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN не задан — не могу отправлять карточки в Telegram.")
         return None
-    try:
-        resp = requests.post(f"{TELEGRAM_API_URL}/{method}", json=payload, timeout=timeout)
-        data = resp.json()
-        if not data.get("ok"):
-            log.error(f"Telegram API error {method}: {data}")
-            return None
-        return data.get("result")
-    except Exception as e:
-        log.error(f"Telegram API exception {method}: {e}")
-        return None
-
-
-def send_plain_message(chat_id: int, text: str) -> None:
-    send_telegram("sendMessage", {"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
-
-
-def send_message_with_keyboard(chat_id: int, text: str, reply_markup: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": False,
-        "reply_markup": reply_markup,
-    }
-    return send_telegram("sendMessage", payload)
-
-
-def edit_message_reply_markup(chat_id: int, message_id: int, reply_markup: Optional[Dict[str, Any]]) -> None:
-    payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup}
-    send_telegram("editMessageReplyMarkup", payload)
-
-
-def answer_callback_query(cb_id: str, text: str = "", show_alert: bool = False) -> None:
-    payload = {"callback_query_id": cb_id, "text": text, "show_alert": show_alert}
-    send_telegram("answerCallbackQuery", payload)
-
-
-def should_send_card(card: Dict[str, Any]) -> Tuple[bool, Optional[float]]:
-    thr = get_threshold()
-    ai = card.get("ai") or {}
-    prob = ai.get("probability_final")
-    if prob is None:
-        # if no AI/probability available, treat as 0 (or always send if threshold=0)
-        prob = 0.0
-    try:
-        p = float(prob)
-    except Exception:
-        p = 0.0
-    return (p >= thr), p
-
-
-def send_card_to_group(card: Dict[str, Any]) -> Optional[int]:
-    ok_send, p = should_send_card(card)
-    if not ok_send:
-        card["status"] = "filtered"
-        card.setdefault("history", []).append({"event": "filtered", "threshold": get_threshold(), "prob": p, "ts": int(time.time())})
-        save_card(card)
-        append_history({"event": "filtered", "card_id": card["card_id"], "threshold": get_threshold(), "prob": p})
-        log.info(f"Filtered card {card['card_id']} prob={p} < thr={get_threshold()}")
+    if TARGET_CHAT_ID == 0:
+        logger.error("TARGET_CHAT_ID не задан — некуда отправлять карточки.")
         return None
 
     text = build_card_text(card)
-    kb = build_card_keyboard(card["card_id"])
-    res = send_message_with_keyboard(TARGET_CHAT_ID, text, kb)
-    if not res:
+    channel = card.get("channel", "-")
+    post_id = card.get("post_id", 0)
+    markup = build_inline_keyboard(card, channel, post_id)
+
+    data: Dict[str, Any] = {
+        "chat_id": TARGET_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",  # текст без HTML, но пусть будет
+        "disable_web_page_preview": True,
+        "reply_markup": markup,
+    }
+
+    try:
+        resp = await tg_request("sendMessage", data)
+        if not resp.get("ok"):
+            logger.error(f"Telegram API error: {resp}")
+            return None
+        message_id = resp["result"]["message_id"]
+        return message_id
+    except Exception as e:
+        logger.error(f"Ошибка отправки карточки в Telegram: {e}")
         return None
 
-    message_id = res.get("message_id")
-    chat_id = res.get("chat", {}).get("id")
 
-    card.setdefault("tg", {})
-    card["tg"]["chat_id"] = chat_id
-    card["tg"]["message_id"] = message_id
-    card["status"] = "sent"
-    card.setdefault("history", []).append({"event": "sent", "chat_id": chat_id, "message_id": message_id, "ts": int(time.time())})
-    save_card(card)
+# ------------------ ПОДПИСКИ ПОЛЬЗОВАТЕЛЕЙ НА ОНзС ------------------ #
 
-    append_history({"event": "sent", "card_id": card["card_id"], "chat_id": chat_id, "message_id": message_id})
-    return message_id
-
-
-def send_cards_to_group(cards: List[Dict[str, Any]]) -> int:
-    cnt = 0
-    for c in cards:
-        mid = send_card_to_group(c)
-        if mid:
-            cnt += 1
-            time.sleep(0.35)
-    return cnt
-
-
-# ==========================================================
-# CARD ACTIONS (admins only)
-# ==========================================================
-def apply_card_action(card_id: str, action: str, from_user: int) -> str:
-    card = load_card(card_id)
-    if not card:
-        return "Карточка не найдена."
-
-    action = action.lower().strip()
-    if action == "work":
-        new_status, label, msg = "in_work", "work", "Статус карточки: В РАБОТУ ✅"
-    elif action == "wrong":
-        new_status, label, msg = "wrong", "wrong", "Статус карточки: НЕВЕРНО ❌"
-    elif action == "bind":
-        new_status, label, msg = "bind", "attach", "Статус карточки: ПРИВЯЗАТЬ 📎"
-    else:
-        return "Неизвестное действие."
-
-    old_status = card.get("status", "new")
-    card["status"] = new_status
-    card.setdefault("history", []).append({"event": f"set_{new_status}", "from_user": int(from_user), "ts": int(time.time())})
-    save_card(card)
-
-    append_history({"event": "status_change", "card_id": card_id, "from_user": int(from_user), "old_status": old_status, "new_status": new_status})
-    log_training_event(card_id, label, from_user=from_user, text=card.get("text", ""), channel=card.get("channel", ""))
-
-    return msg
-
-
-# ==========================================================
-# TRAINING STATS + PLOT
-# ==========================================================
-def compute_training_stats() -> Dict[str, Any]:
-    stats = {
-        "total": 0, "work": 0, "wrong": 0, "attach": 0,
-        "by_admin": {},  # {user_id: {"total":..,"work":..,"wrong":..,"attach":..}}
-        "last_ts": None,
+async def send_tg_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
+    if not BOT_TOKEN:
+        return
+    data: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
     }
-    if not os.path.exists(TRAINING_DATASET):
-        return stats
-
+    if reply_markup:
+        data["reply_markup"] = reply_markup
     try:
-        with open(TRAINING_DATASET, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-
-                stats["total"] += 1
-                label = (obj.get("label") or "").lower()
-                if label == "work":
-                    stats["work"] += 1
-                elif label == "wrong":
-                    stats["wrong"] += 1
-                elif label == "attach":
-                    stats["attach"] += 1
-
-                uid = obj.get("from_user")
-                try:
-                    uid = int(uid)
-                except Exception:
-                    uid = None
-                if uid is not None:
-                    ba = stats["by_admin"].setdefault(str(uid), {"total": 0, "work": 0, "wrong": 0, "attach": 0})
-                    ba["total"] += 1
-                    if label in ba:
-                        ba[label] += 1
-
-                ts = obj.get("timestamp")
-                if isinstance(ts, int):
-                    if stats["last_ts"] is None or ts > stats["last_ts"]:
-                        stats["last_ts"] = ts
+        await tg_request("sendMessage", data)
     except Exception as e:
-        log.error(f"Training stats read error: {e}")
-
-    progress = min(1.0, stats["total"] / max(1, TARGET_DATASET_SIZE))
-    stats["progress"] = round(progress * 100.0, 2)
-    stats["confidence"] = round(progress * 100.0, 2)  # surrogate
-    return stats
+        logger.error(f"Ошибка send_tg_message: {e}")
 
 
-def format_training_stats(stats: Dict[str, Any]) -> str:
-    total = stats.get("total", 0)
-    work = stats.get("work", 0)
-    wrong = stats.get("wrong", 0)
-    attach = stats.get("attach", 0)
-
-    last_ts = stats.get("last_ts")
-    last_str = "Пока не было ни одного события обучения."
-    if isinstance(last_ts, int):
-        last_str = f"Последнее обучение: {datetime.fromtimestamp(last_ts).strftime('%d.%m.%Y %H:%M')}"
-
-    lines = [
-        "📊 Статистика обучения ИИ (YandexGPT):",
-        "",
-        f"• Всего обучающих событий: {total}",
-        f"   ├─ В работу: {work}",
-        f"   ├─ Неверно: {wrong}",
-        f"   └─ Привязать: {attach}",
-        "",
-        f"• Порог авто-фильтра: {get_threshold()}%",
-        f"• Прогресс к целевому датасету ({TARGET_DATASET_SIZE}): {stats.get('progress',0)}%",
-        "",
-        "👥 По администраторам:",
-    ]
-
-    by_admin = stats.get("by_admin") or {}
-    if not by_admin:
-        lines.append("• данных пока нет")
-    else:
-        for uid, s in by_admin.items():
-            lines.append(f"• {uid}: всего={s['total']} | work={s['work']} | wrong={s['wrong']} | bind={s['attach']}")
-
-    lines.extend(["", last_str])
-    return "\n".join(lines)
-
-
-def build_training_plot_png(path: str) -> bool:
-    """
-    Creates a PNG plot of cumulative training events over time.
-    Returns True if created.
-    """
-    # read dataset
-    points: List[Tuple[int, int]] = []
-    try:
-        with open(TRAINING_DATASET, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                ts = obj.get("timestamp")
-                if isinstance(ts, int):
-                    points.append((ts, 1))
-    except Exception:
-        points = []
-
-    if not points:
-        return False
-
-    points.sort(key=lambda x: x[0])
-    xs: List[float] = []
-    ys: List[int] = []
-    cum = 0
-    for ts, one in points:
-        cum += one
-        xs.append(ts)
-        ys.append(cum)
-
-    # optional matplotlib
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception:
-        return False
-
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    ax.plot(xs, ys)
-    ax.set_title("График обучения (накопление примеров)")
-    ax.set_xlabel("Время (epoch)")
-    ax.set_ylabel("Количество примеров (cumulative)")
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    return True
-
-
-def send_photo(chat_id: int, png_path: str, caption: str = "") -> None:
-    if not TELEGRAM_API_URL:
-        return
-    try:
-        with open(png_path, "rb") as f:
-            files = {"photo": f}
-            data = {"chat_id": str(chat_id), "caption": caption}
-            resp = requests.post(f"{TELEGRAM_API_URL}/sendPhoto", data=data, files=files, timeout=30)
-            try:
-                j = resp.json()
-                if not j.get("ok"):
-                    log.error(f"sendPhoto error: {j}")
-            except Exception:
-                pass
-    except Exception as e:
-        log.error(f"send_photo exception: {e}")
-
-
-# ==========================================================
-# ADMIN MENU
-# ==========================================================
-def build_admin_keyboard() -> Dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [{"text": "📊 Статистика обучения", "callback_data": "admin:trainstats"}],
-            [{"text": "📈 График обучения", "callback_data": "admin:trainplot"}],
-            [{"text": "🎚 Порог вероятности", "callback_data": "admin:threshold"}],
-            [{"text": "👥 Управление администраторами", "callback_data": "admin:admins"}],
-        ]
-    }
-
-
-def build_threshold_keyboard() -> Dict[str, Any]:
-    thr = get_threshold()
-    return {
-        "inline_keyboard": [
-            [{"text": f"Текущий порог: {thr}%", "callback_data": "admin:noop"}],
-            [
-                {"text": "−10", "callback_data": "admin:thr:-10"},
-                {"text": "+10", "callback_data": "admin:thr:+10"},
-            ],
-            [
-                {"text": "0%", "callback_data": "admin:thr:0"},
-                {"text": "50%", "callback_data": "admin:thr:50"},
-                {"text": "80%", "callback_data": "admin:thr:80"},
-                {"text": "100%", "callback_data": "admin:thr:100"},
-            ],
-            [{"text": "↩️ Назад", "callback_data": "admin:back"}],
-        ]
-    }
-
-
-# ==========================================================
-# UPDATES (long polling)
-# ==========================================================
-UPDATE_OFFSET = 0
-
-
-def handle_message(update: Dict[str, Any]) -> None:
-    msg = update.get("message")
-    if not msg:
-        return
-
-    chat_id = msg.get("chat", {}).get("id")
-    from_user = msg.get("from", {}).get("id")
-    text = (msg.get("text") or "").strip()
-    if not text.startswith("/"):
-        return
-
-    cmd, *rest = text.split(" ", 1)
-    cmd = cmd.split("@")[0]
-    arg = rest[0].strip() if rest else ""
-
-    if cmd == "/admin":
-        if not is_admin(from_user):
-            send_plain_message(chat_id, "❌ Доступ запрещён.")
-            return
-        send_message_with_keyboard(chat_id, "🛠 Админ-панель:", build_admin_keyboard())
-        return
-
-    if cmd == "/trainstats":
-        if not is_admin(from_user):
-            send_plain_message(chat_id, "❌ Доступ запрещён.")
-            return
-        stats = compute_training_stats()
-        send_plain_message(chat_id, format_training_stats(stats))
-        return
-
-    if cmd == "/setthreshold":
-        if not is_admin(from_user):
-            send_plain_message(chat_id, "❌ Доступ запрещён.")
-            return
-        if not arg:
-            send_plain_message(chat_id, "Использование: /setthreshold <0..100>")
-            return
-        try:
-            v = int(arg)
-        except Exception:
-            send_plain_message(chat_id, "Порог должен быть числом 0..100.")
-            return
-        v = set_threshold(v)
-        send_plain_message(chat_id, f"✅ Порог установлен: {v}%")
-        return
-
-    if cmd == "/addadmin":
-        if not is_admin(from_user):
-            send_plain_message(chat_id, "❌ Доступ запрещён.")
-            return
-        try:
-            uid = int(arg)
-        except Exception:
-            send_plain_message(chat_id, "Использование: /addadmin <telegram_id>")
-            return
-        if add_admin(uid):
-            send_plain_message(chat_id, f"✅ Добавлен админ: {uid}")
-        else:
-            send_plain_message(chat_id, f"👤 {uid} уже админ.")
-        return
-
-    if cmd == "/deladmin":
-        if not is_admin(from_user):
-            send_plain_message(chat_id, "❌ Доступ запрещён.")
-            return
-        try:
-            uid = int(arg)
-        except Exception:
-            send_plain_message(chat_id, "Использование: /deladmin <telegram_id>")
-            return
-        if remove_admin(uid):
-            send_plain_message(chat_id, f"🗑 Удалён админ: {uid}")
-        else:
-            send_plain_message(chat_id, f"👤 {uid} не найден.")
-        return
-
-    if cmd == "/cards":
-        if not is_admin(from_user):
-            send_plain_message(chat_id, "❌ Доступ запрещён.")
-            return
-        cards = list_recent_cards(limit=MAX_CARDS_LIST)
-        send_plain_message(chat_id, format_cards_list(cards))
-        return
-
-    if cmd == "/history":
-        if not is_admin(from_user):
-            send_plain_message(chat_id, "❌ Доступ запрещён.")
-            return
-        events = tail_history_events(limit=MAX_HISTORY_EVENTS)
-        send_plain_message(chat_id, format_history_events(events))
-        return
-
-    send_plain_message(chat_id, f"Неизвестная команда: {cmd}")
-
-
-def handle_callback_query(update: Dict[str, Any]) -> None:
-    cb = update.get("callback_query")
-    if not cb:
-        return
-
-    cb_id = cb.get("id")
-    from_user = cb.get("from", {}).get("id")
-    data = cb.get("data", "") or ""
-    message = cb.get("message", {}) or {}
-    chat_id = message.get("chat", {}).get("id")
-    message_id = message.get("message_id")
-
-    # card actions
-    if data.startswith("card:"):
-        if not is_admin(from_user):
-            answer_callback_query(cb_id, "❌ Только администраторы могут менять статус.", show_alert=True)
-            return
-
-        try:
-            _, card_id, action = data.split(":", 2)
-        except Exception:
-            answer_callback_query(cb_id, "Ошибка формата.", show_alert=True)
-            return
-
-        result = apply_card_action(card_id, action, from_user=int(from_user))
-
-        # remove buttons for everyone after any admin action
-        try:
-            edit_message_reply_markup(chat_id, message_id, reply_markup=None)
-        except Exception:
-            pass
-
-        answer_callback_query(cb_id, result, show_alert=False)
-        return
-
-    # admin menu
-    if data.startswith("admin:"):
-        if not is_admin(from_user):
-            answer_callback_query(cb_id, "❌ Доступ запрещён.", show_alert=True)
-            return
-
-        action = data.split(":", 1)[1]
-
-        if action == "trainstats":
-            stats = compute_training_stats()
-            send_plain_message(chat_id, format_training_stats(stats))
-            answer_callback_query(cb_id, "Готово.", show_alert=False)
-            return
-
-        if action == "trainplot":
-            png = os.path.join(DATA_DIR, "training_plot.png")
-            ok = build_training_plot_png(png)
-            if ok:
-                send_photo(chat_id, png, caption="📈 График обучения (накопление примеров)")
-                answer_callback_query(cb_id, "График отправлен.", show_alert=False)
-            else:
-                answer_callback_query(cb_id, "График недоступен (нет данных или matplotlib).", show_alert=True)
-            return
-
-        if action == "threshold":
-            send_message_with_keyboard(chat_id, "🎚 Настройка порога вероятности:", build_threshold_keyboard())
-            answer_callback_query(cb_id, "Ок.", show_alert=False)
-            return
-
-        if action.startswith("thr:"):
-            val = action.split(":", 1)[1]
-            cur = get_threshold()
-            try:
-                if val in ("+10", "-10"):
-                    delta = int(val)
-                    cur = set_threshold(cur + delta)
-                else:
-                    cur = set_threshold(int(val))
-                answer_callback_query(cb_id, f"Порог: {cur}%", show_alert=False)
-                # update the same message keyboard
-                try:
-                    edit_message_reply_markup(chat_id, message_id, build_threshold_keyboard())
-                except Exception:
-                    pass
-            except Exception:
-                answer_callback_query(cb_id, "Ошибка установки порога.", show_alert=True)
-            return
-
-        if action == "admins":
-            admins_text = "\n".join(str(a) for a in ADMINS) if ADMINS else "пусто"
-            send_plain_message(
-                chat_id,
-                "👥 Администраторы:\n"
-                f"{admins_text}\n\n"
-                "Команды:\n"
-                "/addadmin <id>\n"
-                "/deladmin <id>"
-            )
-            answer_callback_query(cb_id, "Ок.", show_alert=False)
-            return
-
-        if action == "back":
-            send_message_with_keyboard(chat_id, "🛠 Админ-панель:", build_admin_keyboard())
-            answer_callback_query(cb_id, "Ок.", show_alert=False)
-            return
-
-        # noop / unknown
-        answer_callback_query(cb_id, "", show_alert=False)
-        return
-
-    answer_callback_query(cb_id, "", show_alert=False)
-
-
-def poll_updates() -> None:
-    global UPDATE_OFFSET
-    if not TELEGRAM_API_URL:
-        log.warning("poll_updates is disabled (no BOT_TOKEN).")
-        return
-
-    log.info("poll_updates started (message + callback_query).")
-
-    while True:
-        try:
-            params = {
-                "timeout": 25,
-                "offset": UPDATE_OFFSET,
-                "allowed_updates": ["message", "callback_query"],
+def build_onzs_keyboard(selected: List[int]) -> Dict[str, Any]:
+    buttons = []
+    row = []
+    for i in range(1, 13):
+        text = f"{i} {'✅' if i in selected else ''}"
+        row.append({"text": text, "callback_data": f"onzs:{i}"})
+        if len(row) == 4:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append(
+        [
+            {
+                "text": "Все ОНзС",
+                "callback_data": "onzs:all",
             }
-            resp = requests.get(f"{TELEGRAM_API_URL}/getUpdates", params=params, timeout=35)
-            data = resp.json()
-
-            if not data.get("ok"):
-                # Common: 409 Conflict when two instances run simultaneously
-                desc = data.get("description", "")
-                log.error(f"getUpdates error: {data}")
-                if "Conflict" in desc or data.get("error_code") == 409:
-                    time.sleep(10)
-                else:
-                    time.sleep(5)
-                continue
-
-            updates = data.get("result", [])
-            if not updates:
-                continue
-
-            for upd in updates:
-                UPDATE_OFFSET = max(UPDATE_OFFSET, upd.get("update_id", 0) + 1)
-                if "callback_query" in upd:
-                    handle_callback_query(upd)
-                elif "message" in upd:
-                    handle_message(upd)
-
-        except Exception as e:
-            log.error(f"poll_updates exception: {e}")
-            time.sleep(5)
+        ]
+    )
+    return {"inline_keyboard": buttons}
 
 
-# ==========================================================
-# HISTORY / CARDS LIST
-# ==========================================================
-def tail_history_events(limit: int = 50) -> List[Dict[str, Any]]:
-    if not os.path.exists(HISTORY_CARDS):
-        return []
-    try:
-        with open(HISTORY_CARDS, "r", encoding="utf-8") as f:
-            lines = [ln.strip() for ln in f.readlines() if ln.strip()]
-    except Exception:
-        return []
-    out: List[Dict[str, Any]] = []
-    for ln in lines[-limit:]:
-        try:
-            out.append(json.loads(ln))
-        except Exception:
-            continue
-    return out
+async def broadcast_card_to_subscribers(card: Dict[str, Any], main_message_id: Optional[int] = None):
+    """
+    Рассылаем карточку подписчикам по их выбранным ОНзС (если не на паузе).
+    Для простоты: пока рассылаем только основной карточкой в общий чат,
+    а подписки можно использовать позже.
+    """
+    # Здесь можно реализовать личные рассылки по user_subscriptions,
+    # сейчас в основном фокус на общем чате.
+    return
 
 
-def format_history_events(events: List[Dict[str, Any]]) -> str:
-    if not events:
-        return "📂 История пуста."
-    lines = ["📂 Последние события:", ""]
-    for e in events:
-        ts = e.get("ts")
-        dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M") if isinstance(ts, int) else "—"
-        ev = e.get("event", "event")
-        cid = e.get("card_id", "—")
-        extra = []
-        if ev == "sent":
-            extra.append(f"msg={e.get('message_id')}")
-        if ev == "filtered":
-            extra.append(f"thr={e.get('threshold')}, prob={e.get('prob')}")
-        if ev == "status_change":
-            extra.append(f"{e.get('old_status')}→{e.get('new_status')} user={e.get('from_user')}")
-        lines.append(f"• {dt} — {ev} — {cid}" + (f" ({'; '.join(extra)})" if extra else ""))
-    return "\n".join(lines)
+# ------------------ ОБРАБОТКА ПУБЛИЧНЫХ КАНАЛОВ (WEB SCRAPING) ------------------ #
+
+TELEGRAM_WEB_BASE = "https://t.me"
 
 
-def list_recent_cards(limit: int = 20) -> List[Dict[str, Any]]:
-    files = []
-    try:
-        for name in os.listdir(CARDS_DIR):
-            if name.endswith(".json"):
-                p = os.path.join(CARDS_DIR, name)
-                try:
-                    m = os.path.getmtime(p)
-                except Exception:
-                    m = 0
-                files.append((m, p))
-    except Exception:
-        return []
-    files.sort(key=lambda x: x[0], reverse=True)
-    files = files[:limit]
-    cards = []
-    for _, p in files:
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                cards.append(json.load(f))
-        except Exception:
-            continue
-    return cards
+async def fetch_channel_page(username: str) -> str:
+    """
+    Забираем HTML публичного канала через веб-страницу /s/<username>.
+    """
+    url = f"{TELEGRAM_WEB_BASE}/s/{username.lstrip('@')}"
+    logger.info(f"Запрос веб-страницы канала: {url}")
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+        r = await client.get(url)
+        if r.status_code in (301, 302, 303, 307, 308):
+            logger.error(
+                f"Redirect response '{r.status_code} {r.reason_phrase}' for url '{url}'\n"
+                f"Redirect location: '{r.headers.get('Location')}'"
+            )
+            raise RuntimeError(f"Redirect for {url}")
+        r.raise_for_status()
+        return r.text
 
 
-def format_cards_list(cards: List[Dict[str, Any]]) -> str:
-    if not cards:
-        return "📂 Карточек пока нет."
-    lines = ["📂 Последние карточки:", ""]
-    for c in cards:
-        cid = c.get("card_id", "—")
-        st = c.get("status", "—")
-        ch = c.get("channel", "—")
-        pid = c.get("post_id", "—")
-        ts = c.get("timestamp")
-        dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M") if isinstance(ts, int) else "—"
-        prob = (c.get("ai") or {}).get("probability_final")
-        prob_str = f"{float(prob):.1f}%" if prob is not None else "—"
-        lines.append(f"• {cid} | {st} | @{ch} | {dt} | p={prob_str} | post={pid}")
-    return "\n".join(lines)
+def parse_posts_from_html(html: str) -> List[Tuple[int, str]]:
+    """
+    Очень упрощенный парсер: ищем блоки data-post="channel/12345" и рядом текст.
+    В реале лучше использовать парсер HTML, но тут делаем на основе регулярки.
+    """
+    posts: List[Tuple[int, str]] = []
+
+    for m in re.finditer(r'data-post="[^/]+/(\d+)"', html):
+        msg_id = int(m.group(1))
+        # Грубый захват фрагмента текста вокруг ID
+        start = max(0, m.start() - 2000)
+        end = min(len(html), m.end() + 2000)
+        snippet = html[start:end]
+        snippet = re.sub(r"<[^>]+>", " ", snippet)  # вырезаем теги
+        snippet = re.sub(r"\s+", " ", snippet)
+        posts.append((msg_id, snippet))
+
+    # Убираем дубликаты и сортируем
+    unique = {}
+    for msg_id, text in posts:
+        if msg_id not in unique:
+            unique[msg_id] = text
+    result = sorted(unique.items(), key=lambda x: x[0])
+    return result
 
 
-# ==========================================================
-# MAIN SCAN LOOP
-# ==========================================================
-def run_scan_cycle() -> None:
-    log.info("=== SCAN CYCLE START ===")
-    hits = scan_once()
-    if not hits:
-        log.info("No hits.")
+async def analyze_case_with_yagpt(channel: str, msg_id: int, text: str, original_url: str) -> Optional[Dict[str, Any]]:
+    """
+    Постобработка одного кандидата:
+     1) Вызов YandexGPT -> JSON-структура
+     2) Попытка найти координаты / адрес и запросить @rs_search_bot
+     3) Определение ОНзС
+    """
+    prompt = (
+        f"Канал: {channel}\n"
+        f"ID сообщения: {msg_id}\n\n"
+        f"Текст:\n{text}\n\n"
+        "Сформируй JSON-объект с полями:\n"
+        "{\n"
+        '  "object_type": "тип объекта",\n'
+        '  "violation_type": "тип нарушения (если есть признаки самостроя)",\n'
+        '  "address": "адрес (если указан)",\n'
+        '  "okrug_city": "муниципалитет/город (если указан)",\n'
+        '  "cadastral_number": "кадастровый номер (если есть)",\n'
+        '  "risk_probability": 0-100,\n'
+        '  "risk_score": 0-100,\n'
+        '  "risk_level": "низкий/средний/высокий",\n'
+        '  "summary": "краткое описание ситуации"\n'
+        "}"
+    )
+
+    yagpt_data = await call_yandex_gpt_json(prompt)
+    if not yagpt_data:
+        return None
+
+    card: Dict[str, Any] = {
+        "channel": channel,
+        "post_id": msg_id,
+        "original_url": original_url,
+        "source_excerpt": text[:500] + ("..." if len(text) > 500 else ""),
+    }
+
+    for key in [
+        "object_type",
+        "violation_type",
+        "address",
+        "okrug_city",
+        "cadastral_number",
+        "risk_probability",
+        "risk_score",
+        "risk_level",
+        "summary",
+    ]:
+        if key in yagpt_data:
+            card[key] = yagpt_data[key]
+
+    # Порог по вероятности
+    rp = int(card.get("risk_probability") or 0)
+    if rp < STATE.min_risk_probability:
+        logger.info(
+            f"Карточка отклонена по порогу вероятности: {rp}% < {STATE.min_risk_probability}%"
+        )
+        return None
+
+    # Координаты -> @rs_search_bot
+    rosreestr_block = None
+    coords = extract_coords(text)
+    if not coords and card.get("address"):
+        coords = await geocode_address(card["address"])
+
+    if coords:
+        lat, lon = coords
+        rs_resp = await query_rs_search_bot_by_coords(lat, lon)
+        rosreestr_block = extract_rosreestr_block(rs_resp or "")
+    card["rosreestr_block"] = rosreestr_block or "-"
+
+    # ОНзС по адресу/муниципалитету
+    onzs_text_source = f"{card.get('address', '')} {card.get('okrug_city', '')}"
+    card["onzs"] = detect_onzs_by_text(onzs_text_source)
+
+    return card
+
+
+async def process_public_post(channel: str, msg_id: int, text: str):
+    """
+    Обработка одного поста в публичном канале:
+     - Поиск ключевых слов
+     - Вызов YandexGPT
+     - Сохранение карточки
+     - Отправка в Telegram
+    """
+    keywords = read_lines(KEYWORDS_FILE)
+    lower = text.lower()
+    matched = [kw for kw in keywords if kw.lower() in lower]
+    if not matched:
         return
 
-    cards = [generate_card(h) for h in hits]
-    sent = send_cards_to_group(cards) if TELEGRAM_API_URL else 0
-    log.info(f"Cycle done. cards={len(cards)} sent={sent} thr={get_threshold()}%")
+    logger.info(f"[MATCH] @{channel}: пост {msg_id}, ключевые слова {matched}")
+
+    original_url = f"https://t.me/{channel}/{msg_id}"
+
+    card = await analyze_case_with_yagpt(
+        channel=f"@{channel}", msg_id=msg_id, text=text, original_url=original_url
+    )
+    if not card:
+        return
+
+    append_jsonl(NEWS_FILE, card)
+    onzs = int(card.get("onzs") or 0)
+    if onzs in range(1, 13):
+        onzs_file = os.path.join(ONZS_DIR, f"onzs_{onzs}.jsonl")
+        append_jsonl(onzs_file, card)
+
+    # Лог
+    append_line(
+        MONITORING_LOG,
+        json.dumps(
+            {
+                "channel": channel,
+                "msg_id": msg_id,
+                "keywords": matched,
+                "card": card,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    msg_id_sent = await send_card_to_tg_group(card)
+    await broadcast_card_to_subscribers(card, msg_id_sent)
 
 
-def main_loop() -> None:
-    # callbacks in separate thread
-    if TELEGRAM_API_URL:
-        t = threading.Thread(target=poll_updates, daemon=True)
-        t.start()
-        log.info("poll_updates thread started.")
+async def scan_once():
+    """
+    Один проход по списку каналов из groups.txt
+    """
+    groups = read_lines(GROUPS_FILE)
+    for raw in groups:
+        username = raw.lstrip("@")
+        try:
+            html = await fetch_channel_page(username)
+            posts = parse_posts_from_html(html)
+            last_seen = int(STATE.last_post_ids.get(username, 0))
+            new_posts = [(mid, txt) for (mid, txt) in posts if mid > last_seen]
+            if not new_posts:
+                logger.info(f"Новых постов в @{username} не найдено.")
+                continue
+
+            logger.info(f"Найдено новых постов в @{username}: {len(new_posts)}")
+
+            for mid, txt in new_posts:
+                await process_public_post(username, mid, txt)
+                if mid > last_seen:
+                    last_seen = mid
+
+            STATE.last_post_ids[username] = last_seen
+            save_state(STATE)
+
+        except Exception as e:
+            logger.error(f"Ошибка при обработке канала @{username}: {e}")
+
+
+# ------------------ ОБРАБОТКА CALLBACK (ОБУЧЕНИЕ YAGPT) ------------------ #
+
+async def handle_callback_query(callback_query: Dict[str, Any]):
+    """
+    Обработка callback_data формата train:<action>:<channel>:<post_id>
+    и onzs:<номер>
+    """
+    data = callback_query.get("data", "")
+    from_id = callback_query.get("from", {}).get("id")
+    message = callback_query.get("message", {})
+    message_id = message.get("message_id")
+    chat_id = message.get("chat", {}).get("id")
+
+    if data.startswith("train:"):
+        _, action, key = data.split(":", 2)
+        channel, post_id_str = key.split(":", 1)
+        label_map = {
+            "work": "в_работу",
+            "wrong": "неверно",
+            "attach": "привязать",
+        }
+        label = label_map.get(action, action)
+        rec = {
+            "text": message.get("text", ""),
+            "label": label,
+            "timestamp": datetime.now().isoformat(),
+            "from_id": from_id,
+        }
+        append_jsonl(YAGPT_DATASET, rec)
+        append_line(ANALYTICS_LOG, f"DECISION: {label} by {from_id}")
+
+        # Убираем кнопки с карточки для всех
+        try:
+            await tg_request(
+                "editMessageReplyMarkup",
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "reply_markup": {"inline_keyboard": []},
+                },
+            )
+        except Exception as e:
+            logger.error(f"Ошибка editMessageReplyMarkup: {e}")
+
+        # Ответ пользователю (notification)
+        await tg_request(
+            "answerCallbackQuery",
+            {
+                "callback_query_id": callback_query.get("id"),
+                "text": f"Решение зафиксировано: {label}",
+                "show_alert": False,
+            },
+        )
+
+    elif data.startswith("onzs:"):
+        val = data.split(":", 1)[1]
+        user_key = str(from_id)
+        if val == "all":
+            STATE.user_subscriptions[user_key] = list(range(1, 13))
+        else:
+            try:
+                onzs_num = int(val)
+            except ValueError:
+                return
+            subs = STATE.user_subscriptions.get(user_key, [])
+            if onzs_num in subs:
+                subs.remove(onzs_num)
+            else:
+                subs.append(onzs_num)
+            STATE.user_subscriptions[user_key] = sorted(subs)
+
+        save_state(STATE)
+        new_kb = build_onzs_keyboard(STATE.user_subscriptions.get(user_key, []))
+        await tg_request(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": new_kb,
+            },
+        )
+        await tg_request(
+            "answerCallbackQuery",
+            {
+                "callback_query_id": callback_query.get("id"),
+                "text": "Настройки ОНзС обновлены",
+                "show_alert": False,
+            },
+        )
+
+
+# ------------------ ПРИЁМ UPDATE'ов от Telegram (WEBHOOK/POLLING) ------------------ #
+
+OFFSET = 0
+
+
+async def poll_updates():
+    global OFFSET
+    if not BOT_TOKEN:
+        logger.warning("BOT_TOKEN не задан — часть функционала (управление ботом) не будет работать.")
+        return
 
     while True:
         try:
-            run_scan_cycle()
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.get(
+                    f"{TG_API_BASE}/bot{BOT_TOKEN}/getUpdates",
+                    params={"offset": OFFSET, "timeout": 30},
+                )
+                resp.raise_for_status()
+                data = resp.json()
         except Exception as e:
-            log.error(f"scan loop error: {e}")
-        time.sleep(SCAN_INTERVAL)
+            logger.error(f"Ошибка getUpdates: {e}")
+            await asyncio.sleep(5)
+            continue
+
+        if not data.get("ok"):
+            await asyncio.sleep(5)
+            continue
+
+        for update in data.get("result", []):
+            OFFSET = update["update_id"] + 1
+            await handle_update(update)
+
+
+async def handle_update(update: Dict[str, Any]):
+    if "message" in update:
+        await handle_message(update["message"])
+    if "callback_query" in update:
+        await handle_callback_query(update["callback_query"])
+
+
+async def handle_message(message: Dict[str, Any]):
+    chat_id = message.get("chat", {}).get("id")
+    from_id = message.get("from", {}).get("id")
+    text = message.get("text", "") or ""
+
+    if not text:
+        return
+
+    if text.startswith("/"):
+        cmd, *args = text.split()
+        if cmd == "/start":
+            await cmd_start(chat_id, from_id)
+        elif cmd == "/stop":
+            await cmd_stop(chat_id, from_id)
+        elif cmd == "/risk":
+            await cmd_risk(chat_id, from_id, args)
+        return
+
+    # Обучение по тексту-ответу на карточку
+    reply_to = message.get("reply_to_message")
+    if reply_to and reply_to.get("text"):
+        lower = text.strip().lower()
+        if lower in ("в работу", "в_работу", "работа"):
+            label = "в_работу"
+        elif lower in ("неверно", "не относится", "не относится.", "не наш"):
+            label = "неверно"
+        elif lower in ("привязать", "привязка"):
+            label = "привязать"
+        else:
+            return
+
+        rec = {
+            "text": reply_to.get("text", ""),
+            "label": label,
+            "timestamp": datetime.now().isoformat(),
+            "from_id": from_id,
+        }
+        append_jsonl(YAGPT_DATASET, rec)
+        append_line(ANALYTICS_LOG, f"DECISION_REPLY: {label} by {from_id}")
+        await send_tg_message(chat_id, f"✅ Решение зафиксировано: {label}")
+
+
+async def cmd_start(chat_id: int, user_id: int):
+    user_key = str(user_id)
+    subs = STATE.user_subscriptions.get(user_key, [])
+    kb = build_onzs_keyboard(subs)
+    STATE.user_paused[user_key] = False
+    save_state(STATE)
+    text = (
+        "👋 Привет! Это бот мониторинга самовольного строительства.\n\n"
+        "Ниже выбери, по каким ОНзС ты хочешь получать карточки.\n"
+        "Можно отметить несколько, либо нажать «Все ОНзС»."
+    )
+    await send_tg_message(chat_id, text, kb)
+
+
+async def cmd_stop(chat_id: int, user_id: int):
+    user_key = str(user_id)
+    STATE.user_paused[user_key] = True
+    save_state(STATE)
+    await send_tg_message(chat_id, "⏸ Показ карточек для тебя приостановлен. Чтобы возобновить — набери /start.")
+
+
+async def cmd_risk(chat_id: int, user_id: int, args: List[str]):
+    if user_id not in ADMIN_IDS:
+        await send_tg_message(chat_id, "Эта команда доступна только администраторам.")
+        return
+
+    if not args:
+        await send_tg_message(
+            chat_id,
+            f"Текущий порог вероятности самостроя: {STATE.min_risk_probability}%.\n"
+            f"Измени командой: /risk 25 (от 0 до 100).",
+        )
+        return
+
+    try:
+        val = int(args[0])
+    except ValueError:
+        await send_tg_message(chat_id, "Укажи число от 0 до 100, например: /risk 15")
+        return
+
+    if not (0 <= val <= 100):
+        await send_tg_message(chat_id, "Число должно быть от 0 до 100.")
+        return
+
+    STATE.min_risk_probability = val
+    save_state(STATE)
+    await send_tg_message(chat_id, f"✅ Новый порог вероятности самостроя: {val}%.")
+
+
+# ------------------ MAIN ------------------ #
+
+async def main():
+    logger.info("🚀 Запуск Samastroi Scraper (public channels via web + rs_search_bot + карта)...")
+
+    # Проверка критических параметров
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN не задан в .env")
+    if TARGET_CHAT_ID == 0:
+        logger.error("TARGET_CHAT_ID не задан в .env")
+
+    # Запускаем Telethon-клиент для @rs_search_bot
+    if RS_CLIENT is not None:
+        await RS_CLIENT.start()
+        me = await RS_CLIENT.get_me()
+        logger.info(f"Telethon-сессия активна: {me}")
+
+    # Параллельно: опрос публичных каналов и опрос Bot API (getUpdates)
+    await asyncio.gather(
+        scanner_loop(),
+        poll_updates(),
+    )
+
+
+async def scanner_loop():
+    while True:
+        try:
+            await scan_once()
+        except Exception as e:
+            logger.error(f"Ошибка в scanner_loop: {e}")
+        await asyncio.sleep(180)  # интервал между полными проходами по каналам
 
 
 if __name__ == "__main__":
-    log.info("SAMASTROI SCRAPER starting.")
-    main_loop()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Остановка бота по Ctrl+C")
+        append_line(ANALYTICS_LOG, "STOPPED BY KEYBOARD")
