@@ -151,7 +151,7 @@ def load_state() -> BotState:
             last_post_ids=data.get("last_post_ids", {}),
             user_subscriptions=data.get("user_subscriptions", {}),
             user_paused=data.get("user_paused", {}),
-            min_risk_probability=int(
+            min_risk_probability:int(
                 data.get("min_risk_probability", DEFAULT_MIN_RISK_PROBABILITY)
             ),
         )
@@ -1033,6 +1033,9 @@ async def handle_message(message: Dict[str, Any]):
             await cmd_stop(chat_id, from_id)
         elif cmd == "/risk":
             await cmd_risk(chat_id, from_id, args)
+        elif cmd == "/chatid":
+            # Универсальная команда: вернуть ID текущего чата (в т.ч. группы)
+            await send_tg_message(chat_id, f"Chat ID: {chat_id}")
         return
 
     # Обучение по тексту-ответу на карточку
