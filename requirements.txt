@@ -5,7 +5,7 @@ beautifulsoup4==4.12.3
 lxml>=5.2.1
 telethon==1.36.0
 requests>=2.32.3
-beautifulsoup4>=4.12.3
-matplotlib>=4.2.5
+matplotlib>=3.8,<3.11
+pandas>=2.2.3
 openpyxl>=3.1.5
-reportlab>=4.0.9
+reportlab>=4.1.0
