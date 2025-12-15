@@ -65,25 +65,60 @@ DEFAULT_ADMINS = [
 
 
 def load_admins() -> List[int]:
+    """Load admin user IDs.
+
+    Priority:
+    1) ADMINS_FILE if it contains a non-empty list of ints
+    2) ENV: ADMIN_IDS (comma/space separated) or ADMIN_ID (single)
+    3) DEFAULT_ADMINS
+    """
+    # 1) From file
     try:
         with open(ADMINS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, list) and all(isinstance(x, int) for x in data):
+            if isinstance(data, list) and all(isinstance(x, int) for x in data) and len(data) > 0:
                 log.info(f"Загружено админов: {data}")
                 return data
+            if isinstance(data, list) and len(data) == 0:
+                log.warning("admins.json найден, но список админов пуст. Будет использован ENV/DEFAULT.")
+    except FileNotFoundError:
+        log.warning("admins.json не найден. Будет использован ENV/DEFAULT.")
     except Exception as e:
         log.error(f"Ошибка загрузки admins.json: {e}")
 
-    # Восстанавливаем список по умолчанию
-    with open(ADMINS_FILE, "w", encoding="utf-8") as f:
-        json.dump(DEFAULT_ADMINS, f)
+    # 2) From environment
+    env_raw = (os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or "").strip()
+    env_ids: List[int] = []
+    if env_raw:
+        parts = re.split(r"[\s,;]+", env_raw)
+        for p in parts:
+            if not p:
+                continue
+            try:
+                env_ids.append(int(p))
+            except Exception:
+                pass
+        env_ids = [x for i, x in enumerate(env_ids) if x not in env_ids[:i]]  # unique
+        if env_ids:
+            try:
+                with open(ADMINS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(env_ids, f, ensure_ascii=False)
+            except Exception as e:
+                log.error(f"Не удалось записать admins.json из ENV: {e}")
+            log.info(f"Загружено админов из ENV: {env_ids}")
+            return env_ids
+
+    # 3) Fallback to defaults
+    try:
+        with open(ADMINS_FILE, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_ADMINS, f, ensure_ascii=False)
+    except Exception as e:
+        log.error(f"Не удалось записать admins.json по умолчанию: {e}")
     log.info(f"Восстановлены админы по умолчанию: {DEFAULT_ADMINS}")
     return DEFAULT_ADMINS
 
 
 ADMINS = load_admins()
-
-
 def save_admins():
     """Сохраняем список администраторов."""
     with open(ADMINS_FILE, "w", encoding="utf-8") as f:
@@ -1651,3 +1686,41 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN не задан — карточки НЕ будут отправляться в Telegram.")
 
     main_loop()
+def parse_tg_datetime_to_epoch(dt_str: str) -> int:
+    """Convert Telegram <time datetime="..."> value to Unix epoch seconds.
+
+    Telegram's public channel HTML historically used integer epoch seconds, but it can also be
+    ISO-8601 like '2025-12-15T12:20:32+00:00'. This helper supports both.
+    """
+    import time as _time
+    if not dt_str:
+        return int(_time.time())
+    s = str(dt_str).strip()
+    if not s:
+        return int(_time.time())
+    # Pure epoch seconds
+    if s.isdigit():
+        try:
+            return int(s)
+        except Exception:
+            return int(_time.time())
+    # ISO-8601 (Telegram often uses +00:00 or Z)
+    try:
+        iso = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        pass
+    # Fallback: try to find 10-digit epoch inside string
+    m = re.search(r"\b(\d{10})\b", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return int(_time.time())
+    return int(_time.time())
+
+
+
