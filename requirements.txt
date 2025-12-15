@@ -7,3 +7,5 @@ telethon==1.36.0
 requests>=2.31.0
 beautifulsoup4>=4.12.2
 matplotlib>=3.8.0
+openpyxl>=3.1.2
+reportlab>=4.0.9
