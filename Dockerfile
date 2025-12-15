@@ -2,16 +2,16 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Копируем requirements
-COPY requirements.txt .
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-# Устанавливаем зависимости
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код
 COPY samastroi_scraper.py .
-
-# Переменная для volume
-ENV DATA_DIR=/app/data
 
 CMD ["python", "samastroi_scraper.py"]
