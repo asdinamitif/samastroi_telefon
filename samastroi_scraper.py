@@ -21,9 +21,8 @@ load_dotenv(ENV_PATH)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0") or "0")
 
-# Администраторы (дополнительно к админам группы)
-# Можно оставить пустым — тогда используются только реальные админы группы
-ADMIN_IDS: List[int] = []
+# Начальный список администраторов (через .env)
+ENV_ADMIN_IDS: List[int] = []
 _raw_admin_ids = os.getenv("ADMIN_IDS", "").strip()
 if _raw_admin_ids:
     for part in _raw_admin_ids.split(","):
@@ -31,7 +30,7 @@ if _raw_admin_ids:
         if not part:
             continue
         try:
-            ADMIN_IDS.append(int(part))
+            ENV_ADMIN_IDS.append(int(part))
         except ValueError:
             logger.warning(f"Не могу распарсить ADMIN_ID '{part}'")
 
@@ -72,6 +71,7 @@ ANALYTICS_LOG = os.path.join(DATA_DIR, "analytics.log")
 YAGPT_DATASET = os.path.join(DATA_DIR, "yagpt_dataset.jsonl")
 NEWS_FILE = os.path.join(DATA_DIR, "news.jsonl")
 ONZS_DIR = os.path.join(DATA_DIR, "onzs")
+HISTORY_CARDS = os.path.join(DATA_DIR, "history_cards.jsonl")  # История карточек
 os.makedirs(ONZS_DIR, exist_ok=True)
 
 # ------------------ ЛОГИ ------------------ #
@@ -93,7 +93,7 @@ def ensure_file(path: str, default: str = ""):
 
 
 for fpath, default in [
-    (GROUPS_FILE, "# @username каналов, по одному в строке\n@podmoskow\n"),
+    (GROUPS_FILE, "# @username каналов, по одному в строке\n"),
     (
         KEYWORDS_FILE,
         "самострой\nстройка\nстроительство\nнадзор\nштраф\nразрешение на строительство\nразрешение на ввод\nучасток\nземельный участок\n",
@@ -102,6 +102,7 @@ for fpath, default in [
     (ANALYTICS_LOG, ""),
     (YAGPT_DATASET, ""),
     (NEWS_FILE, ""),
+    (HISTORY_CARDS, ""),
 ]:
     ensure_file(fpath, default)
 
@@ -131,6 +132,7 @@ class BotState:
     user_subscriptions: Dict[str, List[int]]  # user_id -> [1..12]
     user_paused: Dict[str, bool]
     min_risk_probability: int
+    bot_admin_ids: List[int]  # администраторы бота (кроме .env)
 
     @staticmethod
     def default() -> "BotState":
@@ -139,6 +141,7 @@ class BotState:
             user_subscriptions={},
             user_paused={},
             min_risk_probability=DEFAULT_MIN_RISK_PROBABILITY,
+            bot_admin_ids=ENV_ADMIN_IDS.copy(),
         )
 
 
@@ -155,6 +158,7 @@ def load_state() -> BotState:
             min_risk_probability=int(
                 data.get("min_risk_probability", DEFAULT_MIN_RISK_PROBABILITY)
             ),
+            bot_admin_ids=data.get("bot_admin_ids", ENV_ADMIN_IDS.copy()),
         )
     except Exception as e:
         logger.error(f"Ошибка чтения {STATE_FILE}: {e}")
@@ -177,21 +181,6 @@ YAGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 
 
 async def call_yandex_gpt_json(prompt: str, temperature: float = 0.2) -> Optional[Dict[str, Any]]:
-    """
-    Вызывает YandexGPT и пытается распарсить JSON из ответа (внутри ```json ... ```).
-    Ожидаемый формат:
-    {
-      "object_type": "...",
-      "violation_type": "...",
-      "address": "...",
-      "okrug_city": "...",
-      "cadastral_number": "...",
-      "risk_probability": 0-100,
-      "risk_score": 0-100,
-      "risk_level": "низкий/средний/высокий",
-      "summary": "..."
-    }
-    """
     if not (YAGPT_API_KEY and YAGPT_FOLDER_ID):
         logger.warning("YAGPT не настроен (нет API_KEY или FOLDER_ID).")
         return None
@@ -235,7 +224,6 @@ async def call_yandex_gpt_json(prompt: str, temperature: float = 0.2) -> Optiona
     try:
         text = data["result"]["alternatives"][0]["message"]["text"]
         text = text.strip()
-        # Срезаем ```json ... ``` если есть
         if text.startswith("```"):
             text = re.sub(r"^```[a-zA-Z]*", "", text)
             text = re.sub(r"```$", "", text).strip()
@@ -250,9 +238,6 @@ async def call_yandex_gpt_json(prompt: str, temperature: float = 0.2) -> Optiona
 # ------------------ КООРДИНАТЫ / РОСРЕЕСТР ------------------ #
 
 def extract_coords(text: str) -> Optional[Tuple[float, float]]:
-    """
-    Ищем в тексте координаты вида 56.054712 37.148884 или 56.054712, 37.148884.
-    """
     pattern = r"(\d{1,2}\.\d{5,})[,\s]+(\d{1,2}\.\d{5,})"
     m = re.search(pattern, text)
     if not m:
@@ -266,9 +251,6 @@ def extract_coords(text: str) -> Optional[Tuple[float, float]]:
 
 
 async def geocode_address(address: str) -> Optional[Tuple[float, float]]:
-    """
-    Преобразует адрес в координаты через Яндекс Геодер.
-    """
     if not (YANDEX_GEOCODER_KEY and address):
         return None
 
@@ -287,7 +269,7 @@ async def geocode_address(address: str) -> Optional[Tuple[float, float]]:
         member = (
             data["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]
         )
-        pos = member["Point"]["pos"]  # "37.620393 55.75396"
+        pos = member["Point"]["pos"]
         lon_str, lat_str = pos.split()
         return float(lat_str), float(lon_str)
     except Exception as e:
@@ -314,10 +296,6 @@ async def ensure_rs_client_started():
 
 
 async def query_rs_search_bot_by_coords(lat: float, lon: float) -> Optional[str]:
-    """
-    Отправляет координаты в @rs_search_bot и возвращает его ответ (текст).
-    Формат координат: "56.007403 37.869397".
-    """
     if RS_CLIENT is None:
         return None
 
@@ -332,7 +310,6 @@ async def query_rs_search_bot_by_coords(lat: float, lon: float) -> Optional[str]
         async def handler(event):
             pass
 
-        # Ждем ответа 15 секунд
         resp = await RS_CLIENT.wait_for(
             events.NewMessage(from_users=bot_entity), timeout=15
         )
@@ -343,15 +320,6 @@ async def query_rs_search_bot_by_coords(lat: float, lon: float) -> Optional[str]
 
 
 def extract_rosreestr_block(text: str) -> Optional[str]:
-    """
-    Из ответа @rs_search_bot вынимаем две ключевые строки:
-    - 'Кад. номер ЗУ ...'
-    - 'RU.. от ....'
-    И формируем блок:
-      Кад. номер ЗУ ...
-
-      RU...
-    """
     if not text:
         return None
 
@@ -409,9 +377,6 @@ ONZS_MAPPING: Dict[int, List[str]] = {
 
 
 def detect_onzs_by_text(text: str) -> int:
-    """
-    Простейшее определение ОНзС по тексту (адрес, округ, город).
-    """
     t = text.lower()
     for onzs, patterns in ONZS_MAPPING.items():
         for p in patterns:
@@ -420,13 +385,9 @@ def detect_onzs_by_text(text: str) -> int:
     return 0
 
 
-# ------------------ КОНСТРУКЦИЯ КАРТОЧЕК ------------------ #
-
+# ------------------ КАРТОЧКИ ------------------ #
 
 def build_card_text(card: Dict[str, Any]) -> str:
-    """
-    Формируем текст карточки по данным, которые вернул YandexGPT + Росреестр.
-    """
     channel = card.get("channel", "-")
     original_url = card.get("original_url", "-")
 
@@ -478,11 +439,6 @@ def build_card_text(card: Dict[str, Any]) -> str:
 
 
 def build_inline_keyboard(card: Dict[str, Any], channel: str, post_id: int) -> Dict[str, Any]:
-    """
-    Инлайн-клавиатура:
-      • в работу / неверно / привязать
-      • 📍 Посмотреть на карте (если есть адрес)
-    """
     card_key = f"{channel}:{post_id}"
 
     keyboard: List[List[Dict[str, Any]]] = [
@@ -526,9 +482,6 @@ async def tg_request(method: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def send_card_to_tg_group(card: Dict[str, Any]) -> Optional[int]:
-    """
-    Отправляем карточку в целевой чат (группу).
-    """
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не задан — не могу отправлять карточки в Telegram.")
         return None
@@ -550,6 +503,7 @@ async def send_card_to_tg_group(card: Dict[str, Any]) -> Optional[int]:
     }
 
     try:
+        logger.info(f"Отправка карточки в chat_id={TARGET_CHAT_ID}")
         resp = await tg_request("sendMessage", data)
         if not resp.get("ok"):
             logger.error(f"Telegram API error: {resp}")
@@ -562,9 +516,6 @@ async def send_card_to_tg_group(card: Dict[str, Any]) -> Optional[int]:
 
 
 async def send_tg_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
-    """
-    Универсальная отправка простого текста.
-    """
     if not BOT_TOKEN:
         return
     data: Dict[str, Any] = {
@@ -580,7 +531,7 @@ async def send_tg_message(chat_id: int, text: str, reply_markup: Optional[Dict[s
         logger.error(f"Ошибка send_tg_message: {e}")
 
 
-# ------------------ ПОДПИСКИ НА ОНзС (на будущее) ------------------ #
+# ------------------ ПОДПИСКИ НА ОНзС ------------------ #
 
 def build_onzs_keyboard(selected: List[int]) -> Dict[str, Any]:
     buttons: List[List[Dict[str, Any]]] = []
@@ -605,10 +556,6 @@ def build_onzs_keyboard(selected: List[int]) -> Dict[str, Any]:
 
 
 async def broadcast_card_to_subscribers(card: Dict[str, Any], main_message_id: Optional[int] = None):
-    """
-    Заготовка под рассылку подписчикам по ОНзС.
-    Сейчас не используется — только общий групповой чат.
-    """
     return
 
 
@@ -618,9 +565,6 @@ TELEGRAM_WEB_BASE = "https://t.me"
 
 
 async def fetch_channel_page(username: str) -> str:
-    """
-    Забираем HTML публичного канала через веб-страницу /s/<username>.
-    """
     url = f"{TELEGRAM_WEB_BASE}/s/{username.lstrip('@')}"
     logger.info(f"Запрос веб-страницы канала: {url}")
     async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
@@ -636,9 +580,6 @@ async def fetch_channel_page(username: str) -> str:
 
 
 def parse_posts_from_html(html: str) -> List[Tuple[int, str]]:
-    """
-    Упрощенный парсер: ищем блоки data-post="channel/12345" и рядом текст.
-    """
     posts: List[Tuple[int, str]] = []
 
     for m in re.finditer(r'data-post="[^/]+/(\d+)"', html):
@@ -659,12 +600,6 @@ def parse_posts_from_html(html: str) -> List[Tuple[int, str]]:
 
 
 async def analyze_case_with_yagpt(channel: str, msg_id: int, text: str, original_url: str) -> Optional[Dict[str, Any]]:
-    """
-    Постобработка одного кандидата:
-      1) Вызов YandexGPT -> JSON-структура
-      2) Попытка найти координаты / адрес и запросить @rs_search_bot
-      3) Определение ОНзС
-    """
     prompt = (
         f"Канал: {channel}\n"
         f"ID сообщения: {msg_id}\n\n"
@@ -708,7 +643,6 @@ async def analyze_case_with_yagpt(channel: str, msg_id: int, text: str, original
         if key in yagpt_data:
             card[key] = yagpt_data[key]
 
-    # Порог по вероятности
     rp = int(card.get("risk_probability") or 0)
     if rp < STATE.min_risk_probability:
         logger.info(
@@ -716,7 +650,6 @@ async def analyze_case_with_yagpt(channel: str, msg_id: int, text: str, original
         )
         return None
 
-    # Координаты -> @rs_search_bot
     rosreestr_block = None
     coords = extract_coords(text)
     if not coords and card.get("address"):
@@ -728,7 +661,6 @@ async def analyze_case_with_yagpt(channel: str, msg_id: int, text: str, original
         rosreestr_block = extract_rosreestr_block(rs_resp or "")
     card["rosreestr_block"] = rosreestr_block or "-"
 
-    # ОНзС по адресу/муниципалитету
     onzs_text_source = f"{card.get('address', '')} {card.get('okrug_city', '')}"
     card["onzs"] = detect_onzs_by_text(onzs_text_source)
 
@@ -736,13 +668,6 @@ async def analyze_case_with_yagpt(channel: str, msg_id: int, text: str, original
 
 
 async def process_public_post(channel: str, msg_id: int, text: str):
-    """
-    Обработка одного поста:
-      - поиск ключевых слов,
-      - вызов YandexGPT,
-      - сохранение карточки,
-      - отправка в Telegram-группу.
-    """
     keywords = read_lines(KEYWORDS_FILE)
     lower = text.lower()
     matched = [kw for kw in keywords if kw.lower() in lower]
@@ -783,9 +708,6 @@ async def process_public_post(channel: str, msg_id: int, text: str):
 
 
 async def scan_once():
-    """
-    Один проход по списку каналов из groups.txt.
-    """
     groups = read_lines(GROUPS_FILE)
     for raw in groups:
         username = raw.lstrip("@")
@@ -815,18 +737,8 @@ async def scan_once():
 # ------------------ ПРОВЕРКА АДМИНИСТРАТОРОВ ------------------ #
 
 async def is_group_admin(chat_id: int, user_id: int) -> bool:
-    """
-    Проверяем, может ли пользователь обучать YandexGPT:
-    - если user_id в ADMIN_IDS -> всегда да;
-    - иначе, если чат - группа/супергруппа, проверяем статус через getChatMember.
-    """
-    if user_id in ADMIN_IDS:
-        return True
-
-    # Только для групп/супергрупп (chat_id < 0)
     if chat_id is None or chat_id > 0:
         return False
-
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
@@ -836,31 +748,129 @@ async def is_group_admin(chat_id: int, user_id: int) -> bool:
             data = resp.json()
             if not data.get("ok"):
                 return False
-
             member = data["result"]
             status = member.get("status")
             return status in ("administrator", "creator")
     except Exception as e:
-        logger.error(f"Ошибка проверки администратора: {e}")
+        logger.error(f"Ошибка проверки администратора группы: {e}")
         return False
+
+
+async def is_bot_admin(user_id: int, chat_id: Optional[int] = None) -> bool:
+    # 1) ID из .env или state.bot_admin_ids
+    if user_id in STATE.bot_admin_ids:
+        return True
+    if user_id in ENV_ADMIN_IDS:
+        return True
+    # 2) Администратор текущей группы
+    if chat_id:
+        if await is_group_admin(chat_id, user_id):
+            return True
+    return False
+
+
+# ------------------ СТАТИСТИКА ОБУЧЕНИЯ ------------------ #
+
+def compute_training_stats() -> Dict[str, Any]:
+    total = 0
+    by_label = {"в_работу": 0, "неверно": 0, "привязать": 0, "other": 0}
+    last_for_text: Dict[str, str] = {}  # text -> last_label
+
+    if not os.path.exists(YAGPT_DATASET):
+        return {"total": 0, "by_label": by_label, "effective_total": 0}
+
+    with open(YAGPT_DATASET, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            text = obj.get("text", "")
+            label = obj.get("label", "other")
+            total += 1
+            if label not in by_label:
+                by_label["other"] += 1
+            else:
+                by_label[label] += 1
+            # запоминаем последний label для этого текста
+            if text:
+                last_for_text[text] = label
+
+    # эффективное количество уникальных примеров (по последнему статусу)
+    effective_total = len(last_for_text)
+    return {"total": total, "by_label": by_label, "effective_total": effective_total}
+
+
+def build_training_stats_text() -> str:
+    stats = compute_training_stats()
+    total = stats["total"]
+    eff = stats["effective_total"]
+    by_label = stats["by_label"]
+
+    target = 1000  # условная цель "до идеала"
+    remaining = max(0, target - eff)
+
+    lines: List[str] = []
+    lines.append("📊 Состояние обучения YandexGPT")
+    lines.append("")
+    lines.append(f"Всего решений (записей): {total}")
+    lines.append(f"Уникальных примеров (по последнему статусу): {eff}")
+    lines.append("")
+    lines.append("Разметка по статусам (последние решения):")
+    lines.append(f"• В работу: {by_label.get('в_работу', 0)}")
+    lines.append(f"• Неверно: {by_label.get('неверно', 0)}")
+    lines.append(f"• Привязать: {by_label.get('привязать', 0)}")
+    if by_label.get("other", 0):
+        lines.append(f"• Прочие: {by_label.get('other', 0)}")
+    lines.append("")
+    lines.append(f"Текущий порог вероятности самостроя: {STATE.min_risk_probability}%")
+    lines.append("")
+    lines.append(f"До условного 'идеала' (цель {target} примеров) осталось ~{remaining}.")
+    lines.append(
+        "Чтобы изменить статус конкретной карточки — ещё раз ответь на неё "
+        "словом «в работу», «неверно» или «привязать». Последнее решение считается актуальным."
+    )
+    return "\n".join(lines)
 
 
 # ------------------ CALLBACK (КНОПКИ) ------------------ #
 
 async def handle_callback_query(callback_query: Dict[str, Any]):
-    """
-    Обработка callback_data формата train:<action>:<channel>:<post_id>
-    и onzs:<номер>.
-    """
     data = callback_query.get("data", "")
     from_id = callback_query.get("from", {}).get("id")
     message = callback_query.get("message", {})
     message_id = message.get("message_id")
     chat_id = message.get("chat", {}).get("id")
 
+    # Админ-панель: статистика
+    if data == "admin:stats":
+        if not await is_bot_admin(from_id, chat_id):
+            await tg_request(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query.get("id"),
+                    "text": "Только администраторы бота могут смотреть статистику.",
+                    "show_alert": True,
+                },
+            )
+            return
+        text = build_training_stats_text()
+        await send_tg_message(chat_id, text)
+        await tg_request(
+            "answerCallbackQuery",
+            {
+                "callback_query_id": callback_query.get("id"),
+                "text": "Статистика отправлена.",
+                "show_alert": False,
+            },
+        )
+        return
+
     if data.startswith("train:"):
-        # Обучать YandexGPT могут только администраторы группы (или ADMIN_IDS)
-        if not await is_group_admin(chat_id, from_id):
+        if not await is_bot_admin(from_id, chat_id):
             await tg_request(
                 "answerCallbackQuery",
                 {
@@ -873,22 +883,29 @@ async def handle_callback_query(callback_query: Dict[str, Any]):
 
         _, action, key = data.split(":", 2)
         channel, post_id_str = key.split(":", 1)
+
         label_map = {
             "work": "в_работу",
             "wrong": "неверно",
             "attach": "привязать",
         }
         label = label_map.get(action, action)
+        card_text = message.get("text", "")
+
         rec = {
-            "text": message.get("text", ""),
+            "text": card_text,
             "label": label,
             "timestamp": datetime.now().isoformat(),
             "from_id": from_id,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "source": "callback",
         }
         append_jsonl(YAGPT_DATASET, rec)
+        append_jsonl(HISTORY_CARDS, rec)
         append_line(ANALYTICS_LOG, f"DECISION: {label} by {from_id}")
 
-        # Убираем кнопки с карточки
+        # убираем кнопки
         try:
             await tg_request(
                 "editMessageReplyMarkup",
@@ -947,7 +964,7 @@ async def handle_callback_query(callback_query: Dict[str, Any]):
         )
 
 
-# ------------------ ПРИЁМ UPDATE'ов (POLLING) ------------------ #
+# ------------------ ПРИЁМ UPDATE'ов ------------------ #
 
 OFFSET = 0
 
@@ -1007,12 +1024,20 @@ async def handle_message(message: Dict[str, Any]):
             await cmd_risk(chat_id, from_id, args)
         elif cmd == "/chatid":
             await send_tg_message(chat_id, f"Chat ID: {chat_id}")
+        elif cmd == "/admin":
+            await cmd_admin(chat_id, from_id)
+        elif cmd == "/addadmin":
+            await cmd_add_admin(chat_id, from_id, args)
+        elif cmd == "/deladmin":
+            await cmd_del_admin(chat_id, from_id, args)
+        elif cmd == "/trainstats":
+            await cmd_train_stats(chat_id, from_id)
         return
 
     # Обучение по тексту-ответу на карточку (только админы)
     reply_to = message.get("reply_to_message")
     if reply_to and reply_to.get("text"):
-        if not await is_group_admin(chat_id, from_id):
+        if not await is_bot_admin(from_id, chat_id):
             return
 
         lower = text.strip().lower()
@@ -1025,13 +1050,18 @@ async def handle_message(message: Dict[str, Any]):
         else:
             return
 
+        base_text = reply_to.get("text", "")
         rec = {
-            "text": reply_to.get("text", ""),
+            "text": base_text,
             "label": label,
             "timestamp": datetime.now().isoformat(),
             "from_id": from_id,
+            "chat_id": chat_id,
+            "message_id": reply_to.get("message_id"),
+            "source": "reply",
         }
         append_jsonl(YAGPT_DATASET, rec)
+        append_jsonl(HISTORY_CARDS, rec)
         append_line(ANALYTICS_LOG, f"DECISION_REPLY: {label} by {from_id}")
         await send_tg_message(chat_id, f"✅ Решение зафиксировано: {label}")
 
@@ -1047,7 +1077,8 @@ async def cmd_start(chat_id: int, user_id: int):
     text = (
         "👋 Привет! Это бот мониторинга самовольного строительства.\n\n"
         "Ниже выбери, по каким ОНзС ты хочешь получать карточки (на будущее, для личных рассылок).\n"
-        "Сейчас все карточки приходят в общий групповой чат."
+        "Сейчас все карточки приходят в общий групповой чат.\n\n"
+        "Для администраторов доступна команда /admin (панель управления)."
     )
     await send_tg_message(chat_id, text, kb)
 
@@ -1060,8 +1091,7 @@ async def cmd_stop(chat_id: int, user_id: int):
 
 
 async def cmd_risk(chat_id: int, user_id: int, args: List[str]):
-    # Эту команду логичнее оставить только супер-админам (из ADMIN_IDS)
-    if user_id not in ADMIN_IDS:
+    if not await is_bot_admin(user_id, chat_id):
         await send_tg_message(chat_id, "Эта команда доступна только администраторам бота.")
         return
 
@@ -1088,17 +1118,110 @@ async def cmd_risk(chat_id: int, user_id: int, args: List[str]):
     await send_tg_message(chat_id, f"✅ Новый порог вероятности самостроя: {val}%.")
 
 
+async def cmd_admin(chat_id: int, user_id: int):
+    if not await is_bot_admin(user_id, chat_id):
+        await send_tg_message(chat_id, "Эта панель доступна только администраторам бота.")
+        return
+
+    all_admins = sorted(set(STATE.bot_admin_ids + ENV_ADMIN_IDS))
+    admins_str = ", ".join(str(a) for a in all_admins) if all_admins else "нет"
+
+    text = (
+        "🛠 Админ-панель бота\n\n"
+        "Администраторы могут обучать YandexGPT (кнопки и ответы), менять порог /risk,\n"
+        "просматривать статистику и управлять списком админов.\n\n"
+        f"Текущий список администраторов (ID): {admins_str}\n\n"
+        "Команды:\n"
+        "• /addadmin <id> — добавить администратора\n"
+        "• /deladmin <id> — удалить администратора\n"
+        "• /risk — посмотреть/изменить порог вероятности\n"
+        "• /trainstats — посмотреть статистику обучения\n\n"
+        "Чтобы поменять статус карточки — ещё раз ответь на неё текстом «в работу», "
+        "«неверно» или «привязать» — последнее решение будет учтено."
+    )
+
+    kb = {
+        "inline_keyboard": [
+            [{"text": "📊 Проверка состояния обучения", "callback_data": "admin:stats"}],
+        ]
+    }
+    await send_tg_message(chat_id, text, kb)
+
+
+async def cmd_add_admin(chat_id: int, user_id: int, args: List[str]):
+    if not await is_bot_admin(user_id, chat_id):
+        await send_tg_message(chat_id, "Добавлять администраторов может только администратор бота.")
+        return
+
+    if not args:
+        await send_tg_message(chat_id, "Использование: /addadmin <telegram_id>")
+        return
+
+    try:
+        new_id = int(args[0])
+    except ValueError:
+        await send_tg_message(chat_id, "ID должен быть числом.")
+        return
+
+    if new_id in STATE.bot_admin_ids:
+        await send_tg_message(chat_id, f"ID {new_id} уже в списке администраторов.")
+        return
+
+    STATE.bot_admin_ids.append(new_id)
+    save_state(STATE)
+    await send_tg_message(chat_id, f"✅ ID {new_id} добавлен в администраторы бота.")
+
+
+async def cmd_del_admin(chat_id: int, user_id: int, args: List[str]):
+    if not await is_bot_admin(user_id, chat_id):
+        await send_tg_message(chat_id, "Удалять администраторов может только администратор бота.")
+        return
+
+    if not args:
+        await send_tg_message(chat_id, "Использование: /deladmin <telegram_id>")
+        return
+
+    try:
+        del_id = int(args[0])
+    except ValueError:
+        await send_tg_message(chat_id, "ID должен быть числом.")
+        return
+
+    if del_id in STATE.bot_admin_ids:
+        STATE.bot_admin_ids.remove(del_id)
+        save_state(STATE)
+        await send_tg_message(chat_id, f"✅ ID {del_id} удалён из администраторов бота.")
+    else:
+        await send_tg_message(chat_id, f"ID {del_id} не найден в списке администраторов.")
+
+
+async def cmd_train_stats(chat_id: int, user_id: int):
+    if not await is_bot_admin(user_id, chat_id):
+        await send_tg_message(chat_id, "Статистику обучения могут смотреть только администраторы.")
+        return
+    text = build_training_stats_text()
+    await send_tg_message(chat_id, text)
+
+
 # ------------------ MAIN ------------------ #
 
+async def scanner_loop():
+    while True:
+        try:
+            await scan_once()
+        except Exception as e:
+            logger.error(f"Ошибка в scanner_loop: {e}")
+        await asyncio.sleep(180)
+
+
 async def main():
-    logger.info("🚀 Запуск Samastroi Scraper (public channels + YandexGPT + rs_search_bot)...")
+    logger.info("🚀 Запуск Samastroi Scraper...")
 
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не задан в .env")
     if TARGET_CHAT_ID == 0:
         logger.error("TARGET_CHAT_ID не задан в .env")
 
-    # Запускаем Telethon-клиент для @rs_search_bot
     if RS_CLIENT is not None:
         await RS_CLIENT.start()
         me = await RS_CLIENT.get_me()
@@ -1108,15 +1231,6 @@ async def main():
         scanner_loop(),
         poll_updates(),
     )
-
-
-async def scanner_loop():
-    while True:
-        try:
-            await scan_once()
-        except Exception as e:
-            logger.error(f"Ошибка в scanner_loop: {e}")
-        await asyncio.sleep(180)  # интервал между проходами по каналам
 
 
 if __name__ == "__main__":
