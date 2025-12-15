@@ -17,11 +17,11 @@ BASE_DIR = os.path.dirname(__file__)
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 load_dotenv(ENV_PATH)
 
-# Telegram Bot API
+# Telegram BOT API (бот @samastroq_MO_bot)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0") or "0")
 
-# Начальный список администраторов (через .env)
+# Начальный список администраторов (через .env, через запятую)
 ENV_ADMIN_IDS: List[int] = []
 _raw_admin_ids = os.getenv("ADMIN_IDS", "").strip()
 if _raw_admin_ids:
@@ -34,32 +34,29 @@ if _raw_admin_ids:
         except ValueError:
             logger.warning(f"Не могу распарсить ADMIN_ID '{part}'")
 
-# YandexGPT настройки
+# YandexGPT
 YAGPT_API_KEY = os.getenv("YAGPT_API_KEY", "").strip()
 YAGPT_FOLDER_ID = os.getenv("YAGPT_FOLDER_ID", "").strip()
 
-# Яндекс Геокодер (для адрес -> координаты)
+# Яндекс Геокодер (опционально)
 YANDEX_GEOCODER_KEY = os.getenv("YANDEX_GEOCODER_KEY", "").strip()
 
-# Уровень логирования
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # Порог вероятности самостроя по умолчанию
 DEFAULT_MIN_RISK_PROBABILITY = int(os.getenv("MIN_RISK_PROBABILITY", "10") or "10")
 
-# Настройки Telethon для работы с @rs_search_bot
+# Telethon для работы с @rs_search_bot (опционально)
 TG_API_ID = int(os.getenv("TG_API_ID", "0") or "0")
 TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
 SESSION_NAME = os.getenv("SESSION_NAME", "samastroi_rs_session").strip()
-
-# ID бота Росреестра
 RS_SEARCH_BOT = "rs_search_bot"  # @rs_search_bot
+
 
 # ------------------ ДИРЕКТОРИИ И ФАЙЛЫ ------------------ #
 
 DATA_DIR = os.path.join(BASE_DIR, "data")
 LOGS_DIR = os.path.join(BASE_DIR, "logs")
-
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 
@@ -71,14 +68,15 @@ ANALYTICS_LOG = os.path.join(DATA_DIR, "analytics.log")
 YAGPT_DATASET = os.path.join(DATA_DIR, "yagpt_dataset.jsonl")
 NEWS_FILE = os.path.join(DATA_DIR, "news.jsonl")
 ONZS_DIR = os.path.join(DATA_DIR, "onzs")
-HISTORY_CARDS = os.path.join(DATA_DIR, "history_cards.jsonl")  # История карточек
+HISTORY_CARDS = os.path.join(DATA_DIR, "history_cards.jsonl")
 os.makedirs(ONZS_DIR, exist_ok=True)
+
 
 # ------------------ ЛОГИ ------------------ #
 
 logger.remove()
 logger.add(
-    os.path.join(LOGS_DIR, "scraper.log"),
+    os.path.join(LOGS_DIR, "samastroi_telethon.log"),
     rotation="10 MB",
     encoding="utf-8",
     level=LOG_LEVEL,
@@ -129,10 +127,10 @@ def append_jsonl(path: str, obj: dict):
 @dataclass
 class BotState:
     last_post_ids: Dict[str, int]
-    user_subscriptions: Dict[str, List[int]]  # user_id -> [1..12]
+    user_subscriptions: Dict[str, List[int]]
     user_paused: Dict[str, bool]
     min_risk_probability: int
-    bot_admin_ids: List[int]  # администраторы бота (кроме .env)
+    bot_admin_ids: List[int]
 
     @staticmethod
     def default() -> "BotState":
@@ -195,7 +193,7 @@ async def call_yandex_gpt_json(prompt: str, temperature: float = 0.2) -> Optiona
         "Ты помощник инспектора Главгосстройнадзора Московской области. "
         "По тексту сообщения из Telegram нужно понять, есть ли признаки самовольного строительства "
         "и, если да, структурировать данные в JSON: объект, адрес, кадастровый номер, риск и краткое описание. "
-        "Отвечай строго одним JSON-объектом, без комментариев, без текста до и после."
+        "Отвечай строго одним JSON-объектом, без комментариев."
     )
 
     payload = {
@@ -277,7 +275,7 @@ async def geocode_address(address: str) -> Optional[Tuple[float, float]]:
         return None
 
 
-# ------------------ TELETHON для @rs_search_bot ------------------ #
+# ------------------ Telethon для @rs_search_bot (опционально) ------------------ #
 
 from telethon import TelegramClient, events
 
@@ -305,11 +303,6 @@ async def query_rs_search_bot_by_coords(lat: float, lon: float) -> Optional[str]
     try:
         bot_entity = await RS_CLIENT.get_entity(RS_SEARCH_BOT)
         await RS_CLIENT.send_message(bot_entity, coords_text)
-
-        @RS_CLIENT.on(events.NewMessage(from_users=bot_entity))
-        async def handler(event):
-            pass
-
         resp = await RS_CLIENT.wait_for(
             events.NewMessage(from_users=bot_entity), timeout=15
         )
@@ -347,7 +340,7 @@ def extract_rosreestr_block(text: str) -> Optional[str]:
     return "\n".join(parts)
 
 
-# ------------------ ONZS МАППИНГ ------------------ #
+# ------------------ ОНзС ------------------ #
 
 ONZS_MAPPING: Dict[int, List[str]] = {
     1: ["одинцовский", "наро-фоминский", "власиха", "краснознаменск", "можайск"],
@@ -408,7 +401,6 @@ def build_card_text(card: Dict[str, Any]) -> str:
         risk_score = risk_probability
 
     text_lines: List[str] = []
-
     text_lines.append(f"Найдено в {channel}")
     text_lines.append("")
     text_lines.append("🏗 Объект и нарушение")
@@ -468,7 +460,7 @@ def build_inline_keyboard(card: Dict[str, Any], channel: str, post_id: int) -> D
     return {"inline_keyboard": keyboard}
 
 
-# ------------------ Telegram Bot API (отправка сообщений) ------------------ #
+# ------------------ Telegram Bot API ------------------ #
 
 TG_API_BASE = "https://api.telegram.org"
 
@@ -483,7 +475,7 @@ async def tg_request(method: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
 async def send_card_to_tg_group(card: Dict[str, Any]) -> Optional[int]:
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN не задан — не могу отправлять карточки в Telegram.")
+        logger.error("BOT_TOKEN не задан — не могу отправлять карточки.")
         return None
     if TARGET_CHAT_ID == 0:
         logger.error("TARGET_CHAT_ID не задан — некуда отправлять карточки.")
@@ -511,7 +503,7 @@ async def send_card_to_tg_group(card: Dict[str, Any]) -> Optional[int]:
         message_id = resp["result"]["message_id"]
         return message_id
     except Exception as e:
-        logger.error(f"Ошибка отправки карточки в Telegram: {e}")
+        logger.error(f"Ошибка отправки карточки: {e}")
         return None
 
 
@@ -556,10 +548,11 @@ def build_onzs_keyboard(selected: List[int]) -> Dict[str, Any]:
 
 
 async def broadcast_card_to_subscribers(card: Dict[str, Any], main_message_id: Optional[int] = None):
+    # пока отключено, вся рассылка идёт только в общий чат TARGET_CHAT_ID
     return
 
 
-# ------------------ ПУБЛИЧНЫЕ КАНАЛЫ (WEB SCRAPING) ------------------ #
+# ------------------ СКРАПЕР Telegram Web ------------------ #
 
 TELEGRAM_WEB_BASE = "https://t.me"
 
@@ -571,8 +564,8 @@ async def fetch_channel_page(username: str) -> str:
         r = await client.get(url)
         if r.status_code in (301, 302, 303, 307, 308):
             logger.error(
-                f"Redirect response '{r.status_code} {r.reason_phrase}' for url '{url}'\n"
-                f"Redirect location: '{r.headers.get('Location')}'"
+                f"Redirect '{r.status_code} {r.reason_phrase}' for url '{url}', "
+                f"Location: '{r.headers.get('Location')}'"
             )
             raise RuntimeError(f"Redirect for {url}")
         r.raise_for_status()
@@ -581,7 +574,6 @@ async def fetch_channel_page(username: str) -> str:
 
 def parse_posts_from_html(html: str) -> List[Tuple[int, str]]:
     posts: List[Tuple[int, str]] = []
-
     for m in re.finditer(r'data-post="[^/]+/(\d+)"', html):
         msg_id = int(m.group(1))
         start = max(0, m.start() - 2000)
@@ -592,11 +584,10 @@ def parse_posts_from_html(html: str) -> List[Tuple[int, str]]:
         posts.append((msg_id, snippet))
 
     unique: Dict[int, str] = {}
-    for msg_id, text in posts:
-        if msg_id not in unique:
-            unique[msg_id] = text
-    result = sorted(unique.items(), key=lambda x: x[0])
-    return result
+    for mid, txt in posts:
+        if mid not in unique:
+            unique[mid] = txt
+    return sorted(unique.items(), key=lambda x: x[0])
 
 
 async def analyze_case_with_yagpt(channel: str, msg_id: int, text: str, original_url: str) -> Optional[Dict[str, Any]]:
@@ -667,19 +658,18 @@ async def analyze_case_with_yagpt(channel: str, msg_id: int, text: str, original
     return card
 
 
-async def process_public_post(channel: str, msg_id: int, text: str):
+async def process_public_post(username: str, msg_id: int, text: str):
     keywords = read_lines(KEYWORDS_FILE)
     lower = text.lower()
     matched = [kw for kw in keywords if kw.lower() in lower]
     if not matched:
         return
 
-    logger.info(f"[MATCH] @{channel}: пост {msg_id}, ключевые слова {matched}")
-
-    original_url = f"https://t.me/{channel}/{msg_id}"
+    logger.info(f"[MATCH] @{username}: пост {msg_id}, ключевые слова {matched}")
+    original_url = f"https://t.me/{username}/{msg_id}"
 
     card = await analyze_case_with_yagpt(
-        channel=f"@{channel}", msg_id=msg_id, text=text, original_url=original_url
+        channel=f"@{username}", msg_id=msg_id, text=text, original_url=original_url
     )
     if not card:
         return
@@ -694,7 +684,7 @@ async def process_public_post(channel: str, msg_id: int, text: str):
         MONITORING_LOG,
         json.dumps(
             {
-                "channel": channel,
+                "channel": username,
                 "msg_id": msg_id,
                 "keywords": matched,
                 "card": card,
@@ -721,7 +711,6 @@ async def scan_once():
                 continue
 
             logger.info(f"Найдено новых постов в @{username}: {len(new_posts)}")
-
             for mid, txt in new_posts:
                 await process_public_post(username, mid, txt)
                 if mid > last_seen:
@@ -734,7 +723,7 @@ async def scan_once():
             logger.error(f"Ошибка при обработке канала @{username}: {e}")
 
 
-# ------------------ ПРОВЕРКА АДМИНИСТРАТОРОВ ------------------ #
+# ------------------ РОЛИ АДМИНИСТРАТОРА ------------------ #
 
 async def is_group_admin(chat_id: int, user_id: int) -> bool:
     if chat_id is None or chat_id > 0:
@@ -757,12 +746,10 @@ async def is_group_admin(chat_id: int, user_id: int) -> bool:
 
 
 async def is_bot_admin(user_id: int, chat_id: Optional[int] = None) -> bool:
-    # 1) ID из .env или state.bot_admin_ids
     if user_id in STATE.bot_admin_ids:
         return True
     if user_id in ENV_ADMIN_IDS:
         return True
-    # 2) Администратор текущей группы
     if chat_id:
         if await is_group_admin(chat_id, user_id):
             return True
@@ -774,7 +761,7 @@ async def is_bot_admin(user_id: int, chat_id: Optional[int] = None) -> bool:
 def compute_training_stats() -> Dict[str, Any]:
     total = 0
     by_label = {"в_работу": 0, "неверно": 0, "привязать": 0, "other": 0}
-    last_for_text: Dict[str, str] = {}  # text -> last_label
+    last_for_text: Dict[str, str] = {}
 
     if not os.path.exists(YAGPT_DATASET):
         return {"total": 0, "by_label": by_label, "effective_total": 0}
@@ -795,11 +782,9 @@ def compute_training_stats() -> Dict[str, Any]:
                 by_label["other"] += 1
             else:
                 by_label[label] += 1
-            # запоминаем последний label для этого текста
             if text:
                 last_for_text[text] = label
 
-    # эффективное количество уникальных примеров (по последнему статусу)
     effective_total = len(last_for_text)
     return {"total": total, "by_label": by_label, "effective_total": effective_total}
 
@@ -810,7 +795,7 @@ def build_training_stats_text() -> str:
     eff = stats["effective_total"]
     by_label = stats["by_label"]
 
-    target = 1000  # условная цель "до идеала"
+    target = 1000  # условная цель
     remaining = max(0, target - eff)
 
     lines: List[str] = []
@@ -836,7 +821,7 @@ def build_training_stats_text() -> str:
     return "\n".join(lines)
 
 
-# ------------------ CALLBACK (КНОПКИ) ------------------ #
+# ------------------ CALLBACK (кнопки) ------------------ #
 
 async def handle_callback_query(callback_query: Dict[str, Any]):
     data = callback_query.get("data", "")
@@ -845,7 +830,30 @@ async def handle_callback_query(callback_query: Dict[str, Any]):
     message_id = message.get("message_id")
     chat_id = message.get("chat", {}).get("id")
 
-    # Админ-панель: статистика
+    # Открыть админ-панель по кнопке "Админ"
+    if data == "admin:open":
+        if not await is_bot_admin(from_id, chat_id):
+            await tg_request(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query.get("id"),
+                    "text": "Только администраторы бота могут открыть админ-панель.",
+                    "show_alert": True,
+                },
+            )
+            return
+        await cmd_admin(chat_id, from_id)
+        await tg_request(
+            "answerCallbackQuery",
+            {
+                "callback_query_id": callback_query.get("id"),
+                "text": "Админ-панель открыта.",
+                "show_alert": False,
+            },
+        )
+        return
+
+    # Статистика обучения
     if data == "admin:stats":
         if not await is_bot_admin(from_id, chat_id):
             await tg_request(
@@ -869,13 +877,14 @@ async def handle_callback_query(callback_query: Dict[str, Any]):
         )
         return
 
+    # Кнопки обучения
     if data.startswith("train:"):
         if not await is_bot_admin(from_id, chat_id):
             await tg_request(
                 "answerCallbackQuery",
                 {
                     "callback_query_id": callback_query.get("id"),
-                    "text": "Только администраторы могут обучать ИИ",
+                    "text": "Только администраторы могут обучать ИИ.",
                     "show_alert": True,
                 },
             )
@@ -905,7 +914,6 @@ async def handle_callback_query(callback_query: Dict[str, Any]):
         append_jsonl(HISTORY_CARDS, rec)
         append_line(ANALYTICS_LOG, f"DECISION: {label} by {from_id}")
 
-        # убираем кнопки
         try:
             await tg_request(
                 "editMessageReplyMarkup",
@@ -964,7 +972,7 @@ async def handle_callback_query(callback_query: Dict[str, Any]):
         )
 
 
-# ------------------ ПРИЁМ UPDATE'ов ------------------ #
+# ------------------ ПОЛЛИНГ getUpdates ------------------ #
 
 OFFSET = 0
 
@@ -1034,7 +1042,7 @@ async def handle_message(message: Dict[str, Any]):
             await cmd_train_stats(chat_id, from_id)
         return
 
-    # Обучение по тексту-ответу на карточку (только админы)
+    # Обучение по ответу на карточку (только для админов)
     reply_to = message.get("reply_to_message")
     if reply_to and reply_to.get("text"):
         if not await is_bot_admin(from_id, chat_id):
@@ -1043,7 +1051,7 @@ async def handle_message(message: Dict[str, Any]):
         lower = text.strip().lower()
         if lower in ("в работу", "в_работу", "работа"):
             label = "в_работу"
-        elif lower in ("неверно", "не относится", "не относится.", "не наш"):
+        elif lower in ("неверно", "не относится", "не наш"):
             label = "неверно"
         elif lower in ("привязать", "привязка"):
             label = "привязать"
@@ -1072,22 +1080,39 @@ async def cmd_start(chat_id: int, user_id: int):
     user_key = str(user_id)
     subs = STATE.user_subscriptions.get(user_key, [])
     kb = build_onzs_keyboard(subs)
+    inline_kb = kb["inline_keyboard"]
+
+    # для администратора добавляем кнопку "Админ"
+    if await is_bot_admin(user_id, chat_id):
+        inline_kb.append(
+            [
+                {
+                    "text": "🛠 Админ",
+                    "callback_data": "admin:open",
+                }
+            ]
+        )
+
     STATE.user_paused[user_key] = False
     save_state(STATE)
+
     text = (
         "👋 Привет! Это бот мониторинга самовольного строительства.\n\n"
         "Ниже выбери, по каким ОНзС ты хочешь получать карточки (на будущее, для личных рассылок).\n"
         "Сейчас все карточки приходят в общий групповой чат.\n\n"
-        "Для администраторов доступна команда /admin (панель управления)."
+        "Для администратора доступна кнопка «Админ» и команда /admin."
     )
-    await send_tg_message(chat_id, text, kb)
+    await send_tg_message(chat_id, text, {"inline_keyboard": inline_kb})
 
 
 async def cmd_stop(chat_id: int, user_id: int):
     user_key = str(user_id)
     STATE.user_paused[user_key] = True
     save_state(STATE)
-    await send_tg_message(chat_id, "⏸ Показ карточек для тебя приостановлен (для личных рассылок). Чтобы возобновить — /start.")
+    await send_tg_message(
+        chat_id,
+        "⏸ Показ карточек для тебя приостановлен (для личных рассылок). Чтобы возобновить — /start.",
+    )
 
 
 async def cmd_risk(chat_id: int, user_id: int, args: List[str]):
@@ -1137,7 +1162,7 @@ async def cmd_admin(chat_id: int, user_id: int):
         "• /risk — посмотреть/изменить порог вероятности\n"
         "• /trainstats — посмотреть статистику обучения\n\n"
         "Чтобы поменять статус карточки — ещё раз ответь на неё текстом «в работу», "
-        "«неверно» или «привязать» — последнее решение будет учтено."
+        "«неверно» или «привязать». Последнее решение будет учтено."
     )
 
     kb = {
@@ -1215,7 +1240,7 @@ async def scanner_loop():
 
 
 async def main():
-    logger.info("🚀 Запуск Samastroi Scraper...")
+    logger.info("🚀 Запуск samastroi_telethon...")
 
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не задан в .env")
@@ -1225,7 +1250,7 @@ async def main():
     if RS_CLIENT is not None:
         await RS_CLIENT.start()
         me = await RS_CLIENT.get_me()
-        logger.info(f"Telethon-сессия активна: {me}")
+        logger.info(f"Telethon-сессия для @rs_search_bot активна: {me}")
 
     await asyncio.gather(
         scanner_loop(),
