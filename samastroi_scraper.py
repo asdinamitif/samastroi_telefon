@@ -23,7 +23,7 @@ log = logging.getLogger("samastroi_scraper")
 # ---------------------------------------------------------
 # ПУТИ ХРАНИЛИЩА
 # ---------------------------------------------------------
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+DATA_DIR = os.getenv("DATA_DIR") or ("/data" if os.path.isdir("/data") else "/app/data")
 
 # Создаём папку, если нет
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -65,60 +65,39 @@ DEFAULT_ADMINS = [
 
 
 def load_admins() -> List[int]:
-    """Load admin user IDs.
-
-    Priority:
-    1) ADMINS_FILE if it contains a non-empty list of ints
-    2) ENV: ADMIN_IDS (comma/space separated) or ADMIN_ID (single)
-    3) DEFAULT_ADMINS
     """
-    # 1) From file
+    Загружает администраторов из admins.json.
+    Если файл пустой/битый/список пуст — восстанавливает DEFAULT_ADMINS.
+    """
     try:
         with open(ADMINS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, list) and all(isinstance(x, int) for x in data) and len(data) > 0:
-                log.info(f"Загружено админов: {data}")
-                return data
-            if isinstance(data, list) and len(data) == 0:
-                log.warning("admins.json найден, но список админов пуст. Будет использован ENV/DEFAULT.")
-    except FileNotFoundError:
-        log.warning("admins.json не найден. Будет использован ENV/DEFAULT.")
+
+        if isinstance(data, list) and all(isinstance(x, int) for x in data):
+            # Если список пуст — считаем это ошибочной конфигурацией и восстанавливаем дефолт.
+            if len(data) == 0:
+                raise ValueError("admins.json contains empty list")
+            log.info(f"Загружено админов: {data}")
+            return data
+
     except Exception as e:
         log.error(f"Ошибка загрузки admins.json: {e}")
 
-    # 2) From environment
-    env_raw = (os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or "").strip()
-    env_ids: List[int] = []
-    if env_raw:
-        parts = re.split(r"[\s,;]+", env_raw)
-        for p in parts:
-            if not p:
-                continue
-            try:
-                env_ids.append(int(p))
-            except Exception:
-                pass
-        env_ids = [x for i, x in enumerate(env_ids) if x not in env_ids[:i]]  # unique
-        if env_ids:
-            try:
-                with open(ADMINS_FILE, "w", encoding="utf-8") as f:
-                    json.dump(env_ids, f, ensure_ascii=False)
-            except Exception as e:
-                log.error(f"Не удалось записать admins.json из ENV: {e}")
-            log.info(f"Загружено админов из ENV: {env_ids}")
-            return env_ids
-
-    # 3) Fallback to defaults
+    # Восстанавливаем список по умолчанию
     try:
         with open(ADMINS_FILE, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_ADMINS, f, ensure_ascii=False)
     except Exception as e:
-        log.error(f"Не удалось записать admins.json по умолчанию: {e}")
+        log.error(f"Не удалось записать admins.json: {e}")
+
     log.info(f"Восстановлены админы по умолчанию: {DEFAULT_ADMINS}")
     return DEFAULT_ADMINS
 
 
+
 ADMINS = load_admins()
+
+
 def save_admins():
     """Сохраняем список администраторов."""
     with open(ADMINS_FILE, "w", encoding="utf-8") as f:
@@ -257,7 +236,7 @@ def extract_posts(html: str) -> List[Dict[str, str]]:
             text = text_block.get_text(" ", strip=True) if text_block else ""
 
             date_block = msg.find("time", class_="time")
-            timestamp = int(date_block.get("datetime")) if date_block else int(time.time())
+            timestamp = parse_tg_datetime(date_block.get("datetime")) if date_block else int(time.time())
 
             links = []
             for a in msg.find_all("a", href=True):
@@ -846,6 +825,12 @@ def poll_updates():
 
     log.info("Запуск poll_updates (обработка callback_query)...")
 
+    # На всякий случай отключаем webhook, иначе getUpdates может не работать
+    try:
+        requests.post(f"{TELEGRAM_API_URL}/deleteWebhook", json={"drop_pending_updates": False}, timeout=10)
+    except Exception as e:
+        log.warning(f"deleteWebhook warning: {e}")
+
     while True:
         try:
             params = {
@@ -1189,6 +1174,9 @@ def handle_callback_query(update: Dict):
 
 UPDATE_OFFSET = 0
 
+# Если DISABLE_UPDATES_POLLING=1 — polling отключён (например, если другой экземпляр уже работает)
+DISABLE_UPDATES_POLLING = os.getenv("DISABLE_UPDATES_POLLING", "0").strip() in ("1","true","True","yes","YES")
+
 
 def poll_updates():
     """
@@ -1202,6 +1190,17 @@ def poll_updates():
         return
 
     log.info("Запуск poll_updates (message + callback_query)...")
+
+    if DISABLE_UPDATES_POLLING:
+        log.warning("DISABLE_UPDATES_POLLING=1 — polling отключён. Кнопки/команды работать не будут.")
+        while True:
+            time.sleep(3600)
+
+    # На всякий случай отключаем webhook
+    try:
+        requests.post(f"{TELEGRAM_API_URL}/deleteWebhook", json={"drop_pending_updates": False}, timeout=10)
+    except Exception as e:
+        log.warning(f"deleteWebhook warning: {e}")
 
     while True:
         try:
@@ -1686,41 +1685,27 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN не задан — карточки НЕ будут отправляться в Telegram.")
 
     main_loop()
-def parse_tg_datetime_to_epoch(dt_str: str) -> int:
-    """Convert Telegram <time datetime="..."> value to Unix epoch seconds.
-
-    Telegram's public channel HTML historically used integer epoch seconds, but it can also be
-    ISO-8601 like '2025-12-15T12:20:32+00:00'. This helper supports both.
-    """
-    import time as _time
-    if not dt_str:
-        return int(_time.time())
-    s = str(dt_str).strip()
-    if not s:
-        return int(_time.time())
-    # Pure epoch seconds
-    if s.isdigit():
-        try:
-            return int(s)
-        except Exception:
-            return int(_time.time())
-    # ISO-8601 (Telegram often uses +00:00 or Z)
+# ---------------------------------------------------------
+# Парсинг даты Telegram из атрибута time[datetime]
+# (обычно ISO 8601: 2025-12-15T10:20:12+00:00)
+# ---------------------------------------------------------
+def parse_tg_datetime(dt_value) -> int:
+    """Возвращает Unix timestamp (int). При ошибке — текущее время."""
     try:
-        iso = s.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(iso)
+        if isinstance(dt_value, (int, float)):
+            return int(dt_value)
+
+        s = str(dt_value).strip()
+        if not s:
+            return int(time.time())
+
+        # Telegram отдаёт ISO 8601. fromisoformat умеет '+00:00'
+        # На случай 'Z' заменяем на '+00:00'
+        s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return int(dt.timestamp())
     except Exception:
-        pass
-    # Fallback: try to find 10-digit epoch inside string
-    m = re.search(r"\b(\d{10})\b", s)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return int(_time.time())
-    return int(_time.time())
-
-
+        return int(time.time())
 
