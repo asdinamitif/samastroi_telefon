@@ -151,7 +151,7 @@ def load_state() -> BotState:
             last_post_ids=data.get("last_post_ids", {}),
             user_subscriptions=data.get("user_subscriptions", {}),
             user_paused=data.get("user_paused", {}),
-            min_risk_probability:int(
+            min_risk_probability=int(
                 data.get("min_risk_probability", DEFAULT_MIN_RISK_PROBABILITY)
             ),
         )
@@ -596,7 +596,7 @@ async def tg_request(method: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
 async def send_card_to_tg_group(card: Dict[str, Any]) -> Optional[int]:
     """
-    Отправляем карточку в целевой чат + тему «Новости» (если есть).
+    Отправляем карточку в целевой чат.
     """
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не задан — не могу отправлять карточки в Telegram.")
@@ -613,7 +613,7 @@ async def send_card_to_tg_group(card: Dict[str, Any]) -> Optional[int]:
     data: Dict[str, Any] = {
         "chat_id": TARGET_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",  # текст без HTML, но пусть будет
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
         "reply_markup": markup,
     }
@@ -672,12 +672,9 @@ def build_onzs_keyboard(selected: List[int]) -> Dict[str, Any]:
 
 async def broadcast_card_to_subscribers(card: Dict[str, Any], main_message_id: Optional[int] = None):
     """
-    Рассылаем карточку подписчикам по их выбранным ОНзС (если не на паузе).
-    Для простоты: пока рассылаем только основной карточкой в общий чат,
-    а подписки можно использовать позже.
+    Заготовка под рассылку подписчикам по ОНзС.
+    Сейчас не используется — только общий чат.
     """
-    # Здесь можно реализовать личные рассылки по user_subscriptions,
-    # сейчас в основном фокус на общем чате.
     return
 
 
@@ -706,8 +703,7 @@ async def fetch_channel_page(username: str) -> str:
 
 def parse_posts_from_html(html: str) -> List[Tuple[int, str]]:
     """
-    Очень упрощенный парсер: ищем блоки data-post="channel/12345" и рядом текст.
-    В реале лучше использовать парсер HTML, но тут делаем на основе регулярки.
+    Упрощенный парсер: ищем блоки data-post="channel/12345" и рядом текст.
     """
     posts: List[Tuple[int, str]] = []
 
@@ -722,7 +718,7 @@ def parse_posts_from_html(html: str) -> List[Tuple[int, str]]:
         posts.append((msg_id, snippet))
 
     # Убираем дубликаты и сортируем
-    unique = {}
+    unique: Dict[int, str] = {}
     for msg_id, text in posts:
         if msg_id not in unique:
             unique[msg_id] = text
@@ -733,9 +729,9 @@ def parse_posts_from_html(html: str) -> List[Tuple[int, str]]:
 async def analyze_case_with_yagpt(channel: str, msg_id: int, text: str, original_url: str) -> Optional[Dict[str, Any]]:
     """
     Постобработка одного кандидата:
-     1) Вызов YandexGPT -> JSON-структура
-     2) Попытка найти координаты / адрес и запросить @rs_search_bot
-     3) Определение ОНзС
+      1) Вызов YandexGPT -> JSON-структура
+      2) Попытка найти координаты / адрес и запросить @rs_search_bot
+      3) Определение ОНзС
     """
     prompt = (
         f"Канал: {channel}\n"
@@ -810,10 +806,10 @@ async def analyze_case_with_yagpt(channel: str, msg_id: int, text: str, original
 async def process_public_post(channel: str, msg_id: int, text: str):
     """
     Обработка одного поста в публичном канале:
-     - Поиск ключевых слов
-     - Вызов YandexGPT
-     - Сохранение карточки
-     - Отправка в Telegram
+      - Поиск ключевых слов
+      - Вызов YandexGPT
+      - Сохранение карточки
+      - Отправка в Telegram
     """
     keywords = read_lines(KEYWORDS_FILE)
     lower = text.lower()
@@ -837,7 +833,6 @@ async def process_public_post(channel: str, msg_id: int, text: str):
         onzs_file = os.path.join(ONZS_DIR, f"onzs_{onzs}.jsonl")
         append_jsonl(onzs_file, card)
 
-    # Лог
     append_line(
         MONITORING_LOG,
         json.dumps(
@@ -857,7 +852,7 @@ async def process_public_post(channel: str, msg_id: int, text: str):
 
 async def scan_once():
     """
-    Один проход по списку каналов из groups.txt
+    Один проход по списку каналов из groups.txt.
     """
     groups = read_lines(GROUPS_FILE)
     for raw in groups:
@@ -1034,7 +1029,7 @@ async def handle_message(message: Dict[str, Any]):
         elif cmd == "/risk":
             await cmd_risk(chat_id, from_id, args)
         elif cmd == "/chatid":
-            # Универсальная команда: вернуть ID текущего чата (в т.ч. группы)
+            # Универсальная команда: вернуть ID текущего чата (личный, группа, супергруппа)
             await send_tg_message(chat_id, f"Chat ID: {chat_id}")
         return
 
