@@ -23,7 +23,7 @@ log = logging.getLogger("samastroi_scraper")
 # ---------------------------------------------------------
 # ПУТИ ХРАНИЛИЩА
 # ---------------------------------------------------------
-DATA_DIR = os.getenv("DATA_DIR") or ("/data" if os.path.isdir("/data") else "/app/data")
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 
 # Создаём папку, если нет
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -33,6 +33,27 @@ HISTORY_CARDS = os.path.join(DATA_DIR, "history_cards.jsonl")
 ADMINS_FILE = os.path.join(DATA_DIR, "admins.json")
 CARDS_DIR = os.path.join(DATA_DIR, "cards")
 os.makedirs(CARDS_DIR, exist_ok=True)
+
+# ---------------------------------------------------------
+# Блокировка polling (чтобы не было 409 Conflict при нескольких инстансах)
+# ---------------------------------------------------------
+POLL_LOCK_FILE = os.path.join(DATA_DIR, "poll_updates.lock")
+
+def acquire_poll_lock() -> bool:
+    """Пытаемся эксклюзивно захватить lock-файл для poll_updates."""
+    try:
+        fd = os.open(POLL_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        os.close(fd)
+        log.info(f"poll_updates lock захвачен: {POLL_LOCK_FILE}")
+        return True
+    except FileExistsError:
+        log.warning(f"poll_updates lock уже существует — второй инстанс polling не запущен: {POLL_LOCK_FILE}")
+        return False
+    except Exception as e:
+        log.error(f"Не удалось создать poll_updates lock: {e}")
+        return False
+
 
 
 # ---------------------------------------------------------
@@ -65,34 +86,20 @@ DEFAULT_ADMINS = [
 
 
 def load_admins() -> List[int]:
-    """
-    Загружает администраторов из admins.json.
-    Если файл пустой/битый/список пуст — восстанавливает DEFAULT_ADMINS.
-    """
     try:
         with open(ADMINS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-
-        if isinstance(data, list) and all(isinstance(x, int) for x in data):
-            # Если список пуст — считаем это ошибочной конфигурацией и восстанавливаем дефолт.
-            if len(data) == 0:
-                raise ValueError("admins.json contains empty list")
-            log.info(f"Загружено админов: {data}")
-            return data
-
+            if isinstance(data, list) and all(isinstance(x, int) for x in data) and len(data) > 0:
+                log.info(f"Загружено админов: {data}")
+                return data
     except Exception as e:
         log.error(f"Ошибка загрузки admins.json: {e}")
 
     # Восстанавливаем список по умолчанию
-    try:
-        with open(ADMINS_FILE, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_ADMINS, f, ensure_ascii=False)
-    except Exception as e:
-        log.error(f"Не удалось записать admins.json: {e}")
-
+    with open(ADMINS_FILE, "w", encoding="utf-8") as f:
+        json.dump(DEFAULT_ADMINS, f)
     log.info(f"Восстановлены админы по умолчанию: {DEFAULT_ADMINS}")
     return DEFAULT_ADMINS
-
 
 
 ADMINS = load_admins()
@@ -179,6 +186,22 @@ def normalize_text(text: str) -> str:
     return text.lower().strip()
 
 
+
+# ---------------------------------------------------------
+# Парсинг datetime из Telegram HTML (ISO 8601 -> unix ts)
+# ---------------------------------------------------------
+def parse_tg_datetime_to_ts(dt_str: str) -> int:
+    """Telegram web отдаёт datetime как ISO 8601 (например 2025-12-15T10:20:12+00:00)."""
+    if not dt_str:
+        return int(time.time())
+    try:
+        s = str(dt_str).strip().replace("Z", "+00:00")
+        return int(datetime.fromisoformat(s).timestamp())
+    except Exception:
+        try:
+            return int(float(str(dt_str).strip()))
+        except Exception:
+            return int(time.time())
 def detect_keywords(text: str) -> List[str]:
     """Возвращает список ключевых слов, найденных в тексте."""
     text_low = text.lower()
@@ -236,7 +259,7 @@ def extract_posts(html: str) -> List[Dict[str, str]]:
             text = text_block.get_text(" ", strip=True) if text_block else ""
 
             date_block = msg.find("time", class_="time")
-            timestamp = parse_tg_datetime(date_block.get("datetime")) if date_block else int(time.time())
+            timestamp = parse_tg_datetime_to_ts(date_block.get("datetime")) if date_block else int(time.time())
 
             links = []
             for a in msg.find_all("a", href=True):
@@ -825,12 +848,6 @@ def poll_updates():
 
     log.info("Запуск poll_updates (обработка callback_query)...")
 
-    # На всякий случай отключаем webhook, иначе getUpdates может не работать
-    try:
-        requests.post(f"{TELEGRAM_API_URL}/deleteWebhook", json={"drop_pending_updates": False}, timeout=10)
-    except Exception as e:
-        log.warning(f"deleteWebhook warning: {e}")
-
     while True:
         try:
             params = {
@@ -1174,9 +1191,6 @@ def handle_callback_query(update: Dict):
 
 UPDATE_OFFSET = 0
 
-# Если DISABLE_UPDATES_POLLING=1 — polling отключён (например, если другой экземпляр уже работает)
-DISABLE_UPDATES_POLLING = os.getenv("DISABLE_UPDATES_POLLING", "0").strip() in ("1","true","True","yes","YES")
-
 
 def poll_updates():
     """
@@ -1191,16 +1205,11 @@ def poll_updates():
 
     log.info("Запуск poll_updates (message + callback_query)...")
 
-    if DISABLE_UPDATES_POLLING:
-        log.warning("DISABLE_UPDATES_POLLING=1 — polling отключён. Кнопки/команды работать не будут.")
-        while True:
-            time.sleep(3600)
-
-    # На всякий случай отключаем webhook
+    # Сбрасываем webhook, чтобы long polling работал стабильно
     try:
-        requests.post(f"{TELEGRAM_API_URL}/deleteWebhook", json={"drop_pending_updates": False}, timeout=10)
+        requests.post(f"{TELEGRAM_API_URL}/deleteWebhook", json={"drop_pending_updates": True}, timeout=10)
     except Exception as e:
-        log.warning(f"deleteWebhook warning: {e}")
+        log.warning(f"deleteWebhook не выполнен: {e}")
 
     while True:
         try:
@@ -1685,27 +1694,3 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN не задан — карточки НЕ будут отправляться в Telegram.")
 
     main_loop()
-# ---------------------------------------------------------
-# Парсинг даты Telegram из атрибута time[datetime]
-# (обычно ISO 8601: 2025-12-15T10:20:12+00:00)
-# ---------------------------------------------------------
-def parse_tg_datetime(dt_value) -> int:
-    """Возвращает Unix timestamp (int). При ошибке — текущее время."""
-    try:
-        if isinstance(dt_value, (int, float)):
-            return int(dt_value)
-
-        s = str(dt_value).strip()
-        if not s:
-            return int(time.time())
-
-        # Telegram отдаёт ISO 8601. fromisoformat умеет '+00:00'
-        # На случай 'Z' заменяем на '+00:00'
-        s = s.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    except Exception:
-        return int(time.time())
-
