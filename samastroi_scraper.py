@@ -750,7 +750,15 @@ def send_message(chat_id: int, text: str, reply_markup: Optional[Dict] = None) -
     return tg_post("sendMessage", payload)
 
 def edit_reply_markup(chat_id: int, message_id: int, reply_markup: Optional[Dict]):
-    return tg_post("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup})
+    payload = {"chat_id": chat_id, "message_id": message_id}
+    # To remove inline keyboard for everyone, omit reply_markup field.
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    resp = tg_post("editMessageReplyMarkup", payload)
+    if resp and not resp.get("ok", True):
+        log.error(f"editMessageReplyMarkup failed: {resp}")
+    return resp
+
 
 def answer_callback(cb_id: str, text: str = "", show_alert: bool = False):
     return tg_post("answerCallbackQuery", {"callback_query_id": cb_id, "text": text, "show_alert": show_alert})
