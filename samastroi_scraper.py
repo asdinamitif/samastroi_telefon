@@ -42,10 +42,10 @@ YAGPT_MODEL = os.getenv("YAGPT_MODEL", f"gpt://{YAGPT_FOLDER_ID}/yandexgpt/lates
 # Telegram
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
-# Roles
-ADMINS = [int(x) for x in os.getenv("ADMINS", "272923789,398960707").split(",") if x.strip().isdigit()]
-MODERATORS = [int(x) for x in os.getenv("MODERATORS", "777464055,978125225").split(",") if x.strip().isdigit()]
-LEADERSHIP = [int(x) for x in os.getenv("LEADERSHIP", "5685586625").split(",") if x.strip().isdigit()]
+# Roles (supports legacy env names: ADMIN_IDS/MODERATOR_IDS/LEAD_IDS)
+ADMINS = [int(x) for x in (os.getenv("ADMINS") or os.getenv("ADMIN_IDS") or "272923789,398960707").split(",") if x.strip().isdigit()]
+MODERATORS = [int(x) for x in (os.getenv("MODERATORS") or os.getenv("MODERATOR_IDS") or "777464055,978125225").split(",") if x.strip().isdigit()]
+LEADERSHIP = [int(x) for x in (os.getenv("LEADERSHIP") or os.getenv("LEAD_IDS") or "5685586625").split(",") if x.strip().isdigit()]
 
 # Persistent files
 SCRAPER_DB = os.path.join(DATA_DIR, "scraper.db")
@@ -849,6 +849,7 @@ def run_poller():
 def main():
     init_db()
     load_onzs_catalog()
+    log.info('=== VERSION: ONZS + AI-GATE + BUTTONS + STATS ===')
 
     if YAGPT_API_KEY and YAGPT_FOLDER_ID:
         log.info(f"[YAGPT] enabled | folder={YAGPT_FOLDER_ID} | model={YAGPT_MODEL}")
