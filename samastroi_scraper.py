@@ -1649,3 +1649,66 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+# ================== ONZS + YANDEXGPT EXTENSION ==================
+# Auto ONZS detection (1–12), confirmation, correction, learning, stats
+
+import time
+
+ONZS_XLSX = "Номера ОНзС.xlsx"
+ONZS_TRAIN_FILE = os.path.join(DATA_DIR, "onzs_training.jsonl")
+ONZS_MAP = {}
+
+def load_onzs_catalog():
+    global ONZS_MAP
+    try:
+        df = pd.read_excel(ONZS_XLSX)
+        ONZS_MAP = {int(r[0]): str(r[1]) for _, r in df.iterrows() if str(r[0]).isdigit()}
+        log.info(f"[ONZS] catalog loaded: {len(ONZS_MAP)} items")
+    except Exception as e:
+        log.error(f"[ONZS] catalog load error: {e}")
+
+load_onzs_catalog()
+
+def detect_onzs_with_yagpt(text: str):
+    if not ONZS_MAP:
+        return None
+    catalog = "\n".join([f"{k}: {v}" for k, v in ONZS_MAP.items()])
+    prompt = f"""Ты инспектор строительного надзора.
+Определи номер ОНзС (1–12).
+
+Классификатор:
+{catalog}
+
+Верни ТОЛЬКО JSON:
+{{"onzs":1,"confidence":0.8,"reason":"кратко"}}
+
+Текст:
+{text}
+"""
+    return call_yandex_gpt_json(prompt)
+
+def save_onzs_training(text, onzs, confirmed):
+    rec = {"text": text, "onzs": onzs, "confirmed": confirmed, "ts": time.time()}
+    with open(ONZS_TRAIN_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+def build_onzs_stats():
+    stats = {}
+    if not os.path.exists(ONZS_TRAIN_FILE):
+        return "Нет данных"
+    with open(ONZS_TRAIN_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            o = r["onzs"]
+            stats.setdefault(o, {"ok":0,"all":0})
+            stats[o]["all"] += 1
+            if r["confirmed"]:
+                stats[o]["ok"] += 1
+    out = ["🎯 Точность ИИ по ОНзС"]
+    for o,s in sorted(stats.items()):
+        out.append(f"ОНзС-{o}: {int(100*s['ok']/s['all'])}% ({s['ok']}/{s['all']})")
+    return "\n".join(out)
+# ================================================================
