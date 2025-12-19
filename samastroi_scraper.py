@@ -633,33 +633,94 @@ def select_few_shot_examples(text: str, k: int = 3) -> List[Dict]:
     scored.sort(key=lambda x: x[0], reverse=True)
     return [e for _, e in scored[:k]]
 
-def call_yandex_gpt_json(text: str) -> Optional[Dict]:
-    if not YAGPT_API_KEY or not YAGPT_FOLDER_ID:
+def _sanitize_for_llm(text: str, max_chars: int = 1800) -> str:
+    """Light cleanup to reduce safety-triggering noise and keep request small."""
+    if not text:
+        return ""
+    t = str(text)
+    # drop URLs
+    t = re.sub(r"https?://\S+", " ", t)
+    # drop @mentions and hashtags (often noisy)
+    t = re.sub(r"[@#][\w_]+", " ", t)
+    # normalize whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:max_chars]
+
+
+# ----------------------------- LLM SAFETY FILTER (skip obvious off-topic / high-risk) -----------------------------
+# YandexGPT may refuse some topics and return non-JSON. We avoid sending such texts.
+LLM_SKIP_PATTERNS = [
+    r"\b(война|сво|армия|фронт|удар|ракет|дрон|террор|теракт)\b",
+    r"\b(путин|зеленск|байден|выбор|голосован|партия|госдума|санкци)\b",
+    r"\b(убийств|суицид|самоубийств|наркотик|героин|кокаин)\b",
+    r"\b(порно|эротик|18\+)\b",
+]
+
+def llm_should_skip(text: str) -> bool:
+    t = (text or "").lower()
+    for pat in LLM_SKIP_PATTERNS:
+        try:
+            if re.search(pat, t):
+                return True
+        except re.error:
+            continue
+    return False
+
+def _extract_json_object(s: str) -> Optional[str]:
+    if not s:
         return None
+    s = s.strip()
+    if s.startswith("{") and s.endswith("}"):
+        return s
+    # Try to extract first {...} block
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if m:
+        return m.group(0)
+    return None
+
+
+def call_yandex_gpt_json(text: str, channel: str = "") -> Dict:
+    """Call YandexGPT and force a JSON-like decision; never return None."""
+    if not YAGPT_API_KEY or not YAGPT_FOLDER_ID:
+        return {"probability": 0, "comment": "YandexGPT not configured"}
 
     model_uri = YAGPT_MODEL.format(folder_id=YAGPT_FOLDER_ID)
 
-    few = select_few_shot_examples(text, k=3)
+    cleaned = _sanitize_for_llm(text)
+
+    # If content is obviously off-topic/high-risk, do not call LLM (it may refuse).
+    if llm_should_skip(cleaned):
+        hits = len(detect_keywords(cleaned.lower()))
+        fallback = 10 if hits >= 2 else (5 if hits == 1 else 0)
+        return {"probability": fallback, "comment": "Skipped LLM (policy/off-topic); heuristic"}
+
+    few = select_few_shot_examples(cleaned, k=3)
+
     few_block = ""
     if few:
         lines = ["Примеры разметки (для калибровки):"]
         for ex in few:
             lbl = ex.get("label")
-            t = re.sub(r"\s+", " ", (ex.get("text") or "")).strip()[:240]
+            t = _sanitize_for_llm(ex.get("text") or "", max_chars=240)
             hint = "70-100" if lbl == "work" else ("0-30" if lbl == "wrong" else "40-70")
             lines.append(f"- Метка={lbl} (ориентир {hint}). Текст: {t}")
         few_block = "\n" + "\n".join(lines) + "\n"
 
+    # our own bias to stabilize decisions (channel/keyword learning)
+    bias_ch = get_channel_bias(channel) if channel else 0.0
+    bias_kw = get_keyword_bias_points(cleaned)
+    bias_total = bias_ch + bias_kw
+
     prompt = (
         "Ты помощник инспектора строительного надзора.\n"
-        "Оцени вероятность, что сообщение относится к незаконному строительству (самострой).\n"
-        "Верни строго JSON:\n"
-        "{\n"
-        '  \"probability\": <0-100>,\n'
-        '  \"comment\": \"краткий комментарий\"\n'
-        "}\n"
+        "Твоя задача: оценить вероятность (0-100), что текст относится к самовольному строительству/нарушениям на стройке.\n"
+        "Запрещено: новости, политика, общие рассуждения.\n"
+        "Если текст содержит запрещённые/неподходящие темы, всё равно верни JSON с probability=0 и кратким comment.\n"
+        "Ответь СТРОГО одним JSON без пояснений и без Markdown.\n"
+        "Формат: {\"probability\": <0-100>, \"comment\": \"...\"}\n"
+        f"Калибровка (bias, прибавь к вероятности): {bias_total:+.1f}\n"
         + few_block +
-        "\nТекст сообщения:\n" + (text or "")
+        "\nТекст:\n" + cleaned
     )
 
     body = {
@@ -673,39 +734,71 @@ def call_yandex_gpt_json(text: str) -> Optional[Dict]:
         "Content-Type": "application/json",
     }
 
-    try:
-        resp = requests.post(YAGPT_ENDPOINT, headers=headers, json=body, timeout=25)
-        if not resp.ok:
-            log.error(f"YandexGPT HTTP {resp.status_code}: {resp.text[:500]}")
-            return None
-        data = resp.json()
-    except Exception as e:
-        log.error(f"YandexGPT request error: {e}")
-        return None
+    # Retry on transient errors (429/5xx). Do not spam: max 4 attempts with backoff.
+    data = None
+    last_status = None
+    for attempt in range(4):
+        try:
+            resp = requests.post(YAGPT_ENDPOINT, headers=headers, json=body, timeout=25)
+            last_status = resp.status_code
+            if resp.ok:
+                data = resp.json()
+                break
+            # transient
+            if resp.status_code in (429, 500, 502, 503, 504):
+                wait = min(10 * (2 ** attempt), 60)
+                log.warning(f"YandexGPT HTTP {resp.status_code}; retry in {wait}s (attempt {attempt+1}/4). Body: {resp.text[:300]}")
+                time.sleep(wait)
+                continue
+            # non-transient
+            log.error(f"YandexGPT HTTP {resp.status_code}: {resp.text[:800]}")
+            return {"probability": 0, "comment": f"YandexGPT HTTP {resp.status_code}"}
+        except Exception as e:
+            wait = min(5 * (2 ** attempt), 30)
+            log.warning(f"YandexGPT request error: {e}; retry in {wait}s (attempt {attempt+1}/4)")
+            time.sleep(wait)
+            continue
+
+    if data is None:
+        return {"probability": 0, "comment": f"YandexGPT unavailable ({last_status})"}
 
     try:
         text_out = data["result"]["alternatives"][0]["message"]["text"]
     except Exception as e:
-        log.error(f"YandexGPT response parse error: {e}; data={data}")
-        return None
+        log.error(f"YandexGPT response parse error: {e}; data={str(data)[:800]}")
+        return {"probability": 0, "comment": "YandexGPT response parse error"}
 
-    out = text_out.strip()
-    if not out.startswith("{"):
-        s = out.find("{")
-        e = out.rfind("}")
-        if s != -1 and e != -1 and e > s:
-            out = out[s:e+1]
+    raw = (text_out or "").strip()
+
+    # If model refused (common phrase), do not treat as error; fallback gracefully.
+    if "не могу обсуждать" in raw.lower() or "давайте поговорим" in raw.lower():
+        hits = len(detect_keywords(cleaned.lower()))
+        fallback = 10 if hits >= 2 else (5 if hits == 1 else 0)
+        return {"probability": fallback, "comment": "YandexGPT refused; heuristic"}
+
+    candidate = _extract_json_object(raw) or raw
+
     try:
-        return json.loads(out)
+        obj = json.loads(candidate)
+        p = float(obj.get("probability", 0))
+        p = max(0.0, min(100.0, p))
+        obj["probability"] = int(round(p))
+        obj["comment"] = str(obj.get("comment", "")).strip()[:400]
+        return obj
     except Exception as e:
-        log.error(f"YandexGPT JSON parse error: {e}; text={text_out[:300]}")
-        return None
+        # Model refused or returned non-JSON.
+        log.error(f"YandexGPT JSON parse error: {e}; text={raw[:300]}")
+        # Heuristic fallback: if keywords hit, not zero.
+        hits = len(detect_keywords(cleaned.lower()))
+        fallback = 10 if hits >= 2 else (5 if hits == 1 else 0)
+        return {"probability": fallback, "comment": "YandexGPT refused/invalid JSON"}
+
 
 def enrich_card_with_yagpt(card: Dict) -> None:
     t = (card.get("text") or "").strip()
     if not t:
         return
-    res = call_yandex_gpt_json(t)
+    res = call_yandex_gpt_json(t, channel=card.get('channel',''))
     if not res:
         return
     prob = res.get("probability")
@@ -823,10 +916,22 @@ def tg_post(method: str, payload: Dict) -> Optional[Dict]:
         return None
 
 def send_message(chat_id: int, text: str, reply_markup: Optional[Dict] = None) -> Optional[Dict]:
-    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": False}
-    if reply_markup is not None:
-        payload["reply_markup"] = reply_markup
-    return tg_post("sendMessage", payload)
+    """Send text message; split into chunks to satisfy Telegram 4096-char limit."""
+    if text is None:
+        text = ""
+    limit = 3500  # safer margin under Telegram 4096 (UTF-8, markup)
+    parts = [text[i:i+limit] for i in range(0, len(text), limit)] or [""]
+    last_resp = None
+    for idx, part in enumerate(parts):
+        payload = {"chat_id": chat_id, "text": part, "disable_web_page_preview": False}
+        # attach markup only to last part
+        if reply_markup is not None and idx == len(parts) - 1:
+            payload["reply_markup"] = reply_markup
+        last_resp = tg_post("sendMessage", payload)
+        if last_resp and last_resp.get("ok") is False:
+            log.error(f"sendMessage failed: {last_resp}")
+            break
+    return last_resp
 
 def edit_reply_markup(chat_id: int, message_id: int, reply_markup: Optional[Dict]):
     payload = {"chat_id": chat_id, "message_id": message_id}
@@ -1474,8 +1579,9 @@ def poll_updates_loop():
 
             if not data.get("ok"):
                 if data.get("error_code") == 409:
-                    log.error("getUpdates conflict (409). Exiting.")
-                    raise SystemExit(0)
+                    log.error("getUpdates conflict (409). Another instance is polling this BOT_TOKEN. Backing off 60s.")
+                    time.sleep(60)
+                    continue
                 log.error(f"getUpdates error: {data}")
                 time.sleep(3); continue
 
