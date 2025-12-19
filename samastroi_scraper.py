@@ -27,6 +27,8 @@ from typing import Dict, List, Optional, Tuple
 import requests
 from bs4 import BeautifulSoup
 
+import pandas as pd
+
 # matplotlib (PNG plot)
 import matplotlib
 matplotlib.use("Agg")
@@ -829,6 +831,201 @@ def enrich_card_with_yagpt(card: Dict) -> None:
         card.setdefault("ai", {})
         card["ai"]["comment"] = comment[:600]
 
+
+# ----------------------------- ONZS (AI + CONFIRM/EDIT + LEARNING) -----------------------------
+ONZS_XLSX = os.getenv("ONZS_XLSX", "Номера ОНзС.xlsx")
+ONZS_TRAIN_FILE = os.path.join(DATA_DIR, "onzs_training.jsonl")
+ONZS_MAP: Dict[int, str] = {}
+
+def load_onzs_catalog() -> None:
+    # Load ONZS catalog (1-12) from Excel (лежит рядом с проектом)
+    global ONZS_MAP
+    try:
+        if not os.path.exists(ONZS_XLSX):
+            log.warning(f"[ONZS] catalog not found: {ONZS_XLSX} (положи рядом с samastroi_scraper.py)")
+            ONZS_MAP = {}
+            return
+        df = pd.read_excel(ONZS_XLSX)
+        m: Dict[int, str] = {}
+        for _, row in df.iterrows():
+            if len(row) < 2:
+                continue
+            k = row.iloc[0]
+            v = row.iloc[1]
+            try:
+                n = int(float(str(k).strip().replace(",", ".")))
+            except Exception:
+                continue
+            if 1 <= n <= 12:
+                m[n] = str(v).strip()
+        ONZS_MAP = m
+        log.info(f"[ONZS] loaded {len(ONZS_MAP)} items from {ONZS_XLSX}")
+    except Exception as e:
+        ONZS_MAP = {}
+        log.error(f"[ONZS] catalog load error: {e}")
+
+load_onzs_catalog()
+
+def _yagpt_request(prompt: str, max_tokens: int = 220, temperature: float = 0.1) -> Optional[str]:
+    # Low-level YandexGPT call returning raw text
+    if not YAGPT_API_KEY or not YAGPT_FOLDER_ID:
+        return None
+    model_uri = YAGPT_MODEL.format(folder_id=YAGPT_FOLDER_ID)
+    body = {
+        "modelUri": model_uri,
+        "completionOptions": {"stream": False, "temperature": float(temperature), "maxTokens": int(max_tokens)},
+        "messages": [{"role": "user", "text": prompt}],
+    }
+    headers = {
+        "Authorization": f"Api-Key {YAGPT_API_KEY}",
+        "x-folder-id": YAGPT_FOLDER_ID,
+        "Content-Type": "application/json",
+    }
+    last_status = None
+    for attempt in range(4):
+        try:
+            resp = requests.post(YAGPT_ENDPOINT, headers=headers, json=body, timeout=25)
+            last_status = resp.status_code
+            if resp.ok:
+                data = resp.json()
+                try:
+                    return data["result"]["alternatives"][0]["message"]["text"]
+                except Exception:
+                    return None
+            if resp.status_code in (429, 500, 502, 503, 504):
+                wait = min(10 * (2 ** attempt), 60)
+                log.warning(f"[ONZS] YandexGPT HTTP {resp.status_code}; retry in {wait}s (attempt {attempt+1}/4)")
+                time.sleep(wait)
+                continue
+            log.error(f"[ONZS] YandexGPT HTTP {resp.status_code}: {resp.text[:300]}")
+            return None
+        except Exception as e:
+            wait = min(5 * (2 ** attempt), 30)
+            log.warning(f"[ONZS] YandexGPT request error: {e}; retry in {wait}s (attempt {attempt+1}/4)")
+            time.sleep(wait)
+            continue
+    log.error(f"[ONZS] YandexGPT unavailable ({last_status})")
+    return None
+
+def detect_onzs_with_yagpt(text: str) -> Optional[Dict]:
+    # Return dict: {"onzs": int|None, "confidence": float 0-1, "reason": str}
+    if not text or not ONZS_MAP:
+        return None
+
+    cleaned = _sanitize_for_llm(text, max_chars=1400)
+    catalog = "\n".join([f"{k}: {v}" for k, v in sorted(ONZS_MAP.items())])
+
+    prompt = (
+        "Ты инспектор строительного надзора.\n"
+        "Определи номер ОНзС (1–12) по классификатору ниже.\n"
+        "Верни строго ТОЛЬКО JSON без Markdown и без пояснений.\n"
+        "Если нельзя определить — верни onzs=null и confidence=0.\n"
+        "Формат: {\"onzs\": <1-12|null>, \"confidence\": <0-1>, \"reason\": \"кратко\"}\n\n"
+        f"Классификатор ОНзС:\n{catalog}\n\n"
+        f"Текст:\n{cleaned}"
+    )
+
+    raw = _yagpt_request(prompt, max_tokens=220, temperature=0.0)
+    if not raw:
+        return None
+
+    low = raw.lower()
+    if "не могу обсуждать" in low or "давайте поговорим" in low:
+        return {"onzs": None, "confidence": 0.0, "reason": "refused"}
+
+    candidate = _extract_json_object(raw) or raw.strip()
+    try:
+        obj = json.loads(candidate)
+        onzs = obj.get("onzs", None)
+        conf = obj.get("confidence", 0.0)
+        reason = str(obj.get("reason", "")).strip()[:220]
+
+        if onzs is None:
+            return {"onzs": None, "confidence": 0.0, "reason": reason or "null"}
+
+        try:
+            onzs_i = int(float(str(onzs).strip().replace(",", ".")))
+        except Exception:
+            onzs_i = None
+        if not onzs_i or onzs_i < 1 or onzs_i > 12:
+            onzs_i = None
+
+        try:
+            conf_f = float(conf)
+        except Exception:
+            conf_f = 0.0
+        conf_f = max(0.0, min(1.0, conf_f))
+        return {"onzs": onzs_i, "confidence": conf_f, "reason": reason}
+    except Exception as e:
+        log.error(f"[ONZS] JSON parse error: {e}; text={raw[:200]}")
+        return None
+
+def save_onzs_training(card_id: str, text: str, predicted: Optional[int], final_onzs: Optional[int], action: str, user_id: int):
+    rec = {
+        "ts": now_ts(),
+        "card_id": card_id,
+        "action": action,
+        "user_id": int(user_id),
+        "predicted": predicted,
+        "final": final_onzs,
+        "text": (text or "")[:4000],
+    }
+    append_jsonl(ONZS_TRAIN_FILE, rec)
+
+def build_onzs_stats_text() -> str:
+    if not os.path.exists(ONZS_TRAIN_FILE):
+        return "📊 ОНзС: данных пока нет."
+
+    total = 0
+    correct = 0
+    per = {i: {"total": 0, "correct": 0} for i in range(1, 13)}
+
+    try:
+        with open(ONZS_TRAIN_FILE, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except Exception:
+                    continue
+                pred = r.get("predicted")
+                fin = r.get("final")
+                if fin is None:
+                    continue
+                try:
+                    fin_i = int(fin)
+                except Exception:
+                    continue
+                if fin_i < 1 or fin_i > 12:
+                    continue
+                total += 1
+                per[fin_i]["total"] += 1
+                if pred is not None and str(pred).isdigit() and int(pred) == fin_i:
+                    correct += 1
+                    per[fin_i]["correct"] += 1
+
+        acc = (correct / total * 100.0) if total else 0.0
+        lines = [
+            f"🎯 Точность ИИ по ОНзС: {acc:.1f}%",
+            f"Всего проверок: {total}",
+            f"✔️ Верно: {correct}",
+            f"✖️ Ошибок: {max(0, total - correct)}",
+            "",
+            "По ОНзС:",
+        ]
+        for i in range(1, 13):
+            t = per[i]["total"]
+            c = per[i]["correct"]
+            if t == 0:
+                continue
+            ai = (c / t * 100.0) if t else 0.0
+            lines.append(f"ОНзС-{i}: {ai:.0f}% ({c}/{t})")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"📊 ОНзС: ошибка статистики: {e}"
+
 # ----------------------------- CARDS -----------------------------
 def generate_card_id() -> str:
     return str(uuid.uuid4())[:12]
@@ -865,6 +1062,20 @@ def build_card_text(card: Dict) -> str:
     comment = ai.get("comment")
 
     ai_lines = []
+    oz = card.get('onzs') or {}
+    if oz.get('value'):
+        src = oz.get('source','')
+        conf = oz.get('confidence', None)
+        if oz.get('confirmed'):
+            ai_lines.append(f"🏗 ОНзС: {oz['value']} (подтверждено)")
+        else:
+            if src == 'ai' and conf is not None:
+                try:
+                    ai_lines.append(f"🏗 ОНзС (ИИ): {oz['value']} ({int(float(conf)*100)}%)")
+                except Exception:
+                    ai_lines.append(f"🏗 ОНзС (ИИ): {oz['value']}")
+            else:
+                ai_lines.append(f"🏗 ОНзС: {oz['value']}")
     if prob is not None:
         if raw is not None and bias is not None:
             ai_lines.append(f"🤖 Вероятность самостроя (ИИ): {prob:.1f}% (raw {raw:.1f}%, bias {bias:+.1f})")
@@ -932,6 +1143,27 @@ def send_message(chat_id: int, text: str, reply_markup: Optional[Dict] = None) -
             log.error(f"sendMessage failed: {last_resp}")
             break
     return last_resp
+
+def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: Optional[Dict] = None):
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "disable_web_page_preview": False}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    resp = tg_post("editMessageText", payload)
+    if resp and not resp.get("ok", True):
+        log.error(f"editMessageText failed: {resp}")
+    return resp
+
+def build_onzs_pick_keyboard(card_id: str) -> Dict:
+    rows = []
+    row = []
+    for n in range(1, 13):
+        row.append({"text": str(n), "callback_data": f"onzs:set:{card_id}:{n}"})
+        if len(row) == 6:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "⬅️ Назад к карточке", "callback_data": f"onzs:back:{card_id}"}])
+    return {"inline_keyboard": rows}
 
 def edit_reply_markup(chat_id: int, message_id: int, reply_markup: Optional[Dict]):
     payload = {"chat_id": chat_id, "message_id": message_id}
@@ -1117,6 +1349,20 @@ def generate_card(hit: Dict) -> Dict:
         enrich_card_with_yagpt(card)
     except Exception as e:
         log.error(f"enrich_card_with_yagpt error: {e}")
+
+    # ONZS detection
+    try:
+        oz = detect_onzs_with_yagpt(card.get("text",""))
+        if oz and oz.get("onzs"):
+            card["onzs"] = {
+                "value": int(oz["onzs"]),
+                "source": "ai",
+                "confidence": float(oz.get("confidence", 0.0)),
+                "reason": str(oz.get("reason",""))[:220],
+                "confirmed": False,
+            }
+    except Exception as e:
+        log.error(f"detect_onzs_with_yagpt error: {e}")
     save_card(card)
     return card
 
@@ -1335,6 +1581,80 @@ def handle_callback_query(upd: Dict):
 
     role = get_role(from_user)  # may be None
 
+    # ONZS actions
+    if data.startswith("onzs:"):
+        if not (is_admin(from_user) or is_moderator(from_user)):
+            answer_callback(cb_id, "❌ Нет доступа.", show_alert=True)
+            return
+        parts = data.split(":")
+        op = parts[1] if len(parts) > 1 else ""
+        if op == "edit" and len(parts) == 3:
+            card_id = parts[2]
+            if chat_id is not None and message_id is not None:
+                edit_reply_markup(chat_id, message_id, reply_markup=build_onzs_pick_keyboard(card_id))
+            answer_callback(cb_id, "Выберите ОНзС (1–12)")
+            return
+        if op == "set" and len(parts) == 4:
+            card_id = parts[2]
+            try:
+                n = int(parts[3])
+            except Exception:
+                n = 0
+            if n < 1 or n > 12:
+                answer_callback(cb_id, "ОНзС должен быть 1–12", show_alert=True)
+                return
+            card = load_card(card_id)
+            if not card:
+                answer_callback(cb_id, "Карточка не найдена", show_alert=True)
+                return
+            ai_pred = None
+            try:
+                oz0 = card.get('onzs') or {}
+                ai_pred = oz0.get('value') if oz0.get('source') == 'ai' else None
+            except Exception:
+                ai_pred = None
+            card['onzs'] = {'value': int(n), 'source': 'manual', 'confidence': 1.0, 'reason': 'manual', 'confirmed': True}
+            save_card(card)
+            try:
+                save_onzs_training(card_id, card.get('text',''), ai_pred, int(n), 'set', from_user)
+            except Exception:
+                pass
+            if chat_id is not None and message_id is not None:
+                edit_message_text(chat_id, message_id, build_card_text(card), reply_markup=build_card_keyboard(card_id))
+            answer_callback(cb_id, f"ОНзС установлен: {n}")
+            return
+        if op == "confirm" and len(parts) == 3:
+            card_id = parts[2]
+            card = load_card(card_id)
+            if not card:
+                answer_callback(cb_id, "Карточка не найдена", show_alert=True)
+                return
+            oz = card.get('onzs') or {}
+            if not oz.get('value'):
+                answer_callback(cb_id, "ОНзС ещё не определён", show_alert=True)
+                return
+            ai_pred = oz.get('value') if oz.get('source') == 'ai' else None
+            oz['confirmed'] = True
+            card['onzs'] = oz
+            save_card(card)
+            try:
+                save_onzs_training(card_id, card.get('text',''), ai_pred, int(oz.get('value')), 'confirm', from_user)
+            except Exception:
+                pass
+            if chat_id is not None and message_id is not None:
+                edit_message_text(chat_id, message_id, build_card_text(card), reply_markup=build_card_keyboard(card_id))
+            answer_callback(cb_id, "ОНзС подтверждён")
+            return
+        if op == "back" and len(parts) == 3:
+            card_id = parts[2]
+            card = load_card(card_id)
+            if chat_id is not None and message_id is not None:
+                edit_message_text(chat_id, message_id, build_card_text(card) if card else "", reply_markup=build_card_keyboard(card_id))
+            answer_callback(cb_id, "Ок")
+            return
+        answer_callback(cb_id, "Неизвестная команда ОНзС", show_alert=True)
+        return
+
     # Card actions
     if data.startswith("card:"):
         if not is_admin(from_user):
@@ -1548,6 +1868,13 @@ def handle_message(upd: Dict):
         send_photo(chat_id, p, caption="📈 График обучения (PNG)")
         return
 
+    if cmd == "/onzs_ai_stats":
+        if not (is_admin(from_user) or is_moderator(from_user) or is_leadership(from_user)):
+            send_message(chat_id, "❌ Нет доступа.")
+            return
+        send_message(chat_id, build_onzs_stats_text())
+        return
+
     if cmd == "/trainstats":
         if not is_admin(from_user):
             send_message(chat_id, "❌ Команда доступна только администраторам.")
@@ -1649,66 +1976,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-# ================== ONZS + YANDEXGPT EXTENSION ==================
-# Auto ONZS detection (1–12), confirmation, correction, learning, stats
-
-import time
-
-ONZS_XLSX = "Номера ОНзС.xlsx"
-ONZS_TRAIN_FILE = os.path.join(DATA_DIR, "onzs_training.jsonl")
-ONZS_MAP = {}
-
-def load_onzs_catalog():
-    global ONZS_MAP
-    try:
-        df = pd.read_excel(ONZS_XLSX)
-        ONZS_MAP = {int(r[0]): str(r[1]) for _, r in df.iterrows() if str(r[0]).isdigit()}
-        log.info(f"[ONZS] catalog loaded: {len(ONZS_MAP)} items")
-    except Exception as e:
-        log.error(f"[ONZS] catalog load error: {e}")
-
-load_onzs_catalog()
-
-def detect_onzs_with_yagpt(text: str):
-    if not ONZS_MAP:
-        return None
-    catalog = "\n".join([f"{k}: {v}" for k, v in ONZS_MAP.items()])
-    prompt = f"""Ты инспектор строительного надзора.
-Определи номер ОНзС (1–12).
-
-Классификатор:
-{catalog}
-
-Верни ТОЛЬКО JSON:
-{{"onzs":1,"confidence":0.8,"reason":"кратко"}}
-
-Текст:
-{text}
-"""
-    return call_yandex_gpt_json(prompt)
-
-def save_onzs_training(text, onzs, confirmed):
-    rec = {"text": text, "onzs": onzs, "confirmed": confirmed, "ts": time.time()}
-    with open(ONZS_TRAIN_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-def build_onzs_stats():
-    stats = {}
-    if not os.path.exists(ONZS_TRAIN_FILE):
-        return "Нет данных"
-    with open(ONZS_TRAIN_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            r = json.loads(line)
-            o = r["onzs"]
-            stats.setdefault(o, {"ok":0,"all":0})
-            stats[o]["all"] += 1
-            if r["confirmed"]:
-                stats[o]["ok"] += 1
-    out = ["🎯 Точность ИИ по ОНзС"]
-    for o,s in sorted(stats.items()):
-        out.append(f"ОНзС-{o}: {int(100*s['ok']/s['all'])}% ({s['ok']}/{s['all']})")
-    return "\n".join(out)
-# ================================================================
