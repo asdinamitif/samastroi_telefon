@@ -88,6 +88,16 @@ YAGPT_FOLDER_ID = os.getenv("YAGPT_FOLDER_ID", "").strip()
 YAGPT_ENDPOINT = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 YAGPT_MODEL = os.getenv("YAGPT_MODEL", "gpt://{folder_id}/yandexgpt/latest")
 
+# log YandexGPT readiness
+if not YAGPT_API_KEY or not YAGPT_FOLDER_ID:
+    log.warning("[YAGPT] disabled: missing YAGPT_API_KEY or YAGPT_FOLDER_ID")
+else:
+    try:
+        log.info(f"[YAGPT] enabled | folder={YAGPT_FOLDER_ID} | model={YAGPT_MODEL.format(folder_id=YAGPT_FOLDER_ID)}")
+    except Exception:
+        log.info(f"[YAGPT] enabled | folder={YAGPT_FOLDER_ID} | model={YAGPT_MODEL}")
+
+
 # ----------------------------- SCRAPER SETTINGS -----------------------------
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
@@ -380,6 +390,66 @@ def update_channel_bias(channel: str, label: str) -> None:
     ch[channel] = round(cur, 2)
     _set_model_param("weights", w)
 
+
+# ----------------------------- KEYWORD LEARNING (ONLINE) -----------------------------
+KW_STATS_KEY = "kw_stats"
+
+def _get_kw_stats() -> Dict:
+    # {"kw": {"work": n, "wrong": n, "attach": n, "total": n}}
+    return _get_model_param(KW_STATS_KEY, {"kw": {}})
+
+def _set_kw_stats(obj: Dict) -> None:
+    _set_model_param(KW_STATS_KEY, obj)
+
+def update_keyword_stats(text: str, label: str) -> None:
+    """Online learning: собираем статистику по ключевым словам из разметки."""
+    if label not in ("work", "wrong", "attach"):
+        return
+    kws = detect_keywords((text or "").lower())
+    if not kws:
+        return
+
+    st = _get_kw_stats()
+    kw_map = st.setdefault("kw", {})
+
+    for kw in kws:
+        rec = kw_map.setdefault(kw, {"work": 0, "wrong": 0, "attach": 0, "total": 0})
+        rec["total"] = int(rec.get("total", 0)) + 1
+        rec[label] = int(rec.get(label, 0)) + 1
+
+    _set_kw_stats(st)
+
+def get_keyword_bias_points(text: str) -> float:
+    """Возвращает поправку (-15..+15) к вероятности на основе истории разметки."""
+    kws = detect_keywords((text or "").lower())
+    if not kws:
+        return 0.0
+
+    st = _get_kw_stats()
+    kw_map = (st.get("kw") or {})
+    score = 0.0
+    used = 0
+
+    for kw in kws:
+        rec = kw_map.get(kw)
+        if not rec:
+            continue
+        total = float(rec.get("total", 0) or 0)
+        if total < 5:
+            continue  # мало данных по ключу — не влияем
+        pos = float((rec.get("work", 0) or 0) + (rec.get("attach", 0) or 0))
+        neg = float(rec.get("wrong", 0) or 0)
+        val = (pos - neg) / max(1.0, total)  # (-1..+1)
+        score += val
+        used += 1
+
+    if used == 0:
+        return 0.0
+
+    score = score / used
+    points = score * 10.0  # масштаб (8..12)
+    return max(-15.0, min(15.0, points))
+
 # ----------------------------- DEDUPE & DECISIONS -----------------------------
 def mark_seen(channel: str, post_id: str, ts: int) -> bool:
     conn = db()
@@ -457,6 +527,7 @@ def log_training_event(card_id: str, label: str, text: str, channel: str, admin_
     append_jsonl(TRAINING_DATASET, rec)
     update_train_daily(label)
     update_channel_bias(channel, label)
+    update_keyword_stats(text, label)
 
 def compute_training_stats() -> Dict:
     conn = db()
@@ -604,6 +675,9 @@ def call_yandex_gpt_json(text: str) -> Optional[Dict]:
 
     try:
         resp = requests.post(YAGPT_ENDPOINT, headers=headers, json=body, timeout=25)
+        if not resp.ok:
+            log.error(f"YandexGPT HTTP {resp.status_code}: {resp.text[:500]}")
+            return None
         data = resp.json()
     except Exception as e:
         log.error(f"YandexGPT request error: {e}")
@@ -645,12 +719,17 @@ def enrich_card_with_yagpt(card: Dict) -> None:
 
     if prob_f is not None:
         prob_f = max(0.0, min(100.0, prob_f))
-        # calibration bias
-        bias = get_channel_bias(card.get("channel", ""))
+        # calibration bias (channel + keyword learning)
+        bias_ch = get_channel_bias(card.get("channel", ""))
+        bias_kw = get_keyword_bias_points(t)
+        bias = bias_ch + bias_kw
+
         prob_adj = max(0.0, min(100.0, prob_f + bias))
         card.setdefault("ai", {})
         card["ai"]["probability_raw"] = round(prob_f, 1)
-        card["ai"]["bias"] = bias
+        card["ai"]["bias"] = round(bias, 1)
+        card["ai"]["bias_ch"] = round(bias_ch, 1)
+        card["ai"]["bias_kw"] = round(bias_kw, 1)
         card["ai"]["probability"] = round(prob_adj, 1)
 
     if comment:
