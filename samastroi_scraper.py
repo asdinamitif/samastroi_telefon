@@ -22,6 +22,52 @@ logging.basicConfig(
 log = logging.getLogger("samastroi")
 
 
+
+# ----------------- SINGLE INSTANCE LOCK -----------------
+def acquire_lock() -> bool:
+    """Create a lock file in DATA_DIR to prevent running multiple pollers."""
+    try:
+        data_dir = globals().get("DATA_DIR") or os.getenv("DATA_DIR", "/data")
+        os.makedirs(data_dir, exist_ok=True)
+        lock_path = os.path.join(data_dir, ".poller.lock")
+
+        # stale lock: 10 minutes
+        if os.path.exists(lock_path):
+            try:
+                if (time.time() - os.path.getmtime(lock_path)) > 600:
+                    os.remove(lock_path)
+                else:
+                    log.error("Lock exists: another poller is running. Exiting.")
+                    return False
+            except Exception:
+                log.error("Lock exists: another poller is running. Exiting.")
+                return False
+
+        # atomic create
+        try:
+            with open(lock_path, "x", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+        except FileExistsError:
+            log.error("Lock exists: another poller is running. Exiting.")
+            return False
+
+        log.info(f"Lock acquired: {lock_path}")
+        return True
+    except Exception as e:
+        log.error(f"Lock acquire error: {e}")
+        return True  # best-effort: do not hard fail
+
+
+def release_lock():
+    try:
+        data_dir = globals().get("DATA_DIR") or os.getenv("DATA_DIR", "/data")
+        lock_path = os.path.join(data_dir, ".poller.lock")
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+    except Exception:
+        pass
+# --------------------------------------------------------
+
 def get_sender_user_id(update: dict) -> int:
     """Returns Telegram user id of the sender for messages/callbacks."""
     try:
