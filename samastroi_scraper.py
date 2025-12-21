@@ -1460,8 +1460,9 @@ def main():
     log.info(f"Moderators: {MODERATORS}")
     log.info(f"Leadership: {LEADERSHIP}")
     log.info(f"Prob threshold: {MIN_AI_GATE}%")
-
-    if not acquire_lock():
+    _acq = globals().get('acquire_lock')
+    log.info(f"[LOCK] acquire_lock callable={callable(_acq)}")
+    if callable(_acq) and (not _acq()):
         log.error("Lock exists: another poller is running. Exiting.")
         return
 
