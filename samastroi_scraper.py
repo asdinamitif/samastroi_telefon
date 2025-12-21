@@ -43,9 +43,18 @@ YAGPT_MODEL = os.getenv("YAGPT_MODEL", f"gpt://{YAGPT_FOLDER_ID}/yandexgpt/lates
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
 # Roles (supports legacy env names: ADMIN_IDS/MODERATOR_IDS/LEAD_IDS)
-ADMINS = [int(x) for x in (os.getenv("ADMINS") or os.getenv("ADMIN_IDS") or "272923789,398960707").split(",") if x.strip().isdigit()]
-MODERATORS = [int(x) for x in (os.getenv("MODERATORS") or os.getenv("MODERATOR_IDS") or "777464055,978125225").split(",") if x.strip().isdigit()]
-LEADERSHIP = [int(x) for x in (os.getenv("LEADERSHIP") or os.getenv("LEAD_IDS") or "5685586625").split(",") if x.strip().isdigit()]
+def _parse_ids(*names: str, default: str = "") -> list[int]:
+    """Parse comma-separated telegram user IDs from the first non-empty env var name."""
+    for n in names:
+        v = os.getenv(n, "")
+        if v and v.strip():
+            return [int(x) for x in v.split(",") if x.strip().isdigit()]
+    return [int(x) for x in default.split(",") if x.strip().isdigit()]
+
+# Keep defaults for safety (won't be used if env vars are set)
+ADMINS = _parse_ids("ADMINS", "ADMIN_IDS", default="272923789,398960707")
+MODERATORS = _parse_ids("MODERATORS", "MODERATOR_IDS", default="777464055,978125225")
+LEADERSHIP = _parse_ids("LEADERSHIP", "LEAD_IDS", default="5685586625")
 
 # Persistent files
 SCRAPER_DB = os.path.join(DATA_DIR, "scraper.db")
@@ -923,7 +932,8 @@ def handle_message(upd: Dict):
         return
 
     if text == "/onzs_ai_stats":
-        if not is_moderator(from_user):
+        # доступ: админ/модератор/руководство
+        if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
             send_message(chat_id, "❌ Нет доступа.")
             return
         send_message(chat_id, build_onzs_stats())
