@@ -1005,7 +1005,7 @@ def handle_message(upd: Dict):
         return
 
     if text == "/admin":
-        uid = get_sender_user_id(update)
+        uid = get_sender_user_id(upd)
         if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
             send_message(chat_id, "❌ Нет доступа.")
             return
@@ -1023,7 +1023,7 @@ def handle_message(upd: Dict):
         return
 
     if text == "/onzs_ai_stats":
-        uid = get_sender_user_id(update)
+        uid = get_sender_user_id(upd)
         if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
             send_message(chat_id, "❌ Нет доступа.")
             return
@@ -1110,7 +1110,14 @@ def main():
 
     log.info(f"Lock acquired: {LOCK_FILE}")
     log.info("Starting getUpdates poller...")
-    run_poller()
+    try:
+        run_poller()
+    finally:
+        try:
+            if os.path.exists(LOCK_FILE):
+                os.remove(LOCK_FILE)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
