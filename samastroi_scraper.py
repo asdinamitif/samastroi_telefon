@@ -38,6 +38,72 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0") or "0")
 
 DATA_DIR = os.getenv("DATA_DIR", "/data").strip()
+
+# --------------------------------------------
+#          ROLES PERSISTENCE (/data)
+# --------------------------------------------
+ROLES_PATH = os.path.join(DATA_DIR, "roles.json")
+
+def _parse_ids_csv(v: str):
+    if not v:
+        return []
+    out = []
+    for x in str(v).split(","):
+        x = x.strip()
+        if not x:
+            continue
+        if re.fullmatch(r"-?\d+", x):
+            try:
+                out.append(int(x))
+            except Exception:
+                pass
+    return out
+
+def load_roles() -> dict:
+    """Load roles from /data/roles.json. If missing, bootstrap from ENV."""
+    base = {
+        "admins": _parse_ids_csv(os.getenv("ADMIN_IDS","")) or _parse_ids_csv(os.getenv("ADMINS","")),
+        "moderators": _parse_ids_csv(os.getenv("MODERATOR_IDS","")) or _parse_ids_csv(os.getenv("MODERATORS","")),
+        "leadership": _parse_ids_csv(os.getenv("LEAD_IDS","")) or _parse_ids_csv(os.getenv("LEADERSHIP","")),
+        "report_targets": _parse_ids_csv(os.getenv("REPORT_TARGETS","")),
+    }
+    try:
+        if os.path.exists(ROLES_PATH):
+            with open(ROLES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            for k in base.keys():
+                if k in data and isinstance(data[k], list):
+                    base[k] = [int(i) for i in data[k] if str(i).lstrip("-").isdigit()]
+    except Exception as e:
+        log.error(f"[ROLES] load error: {e}")
+    for k in base.keys():
+        base[k] = sorted(list(dict.fromkeys(base.get(k, []))))
+    return base
+
+def save_roles(data: dict) -> None:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(ROLES_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        log.info(f"[ROLES] saved: {ROLES_PATH}")
+    except Exception as e:
+        log.error(f"[ROLES] save error: {e}")
+
+ROLES = load_roles()
+
+def roles_refresh_globals():
+    global ADMINS, MODERATORS, LEADERSHIP
+    ADMINS = ROLES.get("admins", [])
+    MODERATORS = ROLES.get("moderators", [])
+    LEADERSHIP = ROLES.get("leadership", [])
+
+roles_refresh_globals()
+
+def is_privileged(uid: int) -> bool:
+    return uid in ROLES.get("admins", []) or uid in ROLES.get("moderators", []) or uid in ROLES.get("leadership", [])
+
+def is_admin(uid: int) -> bool:
+    return uid in ROLES.get("admins", [])
 os.makedirs(DATA_DIR, exist_ok=True)
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300") or "300")
@@ -396,6 +462,112 @@ def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: Op
         log.error(f"editMessageText failed: {resp}")
     return resp
 
+
+# --------------------------------------------
+#               ADMIN PANEL
+# --------------------------------------------
+def admin_menu_text() -> str:
+    return (
+        "🛠 Админ-панель\n"
+        f"• Admins: {len(ROLES.get('admins',[]))}\n"
+        f"• Moderators: {len(ROLES.get('moderators',[]))}\n"
+        f"• Leadership: {len(ROLES.get('leadership',[]))}\n"
+        f"• Reports targets: {len(ROLES.get('report_targets',[]))}\n"
+        "\nВыберите раздел:"
+    )
+
+def admin_menu_kb():
+    return {"inline_keyboard": [
+        [{"text":"👥 Роли", "callback_data":"admin:roles"}],
+        [{"text":"📊 Статистика", "callback_data":"admin:stats"}],
+        [{"text":"🧾 Отчёты", "callback_data":"admin:reports"}],
+        [{"text":"⚙️ Настройки", "callback_data":"admin:settings"}],
+    ]}
+
+def admin_roles_kb():
+    return {"inline_keyboard": [
+        [{"text":"➕ Добавить админа", "callback_data":"admin:add_admin"}],
+        [{"text":"➖ Удалить админа", "callback_data":"admin:del_admin"}],
+        [{"text":"➕ Добавить модератора", "callback_data":"admin:add_mod"}],
+        [{"text":"➖ Удалить модератора", "callback_data":"admin:del_mod"}],
+        [{"text":"➕ Добавить руководство", "callback_data":"admin:add_lead"}],
+        [{"text":"➖ Удалить руководство", "callback_data":"admin:del_lead"}],
+        [{"text":"📋 Показать роли", "callback_data":"admin:list_roles"}],
+        [{"text":"⬅️ Назад", "callback_data":"admin:back"}],
+    ]}
+
+def admin_reports_kb():
+    return {"inline_keyboard": [
+        [{"text":"📤 Отчёт за сутки", "callback_data":"admin:report_day"}],
+        [{"text":"📬 Получатели отчётов", "callback_data":"admin:report_targets"}],
+        [{"text":"➕ Добавить получателя", "callback_data":"admin:add_report_target"}],
+        [{"text":"➖ Удалить получателя", "callback_data":"admin:del_report_target"}],
+        [{"text":"⬅️ Назад", "callback_data":"admin:back"}],
+    ]}
+
+def admin_settings_kb():
+    return {"inline_keyboard": [
+        [{"text":"🔄 Перезагрузить ОНзС", "callback_data":"admin:reload_onzs"}],
+        [{"text":"🧪 Тест YandexGPT", "callback_data":"admin:test_yagpt"}],
+        [{"text":"⬅️ Назад", "callback_data":"admin:back"}],
+    ]}
+
+ADMIN_STATE_PATH = os.path.join(DATA_DIR, "admin_state.json")
+
+def load_admin_state():
+    try:
+        if os.path.exists(ADMIN_STATE_PATH):
+            with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+    except Exception:
+        pass
+    return {}
+
+def save_admin_state(st):
+    try:
+        with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+ADMIN_STATE = load_admin_state()
+
+def set_admin_mode(uid:int, mode:str):
+    ADMIN_STATE[str(uid)] = {"mode": mode, "ts": int(time.time())}
+    save_admin_state(ADMIN_STATE)
+
+def pop_admin_mode(uid:int):
+    ADMIN_STATE.pop(str(uid), None)
+    save_admin_state(ADMIN_STATE)
+
+def get_admin_mode(uid:int):
+    v = ADMIN_STATE.get(str(uid))
+    return v.get("mode") if v else None
+
+def _roles_add(key:str, uid:int):
+    arr = ROLES.get(key, [])
+    if uid not in arr:
+        arr.append(uid)
+    ROLES[key] = sorted(list(dict.fromkeys(arr)))
+    save_roles(ROLES)
+    roles_refresh_globals()
+
+def _roles_del(key:str, uid:int):
+    arr = [x for x in ROLES.get(key, []) if x != uid]
+    ROLES[key] = arr
+    save_roles(ROLES)
+    roles_refresh_globals()
+
+def build_roles_text():
+    def fmt(lst):
+        return ", ".join(str(x) for x in lst) if lst else "—"
+    return (
+        "👥 Текущие роли\n"
+        f"Admins: {fmt(ROLES.get('admins',[]))}\n"
+        f"Moderators: {fmt(ROLES.get('moderators',[]))}\n"
+        f"Leadership: {fmt(ROLES.get('leadership',[]))}\n"
+        f"Report targets: {fmt(ROLES.get('report_targets',[]))}"
+    )
 def send_message(chat_id: int, text: str, reply_markup: Optional[Dict] = None):
     # Telegram limit ~4096; chunk to avoid 400
     max_len = 3900
@@ -626,6 +798,39 @@ def save_onzs_training(text: str, onzs: int, confirmed: bool):
     rec = {"text": clean_text_for_ai(text), "onzs": int(onzs), "confirmed": bool(confirmed), "ts": now_ts()}
     append_jsonl(ONZS_TRAIN_FILE, rec)
 
+
+def build_daily_report_text() -> str:
+    today = datetime.now().date().isoformat()
+    lines = ["🧾 Отчёт за сутки", f"Дата: {today}"]
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [r[0] for r in cur.fetchall()]
+        if not tables:
+            conn.close()
+            lines.append("Нет таблиц в БД.")
+            return "\n".join(lines)
+        table = "cards" if "cards" in tables else tables[0]
+        try:
+            cur.execute(f"SELECT status, COUNT(*) FROM {table} WHERE date(ts)=? GROUP BY status", (today,))
+            rows = cur.fetchall()
+            if rows:
+                lines.append("Статусы:")
+                for st,cnt in rows:
+                    lines.append(f"• {st}: {cnt}")
+        except Exception:
+            pass
+        try:
+            cur.execute(f"SELECT COUNT(*) FROM {table} WHERE date(ts)=? AND onzs_final IS NOT NULL", (today,))
+            n = cur.fetchone()[0]
+            lines.append(f"Подтверждённые ОНзС: {n}")
+        except Exception:
+            pass
+        conn.close()
+    except Exception as e:
+        lines.append(f"Ошибка отчёта: {e}")
+    return "\n".join(lines)
 def build_onzs_stats() -> str:
     if not os.path.exists(ONZS_TRAIN_FILE):
         return "Нет данных по ОНзС."
@@ -817,6 +1022,69 @@ def append_history(entry: Dict):
 def handle_callback_query(upd: Dict):
     cb = upd.get("callback_query") or {}
     data = cb.get("data") or ""
+
+    # --- ADMIN PANEL CALLBACKS ---
+    uid = get_sender_user_id(upd)
+    if data and data.startswith("admin:"):
+        if not is_privileged(uid):
+            answer_callback_query(cb_id, "Нет доступа")
+            return
+        action = data.split(":",1)[1]
+
+        if action == "back":
+            edit_message_text(chat_id, msg_id, admin_menu_text(), reply_markup=admin_menu_kb())
+            answer_callback_query(cb_id, "OK")
+            return
+        if action == "roles":
+            edit_message_text(chat_id, msg_id, build_roles_text(), reply_markup=admin_roles_kb())
+            answer_callback_query(cb_id, "OK")
+            return
+        if action == "reports":
+            edit_message_text(chat_id, msg_id, "🧾 Отчёты", reply_markup=admin_reports_kb())
+            answer_callback_query(cb_id, "OK")
+            return
+        if action == "settings":
+            edit_message_text(chat_id, msg_id, "⚙️ Настройки", reply_markup=admin_settings_kb())
+            answer_callback_query(cb_id, "OK")
+            return
+        if action == "stats":
+            try:
+                txt = build_onzs_stats()
+            except Exception:
+                txt = "📊 Статистика пока недоступна."
+            edit_message_text(chat_id, msg_id, txt, reply_markup={"inline_keyboard":[[{"text":"⬅️ Назад","callback_data":"admin:back"}]]})
+            answer_callback_query(cb_id, "OK")
+            return
+        if action == "list_roles":
+            answer_callback_query(cb_id, "OK")
+            send_message(chat_id, build_roles_text())
+            return
+        if action in ("add_admin","del_admin","add_mod","del_mod","add_lead","del_lead","add_report_target","del_report_target"):
+            set_admin_mode(uid, action)
+            answer_callback_query(cb_id, "OK")
+            send_message(chat_id, "✍️ Пришлите Telegram ID пользователя (числом).")
+            return
+        if action == "report_targets":
+            answer_callback_query(cb_id, "OK")
+            send_message(chat_id, build_roles_text())
+            return
+        if action == "report_day":
+            answer_callback_query(cb_id, "OK")
+            send_message(chat_id, build_daily_report_text())
+            return
+        if action == "reload_onzs":
+            load_onzs_catalog()
+            answer_callback_query(cb_id, "OK")
+            send_message(chat_id, f"✅ ОНзС перезагружен: {len(ONZS_MAP)}")
+            return
+        if action == "test_yagpt":
+            answer_callback_query(cb_id, "OK")
+            try:
+                t = call_yandex_gpt_raw([{"role":"user","text":"Тест. Ответь одним словом: ОК"}])
+                send_message(chat_id, f"🧪 YandexGPT: {str(t)[:500]}")
+            except Exception as e:
+                send_message(chat_id, f"🧪 YandexGPT ошибка: {e}")
+            return
     cb_id = cb.get("id") or ""
     msg = cb.get("message") or {}
     from_user = (cb.get("from") or {}).get("id")
@@ -999,6 +1267,41 @@ def handle_callback_query(upd: Dict):
 def handle_message(upd: Dict):
     msg = upd.get("message") or {}
     text = (msg.get("text") or "").strip()
+
+    # --- ADMIN MODE INPUT (role management) ---
+    uid = get_sender_user_id(upd)
+    mode = get_admin_mode(uid)
+    if mode and text and not text.startswith("/"):
+        m_id = re.search(r"(\d+)", text)
+        if not m_id:
+            send_message(chat_id, "⚠️ Пришлите числовой Telegram ID пользователя.")
+            return
+        target_uid = int(m_id.group(1))
+        if mode == "add_admin":
+            _roles_add("admins", target_uid); send_message(chat_id, f"✅ Добавлен админ: {target_uid}")
+        elif mode == "del_admin":
+            _roles_del("admins", target_uid); send_message(chat_id, f"✅ Удалён админ: {target_uid}")
+        elif mode == "add_mod":
+            _roles_add("moderators", target_uid); send_message(chat_id, f"✅ Добавлен модератор: {target_uid}")
+        elif mode == "del_mod":
+            _roles_del("moderators", target_uid); send_message(chat_id, f"✅ Удалён модератор: {target_uid}")
+        elif mode == "add_lead":
+            _roles_add("leadership", target_uid); send_message(chat_id, f"✅ Добавлено руководство: {target_uid}")
+        elif mode == "del_lead":
+            _roles_del("leadership", target_uid); send_message(chat_id, f"✅ Удалено руководство: {target_uid}")
+        elif mode == "add_report_target":
+            _roles_add("report_targets", target_uid); send_message(chat_id, f"✅ Добавлен получатель отчётов: {target_uid}")
+        elif mode == "del_report_target":
+            _roles_del("report_targets", target_uid); send_message(chat_id, f"✅ Удалён получатель отчётов: {target_uid}")
+        pop_admin_mode(uid)
+        return
+
+    if text == "/admin":
+        if not is_privileged(uid):
+            send_message(chat_id, "❌ Нет доступа.")
+            return
+        send_message(chat_id, admin_menu_text(), reply_markup=admin_menu_kb())
+        return
     chat_id = (msg.get("chat") or {}).get("id")
     from_user = (msg.get("from") or {}).get("id")
     if not chat_id or not from_user:
