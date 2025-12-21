@@ -1265,6 +1265,15 @@ def handle_callback_query(upd: Dict):
 
 # ----------------------------- COMMANDS -----------------------------
 def handle_message(upd: Dict):
+    # --- ensure chat_id is always defined ---
+    msg = upd.get('message') or {}
+    chat = msg.get('chat') or {}
+    chat_id = int(chat.get('id', 0) or 0)
+    text = (msg.get('text') or '').strip()
+    if not text: 
+        return
+    # ---------------------------------------
+
     msg = upd.get("message") or {}
     text = (msg.get("text") or "").strip()
 
@@ -1337,8 +1346,7 @@ def handle_message(upd: Dict):
         send_message(chat_id, "Бот запущен.")
         return
 
-# ----------------------------- GETUPDATES LOOP -----------------------------
-def acquire_lock() -> bool:
+# ----------------------------- GETUPDATES LOOP -----------------------------def acquire_lock() -> bool:
     try:
         if os.path.exists(LOCK_FILE):
             # stale lock check: 10 minutes
