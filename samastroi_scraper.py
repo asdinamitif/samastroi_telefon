@@ -428,6 +428,20 @@ URL_RE = re.compile(r"(https?://\S+)")
 MENTION_RE = re.compile(r"@\w+")
 HASHTAG_RE = re.compile(r"#\w+")
 
+def build_admin_keyboard() -> Dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📊 Статистика ОНзС", "callback_data": "admin:onzs_stats"},
+                {"text": "🔄 Перезагрузить ОНзС", "callback_data": "admin:reload_onzs"},
+            ],
+            [
+                {"text": "🧪 Тест YandexGPT", "callback_data": "admin:test_yagpt"},
+            ],
+        ]
+    }
+
+
 def clean_text_for_ai(text: str) -> str:
     t = (text or "").strip()
     t = URL_RE.sub(" ", t)
@@ -801,6 +815,49 @@ def handle_callback_query(upd: Dict):
         answer_callback(cb_id, "Ошибка", show_alert=True)
         return
 
+# Admin actions
+if data.startswith("admin:"):
+    # доступ: админ/модератор/руководство
+    if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
+        answer_callback(cb_id, "Нет доступа", show_alert=True)
+        return
+
+    op = data.split(":", 1)[1]
+    if op == "onzs_stats":
+        if chat_id:
+            send_message(chat_id, build_onzs_stats())
+        answer_callback(cb_id, "Готово")
+        return
+
+    if op == "reload_onzs":
+        load_onzs_catalog()
+        if chat_id:
+            send_message(chat_id, f"🔄 Каталог ОНзС перезагружен: {len(ONZS_MAP)} элементов")
+        answer_callback(cb_id, "Перезагружено")
+        return
+
+    if op == "test_yagpt":
+        ok = False
+        detail = ""
+        try:
+            txt = call_yandex_gpt_raw(
+                system="Ты тестовый помощник. Ответь одной строкой: OK.",
+                user="Ответь одной строкой: OK",
+                max_tokens=16,
+                temperature=0.0,
+            )
+            if isinstance(txt, str) and "OK" in txt.upper():
+                ok = True
+            else:
+                detail = (txt or "")[:200]
+        except Exception as e:
+            detail = str(e)[:200]
+
+        if chat_id:
+            send_message(chat_id, "✅ YandexGPT: OK" if ok else f"⚠️ YandexGPT: нет ответа. {detail}")
+        answer_callback(cb_id, "OK" if ok else "Проблема")
+        return
+
     # ONZS actions
     if data.startswith("onzs:"):
         if not is_moderator(from_user):
@@ -930,6 +987,25 @@ def handle_message(upd: Dict):
     from_user = (msg.get("from") or {}).get("id")
     if not chat_id or not from_user:
         return
+
+
+if text == "/admin":
+    # доступ: админ/модератор/руководство
+    if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
+        send_message(chat_id, "❌ Нет доступа.")
+        return
+
+    onzs_cnt = len(ONZS_MAP) if isinstance(ONZS_MAP, dict) else 0
+    yagpt_enabled = bool(YAGPT_API_KEY and YAGPT_FOLDER_ID)
+    info = []
+    info.append("🛠 Админ-панель")
+    info.append(f"ID: {from_user}")
+    info.append(f"YandexGPT: {'ON' if yagpt_enabled else 'OFF'} | model={YAGPT_MODEL}")
+    info.append(f"AI-gate: {MIN_AI_GATE}% | HTTP_TIMEOUT={HTTP_TIMEOUT}s")
+    info.append(f"ОНзС каталог: {onzs_cnt} | файл: {ONZS_XLSX}")
+    info.append(f"Admins: {len(ADMINS)} | Moderators: {len(MODERATORS)} | Leadership: {len(LEADERSHIP)}")
+    send_message(chat_id, "\n".join(info), reply_markup=build_admin_keyboard())
+    return
 
     if text == "/onzs_ai_stats":
         # доступ: админ/модератор/руководство
