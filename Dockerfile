@@ -13,5 +13,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY samastroi_scraper.py .
+COPY onzs_catalog.xlsx /app/onzs_catalog.xlsx
 
 CMD ["python", "samastroi_scraper.py"]
