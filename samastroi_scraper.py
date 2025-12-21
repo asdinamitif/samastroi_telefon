@@ -234,23 +234,91 @@ def get_keyword_bias_points(text: str) -> float:
 # ----------------------------- ONZS CATALOG -----------------------------
 ONZS_MAP: Dict[int, str] = {}
 
+def _to_onzs_int(v) -> Optional[int]:
+    """Extract ONZS number 1..12 from a cell value (robust to '1.0', '1 – ...', etc.)."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return None
+    m = re.search(r"(\d+)", s)
+    if not m:
+        return None
+    try:
+        n = int(m.group(1))
+    except Exception:
+        return None
+    return n if 1 <= n <= 12 else None
+
 def load_onzs_catalog():
+    """Load ONZS catalog from Excel.
+    Robust mode:
+      - reads all sheets
+      - no header dependency
+      - finds numbers 1..12 in any column
+      - extracts description from right neighbor or first meaningful text in row
+    """
     global ONZS_MAP
     try:
         path = resolve_path(ONZS_XLSX)
         log.info(f"[ONZS] trying path: {path}")
         if not os.path.exists(path):
             debug_paths_for_file(path)
-        df = pd.read_excel(path)
-        # Expect: first column = number, second column = description
-        mp = {}
-        for _, r in df.iterrows():
-            a = r.iloc[0]
-            b = r.iloc[1] if len(r) > 1 else ""
-            if str(a).strip().isdigit():
-                mp[int(str(a).strip())] = str(b).strip()
+
+        sheets = pd.read_excel(path, sheet_name=None, header=None)
+        mp: Dict[int, str] = {}
+
+        for sheet_name, df in (sheets or {}).items():
+            if df is None or df.empty:
+                continue
+
+            for _, row in df.iterrows():
+                cells = row.tolist()
+
+                found_n = None
+                found_idx = None
+                for i, c in enumerate(cells):
+                    n = _to_onzs_int(c)
+                    if n is not None:
+                        found_n = n
+                        found_idx = i
+                        break
+                if found_n is None:
+                    continue
+
+                desc = ""
+
+                # Prefer the right neighbor of the ONZS number cell
+                if found_idx is not None and found_idx + 1 < len(cells):
+                    v = cells[found_idx + 1]
+                    if v is not None:
+                        sv = str(v).strip()
+                        if sv and sv.lower() not in ("nan", "none"):
+                            desc = sv
+
+                # Otherwise: first non-empty non-numeric text in the row excluding the number cell
+                if not desc:
+                    for j, v in enumerate(cells):
+                        if j == found_idx:
+                            continue
+                        if v is None:
+                            continue
+                        sv = str(v).strip()
+                        if not sv or sv.lower() in ("nan", "none"):
+                            continue
+                        if re.fullmatch(r"\d+(?:\.\d+)?", sv):
+                            continue
+                        desc = sv
+                        break
+
+                if desc:
+                    mp[found_n] = desc
+
         ONZS_MAP = mp
         log.info(f"[ONZS] catalog loaded: {len(ONZS_MAP)} items")
+        if not ONZS_MAP:
+            log.error("[ONZS] loaded 0 items: check Excel structure (numbers/description).")
+
     except Exception as e:
         ONZS_MAP = {}
         log.error(f"[ONZS] catalog load error: {e}")
