@@ -21,6 +21,18 @@ logging.basicConfig(
 )
 log = logging.getLogger("samastroi")
 
+
+def get_sender_user_id(update: dict) -> int:
+    """Returns Telegram user id of the sender for messages/callbacks."""
+    try:
+        if update.get("message") and update["message"].get("from"):
+            return int(update["message"]["from"].get("id"))
+        if update.get("callback_query") and update["callback_query"].get("from"):
+            return int(update["callback_query"]["from"].get("id"))
+    except Exception:
+        pass
+    return 0
+
 # ----------------------------- CONFIG -----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0") or "0")
@@ -993,6 +1005,7 @@ def handle_message(upd: Dict):
         return
 
     if text == "/admin":
+        uid = get_sender_user_id(update)
         if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
             send_message(chat_id, "❌ Нет доступа.")
             return
@@ -1010,6 +1023,7 @@ def handle_message(upd: Dict):
         return
 
     if text == "/onzs_ai_stats":
+        uid = get_sender_user_id(update)
         if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
             send_message(chat_id, "❌ Нет доступа.")
             return
