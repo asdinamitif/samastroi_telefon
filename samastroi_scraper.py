@@ -55,6 +55,51 @@ KEYWORD_BIAS_FILE = os.path.join(DATA_DIR, "keyword_bias.json")
 
 # ONZS files
 ONZS_XLSX = os.getenv("ONZS_XLSX", "Номера ОНзС.xlsx").strip()
+
+# Base dir / path resolver (Railway may run with different CWD)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def resolve_path(p: str) -> str:
+    """Resolve relative paths against common locations.
+    Order: BASE_DIR -> CWD -> DATA_DIR.
+    """
+    if not p:
+        return p
+    if os.path.isabs(p):
+        return p
+
+    # 1) Next to this script
+    cand1 = os.path.join(BASE_DIR, p)
+    if os.path.exists(cand1):
+        return cand1
+
+    # 2) Current working directory
+    cand2 = os.path.join(os.getcwd(), p)
+    if os.path.exists(cand2):
+        return cand2
+
+    # 3) Data dir volume
+    cand3 = os.path.join(DATA_DIR, os.path.basename(p))
+    if os.path.exists(cand3):
+        return cand3
+
+    return p
+
+def debug_paths_for_file(p: str):
+    """Log helpful diagnostics to understand why a file is not found."""
+    try:
+        log.error(f"[PATH] missing file: {p}")
+        log.error(f"[PATH] CWD={os.getcwd()} | BASE_DIR={BASE_DIR} | DATA_DIR={DATA_DIR}")
+        for label, d in [("CWD", os.getcwd()), ("BASE_DIR", BASE_DIR), ("DATA_DIR", DATA_DIR)]:
+            try:
+                items = os.listdir(d)
+                # don't spam: show only first 50
+                shown = items[:50]
+                log.error(f"[PATH] {label} list (first {len(shown)}/{len(items)}): {shown}")
+            except Exception as e:
+                log.error(f"[PATH] {label} list error: {e}")
+    except Exception:
+        pass
 ONZS_TRAIN_FILE = os.path.join(DATA_DIR, "onzs_training.jsonl")
 
 # Lock file to avoid 409 / multi pollers
@@ -192,7 +237,11 @@ ONZS_MAP: Dict[int, str] = {}
 def load_onzs_catalog():
     global ONZS_MAP
     try:
-        df = pd.read_excel(ONZS_XLSX)
+        path = resolve_path(ONZS_XLSX)
+        log.info(f"[ONZS] trying path: {path}")
+        if not os.path.exists(path):
+            debug_paths_for_file(path)
+        df = pd.read_excel(path)
         # Expect: first column = number, second column = description
         mp = {}
         for _, r in df.iterrows():
