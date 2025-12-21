@@ -1424,11 +1424,7 @@ def main():
     try:
         run_poller()
     finally:
-        try:
-            if os.path.exists(LOCK_FILE):
-                os.remove(LOCK_FILE)
-        except Exception:
-            pass
+        release_lock()
 
 if __name__ == "__main__":
     main()
