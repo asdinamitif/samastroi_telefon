@@ -324,11 +324,21 @@ def load_onzs_catalog():
         log.error(f"[ONZS] catalog load error: {e}")
 
 # ----------------------------- TELEGRAM API HELPERS -----------------------------
-def tg_get(method: str, params: Dict) -> Optional[Dict]:
+def tg_get(method: str, params: Dict, timeout_override: Optional[int] = None) -> Optional[Dict]:
     if not TELEGRAM_API_URL:
         return None
+    # For long-polling getUpdates, Telegram can hold the request up to `timeout` seconds.
+    # We must set HTTP client timeout > Telegram timeout to avoid premature Read timed out.
     try:
-        r = requests.get(f"{TELEGRAM_API_URL}/{method}", params=params, timeout=HTTP_TIMEOUT)
+        tg_timeout = int((params or {}).get("timeout", 0) or 0)
+    except Exception:
+        tg_timeout = 0
+    effective_timeout = timeout_override if timeout_override is not None else HTTP_TIMEOUT
+    # Make sure effective timeout safely exceeds long-poll timeout
+    effective_timeout = max(int(effective_timeout or 0), tg_timeout + 10, 30)
+
+    try:
+        r = requests.get(f"{TELEGRAM_API_URL}/{method}", params=params, timeout=effective_timeout)
         return r.json()
     except Exception as e:
         log.error(f"Telegram GET {method} error: {e}")
@@ -947,13 +957,24 @@ def touch_lock():
 
 def run_poller():
     offset = 0
+    backoff = 2
+    max_backoff = 30
+
     while True:
         touch_lock()
-        resp = tg_get("getUpdates", {"timeout": 45, "offset": offset})
+
+        # Use long-polling (timeout=45) and ensure HTTP timeout exceeds it
+        resp = tg_get("getUpdates", {"timeout": 45, "offset": offset}, timeout_override=max(HTTP_TIMEOUT, 60))
+
         if not resp or not resp.get("ok"):
-            # do not crash on timeouts
-            time.sleep(2)
+            # Network is often unstable on some hosts; apply exponential backoff
+            time.sleep(backoff)
+            backoff = min(max_backoff, backoff * 2)
             continue
+
+        # Successful response -> reset backoff
+        backoff = 2
+
         updates = resp.get("result", [])
         for u in updates:
             offset = max(offset, (u.get("update_id", 0) + 1))
