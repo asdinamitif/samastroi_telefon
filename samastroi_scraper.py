@@ -717,7 +717,7 @@ def clear_admin_mode(*args):
     """Clear per-user admin mode.
     Supports signatures:
       clear_admin_mode(uid)
-      clear_admin_mode(chat_id, uid)  # chat_id is ignored
+      clear_admin_mode(uid)  # chat_id is ignored
     """
     if len(args) == 1:
         uid = args[0]
@@ -1231,12 +1231,11 @@ def handle_message(upd: Dict):
     # --- ADMIN MODE INPUT (role management) ---
     uid = get_sender_user_id(upd)
     mode = get_admin_mode(uid)
-    if mode and text and not text.startswith("/"):
-        m_id = re.search(r"(\d+)", text)
-        if not m_id:
-            send_message(chat_id, "⚠️ Пришлите числовой Telegram ID пользователя.")
-            return
-        target_uid = int(m_id.group(1))
+    # Если админ в режиме ввода (например, порог AI-gate), но прислал команду (/admin и т.п.),
+    # выходим из режима и даём обработаться команде.
+    if mode and text and text.startswith("/"):
+        clear_admin_mode(uid)
+        mode = None
     if mode == "set_aigate":
         # If user entered a command while waiting for a threshold value, cancel input mode and process the command normally.
         if text and text.startswith("/"):
@@ -1255,7 +1254,7 @@ def handle_message(upd: Dict):
         global MIN_AI_GATE
         MIN_AI_GATE = float(v)
         set_cfg_value("min_ai_gate", MIN_AI_GATE)
-        clear_admin_mode(chat_id, uid)
+        clear_admin_mode(uid)
         send_message(chat_id, f"✅ Готово. Новый AI‑gate порог: {MIN_AI_GATE:.1f}%")
         return
 
