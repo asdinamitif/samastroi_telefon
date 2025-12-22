@@ -157,6 +157,12 @@ HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15") or "15")
 
 # IMPORTANT: AI gate; if YandexGPT is unavailable or refuses, card is not sent
 MIN_AI_GATE = float(os.getenv("MIN_AI_GATE", "5"))
+# Allow runtime override from /data/config.json (0..100 percent)
+try:
+    MIN_AI_GATE = float(max(0.0, min(100.0, get_cfg_float("min_ai_gate", MIN_AI_GATE))))
+except Exception:
+    pass
+
 
 # YandexGPT
 YAGPT_API_KEY = os.getenv("YAGPT_API_KEY", "").strip()
@@ -610,6 +616,41 @@ def admin_settings_kb():
     ]}
 
 ADMIN_STATE_PATH = os.path.join(DATA_DIR, "admin_state.json")
+# --------------------------------------------
+#               PERSISTENT CONFIG (DATA_DIR)
+# --------------------------------------------
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+
+def load_config() -> dict:
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+    except Exception:
+        pass
+    return {}
+
+def save_config(cfg: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg or {}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def get_cfg_float(key: str, default: float) -> float:
+    cfg = load_config()
+    v = cfg.get(key, default)
+    try:
+        return float(str(v).replace(",", "."))
+    except Exception:
+        return float(default)
+
+def set_cfg_value(key: str, value) -> None:
+    cfg = load_config()
+    cfg[key] = value
+    save_config(cfg)
+
 
 def load_admin_state():
     try:
@@ -1138,6 +1179,23 @@ def handle_message(upd: Dict):
             send_message(chat_id, "⚠️ Пришлите числовой Telegram ID пользователя.")
             return
         target_uid = int(m_id.group(1))
+    if mode == "set_aigate":
+        raw = (text or "").strip().replace(",", ".")
+        try:
+            v = float(raw)
+        except Exception:
+            send_message(chat_id, "❌ Неверный формат. Введи число от 0 до 100 (например: 5 или 12.5).")
+            return
+        if v < 0 or v > 100:
+            send_message(chat_id, "❌ Диапазон: от 0 до 100.")
+            return
+        global MIN_AI_GATE
+        MIN_AI_GATE = float(v)
+        set_cfg_value("min_ai_gate", MIN_AI_GATE)
+        clear_admin_mode(chat_id, uid)
+        send_message(chat_id, f"✅ Готово. Новый AI‑gate порог: {MIN_AI_GATE:.1f}%")
+        return
+
         if mode == "add_admin":
             _roles_add("admins", target_uid); send_message(chat_id, f"✅ Добавлен админ: {target_uid}")
         elif mode == "del_admin":
@@ -1255,6 +1313,15 @@ def handle_callback_query(upd: Dict):
             edit_message_text(chat_id, msg_id, "⚙️ Настройки", reply_markup=admin_settings_kb())
             answer_callback_query(cb_id, "OK")
             return
+        if action == "set_aigate":
+            set_admin_mode(chat_id, uid, "set_aigate")
+            send_message(
+                chat_id,
+                f"🎚 AI‑gate порог (в процентах).\n\nТекущий: {MIN_AI_GATE:.1f}%\n\nВведи число от 0 до 100.",
+            )
+            answer_callback_query(cb_id, "Введите число 0–100")
+            return
+
         if action == "stats":
             try:
                 txt = build_onzs_stats()
