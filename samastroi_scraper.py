@@ -105,26 +105,50 @@ def _parse_ids_csv(v: str):
                 pass
     return out
 
+
 def load_roles() -> dict:
-    """Load roles from /data/roles.json. If missing, bootstrap from ENV."""
+    """Load roles (admins/moderators/leadership/report_targets) with persistence.
+
+    Priority logic (safe & predictable):
+    1) Start from ENV lists (ADMIN_IDS/MODERATOR_IDS/LEADERSHIP etc).
+    2) If /data/roles.json exists, MERGE it with ENV (additive). It must not delete ENV access.
+    This prevents the classic situation where an old roles.json blocks access after redeploy.
+    """
     base = {
-        "admins": _parse_ids_csv(os.getenv("ADMIN_IDS","")) or _parse_ids_csv(os.getenv("ADMINS","")),
-        "moderators": _parse_ids_csv(os.getenv("MODERATOR_IDS","")) or _parse_ids_csv(os.getenv("MODERATORS","")),
-        "leadership": _parse_ids_csv(os.getenv("LEAD_IDS","")) or _parse_ids_csv(os.getenv("LEADERSHIP","")),
-        "report_targets": _parse_ids_csv(os.getenv("REPORT_TARGETS","")),
+        "admins": _parse_ids_csv(os.getenv("ADMIN_IDS", "")) or _parse_ids_csv(os.getenv("ADMINS", "")),
+        "moderators": _parse_ids_csv(os.getenv("MODERATOR_IDS", "")) or _parse_ids_csv(os.getenv("MODERATORS", "")),
+        "leadership": _parse_ids_csv(os.getenv("LEAD_IDS", "")) or _parse_ids_csv(os.getenv("LEADERSHIP", "")),
+        "report_targets": _parse_ids_csv(os.getenv("REPORT_TARGETS", "")),
     }
+
     try:
         if os.path.exists(ROLES_PATH):
             with open(ROLES_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f) or {}
-            for k in base.keys():
-                if k in data and isinstance(data[k], list):
-                    base[k] = [int(i) for i in data[k] if str(i).lstrip("-").isdigit()]
+            for k in list(base.keys()):
+                file_list = data.get(k, [])
+                if isinstance(file_list, list):
+                    merged = []
+                    seen = set()
+                    for src in (base.get(k, []), file_list):
+                        for i in src:
+                            try:
+                                ii = int(i)
+                            except Exception:
+                                continue
+                            if ii not in seen:
+                                seen.add(ii)
+                                merged.append(ii)
+                    base[k] = merged
     except Exception as e:
         log.error(f"[ROLES] load error: {e}")
-    for k in base.keys():
-        base[k] = sorted(list(dict.fromkeys(base.get(k, []))))
+
+    # Persist merged result (so that UI changes are remembered)
+    save_roles(base)
     return base
+
+
+
 
 def save_roles(data: dict) -> None:
     try:
