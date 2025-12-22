@@ -478,14 +478,56 @@ def tg_get(method: str, params: Dict, timeout_override: Optional[int] = None) ->
         return None
 
 def tg_post(method: str, payload: Dict) -> Optional[Dict]:
+    """POST wrapper with basic resiliency (timeouts/resets/429) and safe JSON parsing."""
     if not TELEGRAM_API_URL:
         return None
-    try:
-        r = requests.post(f"{TELEGRAM_API_URL}/{method}", json=payload, timeout=HTTP_TIMEOUT)
-        return r.json()
-    except Exception as e:
-        log.error(f"Telegram POST {method} error: {e}")
-        return None
+
+    max_attempts = int(os.getenv("TG_HTTP_RETRIES", "5"))
+    base_sleep = float(os.getenv("TG_HTTP_RETRY_SLEEP", "1.0"))  # seconds
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.post(
+                f"{TELEGRAM_API_URL}/{method}",
+                json=payload,
+                timeout=HTTP_TIMEOUT,
+            )
+
+            # Telegram sometimes rate-limits (429) with retry_after in response JSON.
+            if r.status_code == 429:
+                try:
+                    j = r.json()
+                    retry_after = float(j.get("parameters", {}).get("retry_after", 1))
+                except Exception:
+                    retry_after = 1.0
+                sleep_s = max(1.0, retry_after)
+                log.warning(f"Telegram POST {method} rate-limited (429). Sleeping {sleep_s:.1f}s (attempt {attempt}/{max_attempts})")
+                time.sleep(sleep_s)
+                continue
+
+            # Non-200: still try to parse JSON for diagnostics, but retry on 5xx.
+            if r.status_code >= 500:
+                log.warning(f"Telegram POST {method} server error {r.status_code}. Attempt {attempt}/{max_attempts}")
+                time.sleep(base_sleep * attempt)
+                continue
+
+            try:
+                return r.json()
+            except Exception:
+                # Not JSON (rare). Log a short snippet and do not crash.
+                snippet = (r.text or "")[:300]
+                log.error(f"Telegram POST {method} non-JSON response (status={r.status_code}): {snippet}")
+                return None
+
+        except Exception as e:
+            last_err = e
+            log.error(f"Telegram POST {method} error: {e!r} (attempt {attempt}/{max_attempts})")
+            time.sleep(base_sleep * attempt)
+
+    if last_err:
+        log.error(f"Telegram POST {method} failed after {max_attempts} attempts: {last_err!r}")
+    return None
 
 def answer_callback(callback_query_id: str, text: str = "", show_alert: bool = False):
     tg_post("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text, "show_alert": show_alert})
