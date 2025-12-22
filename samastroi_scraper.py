@@ -490,6 +490,10 @@ def tg_post(method: str, payload: Dict) -> Optional[Dict]:
 def answer_callback(callback_query_id: str, text: str = "", show_alert: bool = False):
     tg_post("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text, "show_alert": show_alert})
 
+# Backward-compatible alias used by some handlers
+def answer_callback_query(callback_query_id: str, text: str = "", show_alert: bool = False):
+    return answer_callback(callback_query_id, text=text, show_alert=show_alert)
+
 def edit_reply_markup(chat_id: int, message_id: int, reply_markup: Optional[Dict] = None):
     payload = {"chat_id": chat_id, "message_id": message_id}
     if reply_markup is not None:
@@ -505,7 +509,12 @@ def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: Op
         payload["reply_markup"] = reply_markup
     resp = tg_post("editMessageText", payload)
     if resp and not resp.get("ok", True):
-        log.error(f"editMessageText failed: {resp}")
+        desc = str(resp.get("description", ""))
+        # Telegram returns this when trying to set the same text/markup; not a real failure.
+        if "message is not modified" in desc:
+            log.debug(f"editMessageText not modified: {desc}")
+        else:
+            log.error(f"editMessageText failed: {resp}")
     return resp
 
 
