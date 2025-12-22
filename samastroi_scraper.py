@@ -1065,6 +1065,104 @@ def append_history(entry: Dict):
     append_jsonl(HISTORY_CARDS, entry)
 
 # ----------------------------- CALLBACK HANDLER -----------------------------
+def handle_message(upd: Dict):
+    # --- ensure chat_id is always defined ---
+    msg = upd.get('message') or {}
+    chat = msg.get('chat') or {}
+    chat_id = int(chat.get('id', 0) or 0)
+    text = (msg.get('text') or '').strip()
+    if not text: 
+        return
+    # ---------------------------------------
+
+    msg = upd.get("message") or {}
+    text = (msg.get("text") or "").strip()
+
+    # --- ADMIN MODE INPUT (role management) ---
+    uid = get_sender_user_id(upd)
+    mode = get_admin_mode(uid)
+    if mode and text and not text.startswith("/"):
+        m_id = re.search(r"(\d+)", text)
+        if not m_id:
+            send_message(chat_id, "⚠️ Пришлите числовой Telegram ID пользователя.")
+            return
+        target_uid = int(m_id.group(1))
+        if mode == "add_admin":
+            _roles_add("admins", target_uid); send_message(chat_id, f"✅ Добавлен админ: {target_uid}")
+        elif mode == "del_admin":
+            _roles_del("admins", target_uid); send_message(chat_id, f"✅ Удалён админ: {target_uid}")
+        elif mode == "add_mod":
+            _roles_add("moderators", target_uid); send_message(chat_id, f"✅ Добавлен модератор: {target_uid}")
+        elif mode == "del_mod":
+            _roles_del("moderators", target_uid); send_message(chat_id, f"✅ Удалён модератор: {target_uid}")
+        elif mode == "add_lead":
+            _roles_add("leadership", target_uid); send_message(chat_id, f"✅ Добавлено руководство: {target_uid}")
+        elif mode == "del_lead":
+            _roles_del("leadership", target_uid); send_message(chat_id, f"✅ Удалено руководство: {target_uid}")
+        elif mode == "add_report_target":
+            _roles_add("report_targets", target_uid); send_message(chat_id, f"✅ Добавлен получатель отчётов: {target_uid}")
+        elif mode == "del_report_target":
+            _roles_del("report_targets", target_uid); send_message(chat_id, f"✅ Удалён получатель отчётов: {target_uid}")
+        pop_admin_mode(uid)
+        return
+
+    if text == "/admin":
+        if not is_privileged(uid):
+            send_message(chat_id, "❌ Нет доступа.")
+            return
+        send_message(chat_id, admin_menu_text(), reply_markup=admin_menu_kb())
+        return
+    chat_id = (msg.get("chat") or {}).get("id")
+    from_user = (msg.get("from") or {}).get("id")
+    if not chat_id or not from_user:
+        return
+
+    if text == "/admin":
+        uid = get_sender_user_id(upd)
+        if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
+            send_message(chat_id, "❌ Нет доступа.")
+            return
+
+        onzs_cnt = len(ONZS_MAP) if isinstance(ONZS_MAP, dict) else 0
+        yagpt_enabled = bool(YAGPT_API_KEY and YAGPT_FOLDER_ID)
+        info = []
+        info.append("🛠 Админ-панель")
+        info.append(f"ID: {from_user}")
+        info.append(f"YandexGPT: {'ON' if yagpt_enabled else 'OFF'} | model={YAGPT_MODEL}")
+        info.append(f"AI-gate: {MIN_AI_GATE}% | HTTP_TIMEOUT={HTTP_TIMEOUT}s")
+        info.append(f"ОНзС каталог: {onzs_cnt} | файл: {ONZS_XLSX}")
+        info.append(f"Admins: {len(ADMINS)} | Moderators: {len(MODERATORS)} | Leadership: {len(LEADERSHIP)}")
+        send_message(chat_id, "\n".join(info), reply_markup=build_admin_keyboard())
+        return
+
+    if text == "/onzs_ai_stats":
+        uid = get_sender_user_id(upd)
+        if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
+            send_message(chat_id, "❌ Нет доступа.")
+            return
+        send_message(chat_id, build_onzs_stats())
+        return
+
+    if text == "/start":
+        send_message(chat_id, "Бот запущен.")
+        return
+
+# ----------------------------- GETUPDATES LOOP -----------------------------def acquire_lock() -> bool:
+    try:
+        if os.path.exists(LOCK_FILE):
+            # stale lock check: 10 minutes
+            if now_ts() - int(os.path.getmtime(LOCK_FILE)) > 600:
+                os.remove(LOCK_FILE)
+            else:
+                return False
+        with open(LOCK_FILE, "w", encoding="utf-8") as f:
+            f.write(str(now_ts()))
+        return True
+    except Exception:
+        return True
+
+
+
 def handle_callback_query(upd: Dict):
     # --- normalize callback update ---
     cq = upd.get('callback_query') or {}
