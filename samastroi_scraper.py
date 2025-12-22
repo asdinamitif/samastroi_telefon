@@ -610,6 +610,7 @@ def admin_reports_kb():
 
 def admin_settings_kb():
     return {"inline_keyboard": [
+        [ {"text": f"🎚 Порог AI-gate: {MIN_AI_GATE:.1f}%", "callback_data": "admin:set_aigate"} ],
         [{"text":"🔄 Перезагрузить ОНзС", "callback_data":"admin:reload_onzs"}],
         [{"text":"🧪 Тест YandexGPT", "callback_data":"admin:test_yagpt"}],
         [{"text":"⬅️ Назад", "callback_data":"admin:back"}],
