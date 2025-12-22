@@ -1166,13 +1166,15 @@ def handle_message(upd: Dict):
 def handle_callback_query(upd: Dict):
     # --- normalize callback update ---
     cq = upd.get('callback_query') or {}
+    data = cq.get('data')
+    cb_id = cq.get('id')
     msg = cq.get('message') or {}
     chat = msg.get('chat') or {}
     chat_id = int(chat.get('id', 0) or 0)
     msg_id = int(msg.get('message_id', 0) or 0)
-    # data already set above
     if not data or not chat_id or not msg_id:
         return
+    # ---------------------------------
     # ---------------------------------
 
     cb = upd.get("callback_query") or {}
