@@ -11,6 +11,9 @@ from io import BytesIO
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import requests
 import pandas as pd
 
@@ -1732,10 +1735,54 @@ def run_poller():
                 handle_message(u)
 
 # ----------------------------- MAIN -----------------------------
+
+def start_health_server():
+    """Start a minimal HTTP server on PORT for Railway/Web-style deployments.
+
+    Railway "Web" services expect a process to bind to $PORT. If you deploy this
+    bot as a Web service, lack of an open port may cause the platform to stop
+    the container as "unhealthy".
+
+    If PORT is not set (or invalid), this function does nothing.
+    """
+    port_s = os.getenv("PORT")
+    if not port_s:
+        return
+    try:
+        port = int(port_s)
+    except Exception:
+        log.warning(f"[HEALTH] invalid PORT={port_s!r}; skipping health server")
+        return
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, fmt, *args):
+            # silence default http.server access logs
+            return
+
+    def _serve():
+        try:
+            httpd = HTTPServer(("0.0.0.0", port), _Handler)
+            log.info(f"[HEALTH] listening on 0.0.0.0:{port}")
+            httpd.serve_forever()
+        except Exception as e:
+            log.warning(f"[HEALTH] server failed: {e}")
+
+    t = threading.Thread(target=_serve, name="health_server", daemon=True)
+    t.start()
+
 def main():
     init_db()
     load_onzs_catalog()
     log.info('=== VERSION: ONZS + AI-GATE + BUTTONS + STATS ===')
+
+    # If deployed as a Web service, keep the platform health-checks satisfied.
+    start_health_server()
 
     if YAGPT_API_KEY and YAGPT_FOLDER_ID:
         log.info(f"[YAGPT] enabled | folder={YAGPT_FOLDER_ID} | model={YAGPT_MODEL}")
