@@ -1339,7 +1339,7 @@ def handle_callback_query(upd: Dict):
             answer_callback_query(cb_id, "OK")
             return
         if action == "set_aigate":
-            set_admin_mode(chat_id, uid, "set_aigate")
+            set_admin_mode(uid, "set_aigate")
             send_message(
                 chat_id,
                 f"🎚 AI‑gate порог (в процентах).\n\nТекущий: {MIN_AI_GATE:.1f}%\n\nВведи число от 0 до 100.",
