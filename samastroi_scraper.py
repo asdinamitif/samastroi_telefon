@@ -695,8 +695,41 @@ def save_admin_state(st):
 
 ADMIN_STATE = load_admin_state()
 
-def set_admin_mode(uid:int, mode:str):
-    ADMIN_STATE[str(uid)] = {"mode": mode, "ts": int(time.time())}
+def set_admin_mode(*args):
+    """Set per-user admin mode.
+    Supports signatures:
+      set_admin_mode(uid, mode)
+      set_admin_mode(chat_id, uid, mode)  # chat_id is ignored (kept for backward compatibility)
+    """
+    if len(args) == 2:
+        uid, mode = args
+    elif len(args) == 3:
+        _chat_id, uid, mode = args
+    else:
+        raise TypeError("set_admin_mode expected (uid, mode) or (chat_id, uid, mode)")
+    try:
+        uid = int(uid)
+    except Exception:
+        uid = int(str(uid).strip())
+    ADMIN_STATE[str(uid)] = {"mode": str(mode), "ts": int(time.time())}
+
+def clear_admin_mode(*args):
+    """Clear per-user admin mode.
+    Supports signatures:
+      clear_admin_mode(uid)
+      clear_admin_mode(chat_id, uid)  # chat_id is ignored
+    """
+    if len(args) == 1:
+        uid = args[0]
+    elif len(args) == 2:
+        _chat_id, uid = args
+    else:
+        raise TypeError("clear_admin_mode expected (uid) or (chat_id, uid)")
+    try:
+        uid = int(uid)
+    except Exception:
+        uid = int(str(uid).strip())
+    ADMIN_STATE.pop(str(uid), None)
     save_admin_state(ADMIN_STATE)
 
 def pop_admin_mode(uid:int):
@@ -1205,6 +1238,11 @@ def handle_message(upd: Dict):
             return
         target_uid = int(m_id.group(1))
     if mode == "set_aigate":
+        # If user entered a command while waiting for a threshold value, cancel input mode and process the command normally.
+        if text and text.startswith("/"):
+            clear_admin_mode(uid)
+            mode = None
+        
         raw = (text or "").strip().replace(",", ".")
         try:
             v = float(raw)
