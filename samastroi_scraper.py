@@ -1066,8 +1066,19 @@ def append_history(entry: Dict):
 
 # ----------------------------- CALLBACK HANDLER -----------------------------
 def handle_callback_query(upd: Dict):
+    # --- normalize callback update ---
+    cq = upd.get('callback_query') or {}
+    msg = cq.get('message') or {}
+    chat = msg.get('chat') or {}
+    chat_id = int(chat.get('id', 0) or 0)
+    msg_id = int(msg.get('message_id', 0) or 0)
+    # data already set above
+    if not data or not chat_id or not msg_id:
+        return
+    # ---------------------------------
+
     cb = upd.get("callback_query") or {}
-    data = cb.get("data") or ""
+    # data already set above
 
     # --- ADMIN PANEL CALLBACKS ---
     uid = get_sender_user_id(upd)
@@ -1309,8 +1320,7 @@ def handle_callback_query(upd: Dict):
 
     answer_callback(cb_id, "OK")
 
-# ----------------------------- COMMANDS -----------------------------
-def handle_message(upd: Dict):
+# ----------------------------- COMMANDS -----------------------------def handle_message(upd: Dict):
     # --- ensure chat_id is always defined ---
     msg = upd.get('message') or {}
     chat = msg.get('chat') or {}
