@@ -1546,7 +1546,7 @@ def poll_updates_loop():
         return
 
     try:
-        tg_post("deleteWebhook", {"drop_pending_updates": False})
+        tg_post("deleteWebhook", {"drop_pending_updates": True})
     except Exception:
         pass
 
@@ -1560,7 +1560,7 @@ def poll_updates_loop():
 
             if not data.get("ok"):
                 if data.get("error_code") == 409:
-                    log.error("getUpdates conflict (409). Another process is consuming updates for this BOT_TOKEN. Poller will retry in 60s.\nFix: ensure only ONE instance runs and no other bot/service uses getUpdates/webhook with the same token.")
+                    log.error("getUpdates conflict (409). Updates are being consumed elsewhere (another instance or active webhook) for this BOT_TOKEN. Poller will retry in 60s.\nFix: ensure ONLY ONE running instance for this token and webhook is deleted (deleteWebhook).")
                     time.sleep(60)
                     continue
                 log.error(f"getUpdates error: {data}")
@@ -1614,7 +1614,7 @@ def main():
 
     try:
         # poller + daily reports in daemon threads
-        if str(os.getenv("ENABLE_UPDATES_POLLER", "0")).strip().lower() in ("1", "true", "yes", "on"):
+        if str(os.getenv("ENABLE_UPDATES_POLLER", "1")).strip().lower() in ("1", "true", "yes", "on"):
             # Important: polling conflicts with any other instance using the same BOT_TOKEN, or with an active webhook.
             # If you need buttons/callbacks, ensure only ONE poller is running for this token.
             try:
@@ -1622,9 +1622,10 @@ def main():
                 log.info("[POLL] deleteWebhook(drop_pending_updates=True) OK")
             except Exception as e:
                 log.warning(f"[POLL] deleteWebhook failed: {e}")
+            log.info("[POLL] Updates poller enabled. /admin and buttons are active.")
             threading.Thread(target=poll_updates_loop, daemon=True).start()
         else:
-            log.info("[POLL] Updates poller disabled (ENABLE_UPDATES_POLLER=0). Scraper-only mode.")
+            log.info("[POLL] Updates poller disabled (set ENABLE_UPDATES_POLLER=0). Scraper-only mode.")
         threading.Thread(target=daily_reports_worker, daemon=True).start()
 
         while True:
