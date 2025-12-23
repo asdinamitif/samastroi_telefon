@@ -98,104 +98,111 @@ DEFAULT_CHANNELS = [
     "life_sergiev_posad"
 ]
 
-# --- External lists (repo/data/*.txt or /data/*.txt) ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def _resolve_data_file(*candidates: str) -> Optional[str]:
-    """Return first existing path among candidates (absolute or relative).
-    Looks in: as-is -> BASE_DIR -> BASE_DIR/data -> DATA_DIR.
-    """
-    for cand in candidates:
-        if not cand:
-            continue
-        if os.path.isabs(cand) and os.path.exists(cand):
-            return cand
-        for base in (BASE_DIR, os.path.join(BASE_DIR, "data"), DATA_DIR):
-            try:
-                p = os.path.join(base, cand)
-            except Exception:
-                continue
-            if os.path.exists(p):
-                return p
-    return None
+# --- Scraper configuration files (optional) ---
+# If CHANNEL_LIST/KEYWORDS env vars are empty, the scraper will load sources/keywords from files.
+# Supported paths:
+#   - /data/groups.txt and /data/keywords.txt (Railway volume)
+#   - /app/data/groups.txt and /app/data/keywords.txt (repo files copied into image)
+GROUPS_FILE = os.getenv("GROUPS_FILE", "").strip()
+KEYWORDS_FILE = os.getenv("KEYWORDS_FILE", "").strip()
 
-def _read_list_file(path: str) -> List[str]:
-    out: List[str] = []
+def _read_lines_file(path: str) -> List[str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                s = (line or "").strip()
-                if not s or s.startswith("#"):
-                    continue
-                out.append(s)
-    except Exception as e:
-        log.error(f"Failed to read list file {path}: {e}")
-    return out
+            return [ln.strip() for ln in f.read().splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    except Exception:
+        return []
 
-def normalize_channel_name(raw: str) -> str:
-    """Normalize any of: '@name', 'https://t.me/name', 't.me/name', 'name' -> 'name'."""
-    s = (raw or "").strip()
+def _find_first_existing(paths: List[str]) -> Optional[str]:
+    for p in paths:
+        try:
+            if p and os.path.isfile(p):
+                return p
+        except Exception:
+            pass
+    return None
+
+def _normalize_source(s: str) -> Optional[str]:
+    s = (s or "").strip()
     if not s:
-        return ""
+        return None
     s = s.replace("https://", "").replace("http://", "")
-    s = s.replace("t.me/", "").replace("t.me/s/", "").replace("/s/", "")
-    s = s.strip()
-    if s.startswith("@"):
-        s = s[1:]
-    # if user pasted post link like name/123 -> keep name only
-    s = s.split("/")[0].strip()
+    s = s.replace("t.me/s/", "t.me/").replace("t.me/", "")
+    s = s.lstrip("@").strip().strip("/")
+    if not s:
+        return None
+    # keep only username part before any query params
+    s = s.split("?")[0].split("#")[0]
     return s
 
-def load_groups_list() -> List[str]:
-    # Priority: ENV CHANNEL_LIST -> /data/groups.txt or repo data/groups.txt -> DEFAULT_CHANNELS
-    env_list = [normalize_channel_name(x) for x in os.getenv("CHANNEL_LIST", "").split(",") if x.strip()]
-    env_list = [x for x in env_list if x]
-    if env_list:
-        return env_list
+def load_channel_list() -> List[str]:
+    env = (os.getenv("CHANNEL_LIST", "") or "").strip()
+    if env:
+        items = [x.strip() for x in env.split(",") if x.strip()]
+        res = []
+        for it in items:
+            n = _normalize_source(it)
+            if n:
+                res.append(n)
+        return res
 
-    fp = _resolve_data_file("groups.txt")
+    candidate_files = []
+    if GROUPS_FILE:
+        candidate_files.append(GROUPS_FILE)
+    candidate_files += [os.path.join(DATA_DIR, "groups.txt"), "/app/data/groups.txt"]
+    fp = _find_first_existing(candidate_files)
     if fp:
-        items = [normalize_channel_name(x) for x in _read_list_file(fp)]
-        items = [x for x in items if x]
-        if items:
-            log.info(f"[SCRAPER] loaded groups from {fp}: {len(items)}")
-            return items
+        raw = _read_lines_file(fp)
+        res = []
+        for it in raw:
+            n = _normalize_source(it)
+            if n:
+                res.append(n)
+        if res:
+            log.info(f"[CFG] channels loaded from {fp}: {len(res)}")
+            return res
 
+    log.info("[CFG] channels fallback to DEFAULT_CHANNELS")
     return list(DEFAULT_CHANNELS)
 
-DEFAULT_KEYWORDS = [
-    # core
-    "стройка", "строительство", "строит", "строят", "строятcя", "строительный",
-    "самострой", "самостро", "самосострой", "незаконная стройка", "незаконное строительство",
-    "котлован", "фундамент", "арматура", "бетон", "опалубка", "плита", "перекрытие",
-    "кран", "башенный кран", "забор", "ограждение", "пристройка", "надстройка", "реконструкция",
-    "склад", "ангар", "павильон",
-    # permits / control signals
-    "разрешение на строительство", "рнс", "гпзу", "зос", "стройнадзор",
-]
-
-CADASTRAL_RE = re.compile(r"\b\d{2}:\d{2}:\d{6,7}:\d+\b")
-COORD_RE = re.compile(r"\b\d{1,2}\.\d{4,7}\s*,\s*\d{1,2}\.\d{4,7}\b")
-
 def load_keywords_list() -> List[str]:
-    # Priority: ENV KEYWORDS (csv) -> /data/keywords.txt or repo data/keywords.txt -> DEFAULT_KEYWORDS
-    env_kw = [x.strip() for x in os.getenv("KEYWORDS", "").split(",") if x.strip()]
-    if env_kw:
-        return env_kw
+    env = (os.getenv("KEYWORDS", "") or "").strip()
+    if env:
+        # allow comma or newline separated
+        parts = []
+        for chunk in env.split(","):
+            chunk = chunk.strip()
+            if chunk:
+                parts.append(chunk)
+        return parts
 
-    fp = _resolve_data_file("keywords.txt")
+    candidate_files = []
+    if KEYWORDS_FILE:
+        candidate_files.append(KEYWORDS_FILE)
+    candidate_files += [os.path.join(DATA_DIR, "keywords.txt"), "/app/data/keywords.txt"]
+    fp = _find_first_existing(candidate_files)
     if fp:
-        items = [x.strip() for x in _read_list_file(fp)]
-        items = [x for x in items if x]
-        if items:
-            log.info(f"[SCRAPER] loaded keywords from {fp}: {len(items)}")
-            return items
+        res = _read_lines_file(fp)
+        if res:
+            log.info(f"[CFG] keywords loaded from {fp}: {len(res)}")
+            return res
 
-    return list(DEFAULT_KEYWORDS)
+    # Fallback keywords (kept minimal; prefer keywords.txt)
+    return [
+        "стройка", "строительство", "самострой", "самосострой", "незаконная стройка",
+        "котлован", "фундамент", "кран", "экскаватор", "застройщик"
+    ]
 
-CHANNEL_LIST = load_groups_list()
+CHANNEL_LIST = load_channel_list()
 KEYWORDS = load_keywords_list()
 
+# Extra high-signal patterns (work even without keywords)
+CADASTRE_RE = re.compile(r"\b\d{2}:\d{2}:\d{6,8}:\d+\b")
+COORD_RE = re.compile(r"\b\d{2}\.\d{3,}\s*,\s*\d{2}\.\d{3,}\b")
+
+# CHANNEL_LIST is loaded via load_channel_list() above
+# KEYWORDS are loaded via load_keywords_list() above
 KEYWORDS_LOWER = [k.lower() for k in KEYWORDS]
 
 
@@ -398,31 +405,8 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 def detect_keywords(text: str) -> List[str]:
-    """Return list of matched keywords / signals.
-
-    In addition to substring keywords, treats cadastral numbers and координаты as strong signals,
-    because many source posts contain only those identifiers.
-    """
-    low = (text or "").lower()
-
-    hits = [kw for kw in KEYWORDS_LOWER if kw and kw in low]
-
-    # Strong identifier signals
-    if CADASTRAL_RE.search(text or ""):
-        hits.append("кадастровый номер")
-    if COORD_RE.search(text or ""):
-        hits.append("координаты")
-
-    # de-dup preserving order
-    out: List[str] = []
-    seen = set()
-    for h in hits:
-        hh = (h or "").strip()
-        if not hh or hh in seen:
-            continue
-        seen.add(hh)
-        out.append(hh)
-    return out
+    low = text.lower()
+    return [kw for kw in KEYWORDS_LOWER if kw in low]
 
 def parse_tg_datetime(dt_str: str) -> int:
     """
@@ -993,6 +977,13 @@ def process_channel(channel_username: str) -> List[Dict]:
     for p in posts:
         text = normalize_text(p["text"])
         found = detect_keywords(text)
+        # High-signal patterns: cadastral numbers and coordinates (often in media captions)
+        if CADASTRE_RE.search(text):
+            found.append("кадастр")
+        if COORD_RE.search(text):
+            found.append("координаты")
+        # de-dup
+        found = list(dict.fromkeys([f for f in found if f]))
         if not found:
             continue
         if not mark_seen(channel_username, p["id"], p["timestamp"]):
@@ -1548,7 +1539,17 @@ def main():
 
     try:
         # poller + daily reports in daemon threads
-        threading.Thread(target=poll_updates_loop, daemon=True).start()
+        if str(os.getenv("ENABLE_UPDATES_POLLER", "0")).strip().lower() in ("1", "true", "yes", "on"):
+            # Important: polling conflicts with any other instance using the same BOT_TOKEN, or with an active webhook.
+            # If you need buttons/callbacks, ensure only ONE poller is running for this token.
+            try:
+                tg_post("deleteWebhook", {"drop_pending_updates": True})
+                log.info("[POLL] deleteWebhook(drop_pending_updates=True) OK")
+            except Exception as e:
+                log.warning(f"[POLL] deleteWebhook failed: {e}")
+            threading.Thread(target=poll_updates_loop, daemon=True).start()
+        else:
+            log.info("[POLL] Updates poller disabled (ENABLE_UPDATES_POLLER=0). Scraper-only mode.")
         threading.Thread(target=daily_reports_worker, daemon=True).start()
 
         while True:
