@@ -1,1170 +1,787 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SAMASTROI SCRAPER (Railway-ready, OFFICIAL)
+- Web-scrapes t.me/s/<channel> pages
+- Builds "cards", enriches with YandexGPT probability (JSON response)
+- Auto-filters by probability threshold
+- Sends cards to a Telegram group with inline action buttons
+- Global decision lock: once any admin clicks ("В работу / Неверно / Привязать") buttons disappear for everyone
+- Training log (JSONL) + decisions & daily aggregates (SQLite) stored on Railway Volume
+- Admin panel: threshold, role management, stats, log, PNG plot, XLSX/PDF reports, KPI dashboard
+- Protection from double poller: single-instance lock on shared volume (prevents 409 getUpdates conflict)
+- "Self-training" (practical): few-shot retrieval + adaptive calibration weights (per-channel bias) stored in DB
+"""
+
 import os
 import re
 import json
 import time
-import math
-import random
+import uuid
 import sqlite3
 import logging
-import hashlib
-from io import BytesIO
-from typing import Optional, Dict, Any, List, Tuple
-from datetime import datetime, timedelta
-
 import threading
-import asyncio
-import base64
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-# Optional: Telethon user-client for reading public channels/groups without adding the bot
-try:
-    from telethon import TelegramClient
-except Exception:
-    TelegramClient = None
+from datetime import datetime, timezone, date, timedelta
+from typing import Dict, List, Optional, Tuple
 
 import requests
-import pandas as pd
+from bs4 import BeautifulSoup
 
-# ----------------------------- LOGGING -----------------------------
+# matplotlib (PNG plot)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# Reports
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("samastroi")
+log = logging.getLogger("samastroi_scraper")
 
-
-
-# ----------------- SINGLE INSTANCE LOCK -----------------
-def acquire_lock() -> bool:
-    """Create a lock file in DATA_DIR to prevent running multiple pollers."""
-    try:
-        data_dir = globals().get("DATA_DIR") or os.getenv("DATA_DIR", "/data")
-        os.makedirs(data_dir, exist_ok=True)
-        lock_path = os.path.join(data_dir, ".poller.lock")
-
-        # stale lock: 10 minutes
-        if os.path.exists(lock_path):
-            try:
-                if (time.time() - os.path.getmtime(lock_path)) > 600:
-                    os.remove(lock_path)
-                else:
-                    log.error("Lock exists: another poller is running. Exiting.")
-                    return False
-            except Exception:
-                log.error("Lock exists: another poller is running. Exiting.")
-                return False
-
-        # atomic create
-        try:
-            with open(lock_path, "x", encoding="utf-8") as f:
-                f.write(str(os.getpid()))
-        except FileExistsError:
-            log.error("Lock exists: another poller is running. Exiting.")
-            return False
-
-        log.info(f"Lock acquired: {lock_path}")
-        return True
-    except Exception as e:
-        log.error(f"Lock acquire error: {e}")
-        return True  # best-effort: do not hard fail
-
-
-def release_lock():
-    try:
-        data_dir = globals().get("DATA_DIR") or os.getenv("DATA_DIR", "/data")
-        lock_path = os.path.join(data_dir, ".poller.lock")
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
-    except Exception:
-        pass
-# --------------------------------------------------------
-
-def get_sender_user_id(update: dict) -> int:
-    """Returns Telegram user id of the sender for messages/callbacks."""
-    try:
-        if update.get("message") and update["message"].get("from"):
-            return int(update["message"]["from"].get("id"))
-        if update.get("callback_query") and update["callback_query"].get("from"):
-            return int(update["callback_query"]["from"].get("id"))
-    except Exception:
-        pass
-    return 0
-
-# ----------------------------- CONFIG -----------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0") or "0")
-
-DATA_DIR = os.getenv("DATA_DIR", "/data").strip()
-
-# --------------------------------------------
-#          ROLES PERSISTENCE (/data)
-# --------------------------------------------
-ROLES_PATH = os.path.join(DATA_DIR, "roles.json")
-
-def _parse_ids_csv(v: str):
-    if not v:
-        return []
-    out = []
-    for x in str(v).split(","):
-        x = x.strip()
-        if not x:
-            continue
-        if re.fullmatch(r"-?\d+", x):
-            try:
-                out.append(int(x))
-            except Exception:
-                pass
-    return out
-
-
-def load_roles() -> dict:
-    """Load roles (admins/moderators/leadership/report_targets) with persistence.
-
-    Priority logic (safe & predictable):
-    1) Start from ENV lists (ADMIN_IDS/MODERATOR_IDS/LEADERSHIP etc).
-    2) If /data/roles.json exists, MERGE it with ENV (additive). It must not delete ENV access.
-    This prevents the classic situation where an old roles.json blocks access after redeploy.
-    """
-    base = {
-        "admins": _parse_ids_csv(os.getenv("ADMIN_IDS", "")) or _parse_ids_csv(os.getenv("ADMINS", "")),
-        "moderators": _parse_ids_csv(os.getenv("MODERATOR_IDS", "")) or _parse_ids_csv(os.getenv("MODERATORS", "")),
-        "leadership": _parse_ids_csv(os.getenv("LEAD_IDS", "")) or _parse_ids_csv(os.getenv("LEADERSHIP", "")),
-        "report_targets": _parse_ids_csv(os.getenv("REPORT_TARGETS", "")),
-    }
-
-    try:
-        if os.path.exists(ROLES_PATH):
-            with open(ROLES_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f) or {}
-            for k in list(base.keys()):
-                file_list = data.get(k, [])
-                if isinstance(file_list, list):
-                    merged = []
-                    seen = set()
-                    for src in (base.get(k, []), file_list):
-                        for i in src:
-                            try:
-                                ii = int(i)
-                            except Exception:
-                                continue
-                            if ii not in seen:
-                                seen.add(ii)
-                                merged.append(ii)
-                    base[k] = merged
-    except Exception as e:
-        log.error(f"[ROLES] load error: {e}")
-
-    # Persist merged result (so that UI changes are remembered)
-    save_roles(base)
-    return base
-
-
-
-
-def save_roles(data: dict) -> None:
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(ROLES_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        log.info(f"[ROLES] saved: {ROLES_PATH}")
-    except Exception as e:
-        log.error(f"[ROLES] save error: {e}")
-
-ROLES = load_roles()
-
-def roles_refresh_globals():
-    global ADMINS, MODERATORS, LEADERSHIP
-    ADMINS = ROLES.get("admins", [])
-    MODERATORS = ROLES.get("moderators", [])
-    LEADERSHIP = ROLES.get("leadership", [])
-
-roles_refresh_globals()
-
-def is_privileged(uid: int) -> bool:
-    return uid in ROLES.get("admins", []) or uid in ROLES.get("moderators", []) or uid in ROLES.get("leadership", [])
-
-def is_admin(uid: int) -> bool:
-    return uid in ROLES.get("admins", [])
+DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300") or "300")
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15") or "15")
+CARDS_DIR = os.path.join(DATA_DIR, "cards")
+os.makedirs(CARDS_DIR, exist_ok=True)
 
-# Telethon source reader (MTProto). Works for public chats without adding the bot.
-TG_API_ID = int(os.getenv("TG_API_ID", "0") or "0")
-TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
-TG_SESSION_B64 = os.getenv("TG_SESSION_B64", "").strip()
-TG_SESSION_PATH = os.getenv("TG_SESSION_PATH", "").strip()  # optional
-SOURCE_CHATS = [s.strip() for s in (os.getenv("SOURCE_CHATS", "@BIGTESTING197") or "").split(",") if s.strip()]
+REPORTS_DIR = os.path.join(DATA_DIR, "reports")
+os.makedirs(REPORTS_DIR, exist_ok=True)
 
-# IMPORTANT: AI gate; if YandexGPT is unavailable or refuses, card is not sent
-MIN_AI_GATE = float(os.getenv("MIN_AI_GATE", "5"))
-# Allow runtime override from /data/config.json (0..100 percent)
-try:
-    MIN_AI_GATE = float(max(0.0, min(100.0, get_cfg_float("min_ai_gate", MIN_AI_GATE))))
-except Exception:
-    pass
+TRAINING_DATASET = os.path.join(DATA_DIR, "training_dataset.jsonl")
+HISTORY_CARDS = os.path.join(DATA_DIR, "history_cards.jsonl")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+DB_PATH = os.path.join(DATA_DIR, "scraper.db")
+LOCK_PATH = os.path.join(DATA_DIR, ".poller.lock")
 
+def _ensure_file(path: str, default: str = ""):
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(default)
 
-# YandexGPT
-YAGPT_API_KEY = os.getenv("YAGPT_API_KEY", "").strip()
-YAGPT_FOLDER_ID = os.getenv("YAGPT_FOLDER_ID", "").strip()
-YAGPT_MODEL = os.getenv("YAGPT_MODEL", f"gpt://{YAGPT_FOLDER_ID}/yandexgpt/latest").strip()
+_ensure_file(TRAINING_DATASET)
+_ensure_file(HISTORY_CARDS)
+_ensure_file(SETTINGS_FILE, "{}")
 
-# Telegram
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
-# Roles (supports legacy env names: ADMIN_IDS/MODERATOR_IDS/LEAD_IDS)
-def _parse_ids(*names: str, default: str = "") -> list[int]:
-    """Parse comma-separated telegram user IDs from the first non-empty env var name."""
-    for n in names:
-        v = os.getenv(n, "")
-        if v and v.strip():
-            return [int(x) for x in v.split(",") if x.strip().isdigit()]
-    return [int(x) for x in default.split(",") if x.strip().isdigit()]
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1003502443229"))  # group/channel for cards
 
-# Keep defaults for safety (won't be used if env vars are set)
-ADMINS = _parse_ids("ADMINS", "ADMIN_IDS", default="272923789,398960707")
-MODERATORS = _parse_ids("MODERATORS", "MODERATOR_IDS", default="777464055,978125225")
-LEADERSHIP = _parse_ids("LEADERSHIP", "LEAD_IDS", default="5685586625")
+# from user:
+DEFAULT_LEADERSHIP = [5685586625]
+DEFAULT_ADMINS = [272923789, 398960707]
+DEFAULT_MODERATORS = [978125225, 777464055]
 
-# Persistent files
-SCRAPER_DB = os.path.join(DATA_DIR, "scraper.db")
-HISTORY_CARDS = os.path.join(DATA_DIR, "training_dataset.jsonl")
-CHANNEL_BIAS_FILE = os.path.join(DATA_DIR, "channel_bias.json")
-KEYWORD_BIAS_FILE = os.path.join(DATA_DIR, "keyword_bias.json")
+YAGPT_API_KEY = os.getenv("YAGPT_API_KEY", "").strip()
+YAGPT_FOLDER_ID = os.getenv("YAGPT_FOLDER_ID", "").strip()
+YAGPT_ENDPOINT = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+YAGPT_MODEL = os.getenv("YAGPT_MODEL", "gpt://{folder_id}/yandexgpt/latest")
 
-# ONZS files
-ONZS_XLSX = os.getenv("ONZS_XLSX", "Номера ОНзС.xlsx").strip()
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
+MAX_TRAIN_LOG = int(os.getenv("MAX_TRAIN_LOG", "50"))
+TARGET_DATASET_SIZE = int(os.getenv("TARGET_DATASET_SIZE", "5000"))
+DEFAULT_THRESHOLD = int(os.getenv("DEFAULT_THRESHOLD", "0"))
 
-# Base dir / path resolver (Railway may run with different CWD)
+DEFAULT_CHANNELS = [
+    "tipkhimki", "lobnya", "dolgopacity", "vkhimki",
+    "podslushanovsolnechnogorske", "klingorod", "mspeaks",
+    "pushkino_official", "podmoskow", "trofimovonline",
+    "Tipichnoe_Pushkino", "chp_sergiev_posad", "kraftyou",
+    "kontext_channel", "podslushano_ivanteevka", "pushkino_live",
+    "life_sergiev_posad"
+]
+
+# --- External lists (repo/data/*.txt or /data/*.txt) ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def resolve_path(p: str) -> str:
-    """Resolve relative paths against common locations.
-    Order: BASE_DIR -> CWD -> DATA_DIR.
+def _resolve_data_file(*candidates: str) -> Optional[str]:
+    """Return first existing path among candidates (absolute or relative).
+    Looks in: as-is -> BASE_DIR -> BASE_DIR/data -> DATA_DIR.
     """
-    if not p:
-        return p
-    if os.path.isabs(p):
-        return p
-
-    # 1) Next to this script
-    cand1 = os.path.join(BASE_DIR, p)
-    if os.path.exists(cand1):
-        return cand1
-
-    # 2) Current working directory
-    cand2 = os.path.join(os.getcwd(), p)
-    if os.path.exists(cand2):
-        return cand2
-
-    # 3) Data dir volume
-    cand3 = os.path.join(DATA_DIR, os.path.basename(p))
-    if os.path.exists(cand3):
-        return cand3
-
-    return p
-
-def debug_paths_for_file(p: str):
-    """Log helpful diagnostics to understand why a file is not found."""
-    try:
-        log.error(f"[PATH] missing file: {p}")
-        log.error(f"[PATH] CWD={os.getcwd()} | BASE_DIR={BASE_DIR} | DATA_DIR={DATA_DIR}")
-        for label, d in [("CWD", os.getcwd()), ("BASE_DIR", BASE_DIR), ("DATA_DIR", DATA_DIR)]:
+    for cand in candidates:
+        if not cand:
+            continue
+        if os.path.isabs(cand) and os.path.exists(cand):
+            return cand
+        for base in (BASE_DIR, os.path.join(BASE_DIR, "data"), DATA_DIR):
             try:
-                items = os.listdir(d)
-                # don't spam: show only first 50
-                shown = items[:50]
-                log.error(f"[PATH] {label} list (first {len(shown)}/{len(items)}): {shown}")
-            except Exception as e:
-                log.error(f"[PATH] {label} list error: {e}")
-    except Exception:
-        pass
-ONZS_TRAIN_FILE = os.path.join(DATA_DIR, "onzs_training.jsonl")
+                p = os.path.join(base, cand)
+            except Exception:
+                continue
+            if os.path.exists(p):
+                return p
+    return None
 
-# Lock file to avoid 409 / multi pollers
-LOCK_FILE = os.path.join(DATA_DIR, ".poller.lock")
-
-# ----------------------------- STOP TOPICS (anti-news/politics noise) -----------------------------
-STOP_TOPICS = [
-    "путин", "украин", "войн", "политик", "санкц", "выбор", "митинг", "байден",
-    "трамп", "хамас", "израил", "террор", "дрон", "ракет", "фронт", "мобилиз",
-    "наступлен", "обстрел", "всу", "армия", "нато", "премьер", "президент",
-]
-
-# Construction signal words (soft allow)
-CONSTR_HINTS = [
-    "строй", "строит", "строител", "самостро", "котлован", "фундамент", "арматур",
-    "бетон", "плита", "монолит", "перекрыт", "этаж", "кран", "опалуб", "забор",
-    "пристрой", "надстрой", "реконструкц", "капремонт", "разрешен", "рнс", "гпзу",
-]
-
-# ----------------------------- UTIL -----------------------------
-def now_ts() -> int:
-    return int(time.time())
-
-def is_admin(uid: int) -> bool:
-    return uid in ADMINS
-
-def is_moderator(uid: int) -> bool:
-    return uid in MODERATORS or uid in ADMINS
-
-def is_lead(uid: int) -> bool:
-    return uid in LEADERSHIP or uid in ADMINS
-
-def sha1(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
-
-def safe_json(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False)
-
-def append_jsonl(path: str, record: Dict):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-def read_last_jsonl(path: str, limit: int = 50) -> List[Dict]:
-    if not os.path.exists(path):
-        return []
-    out = []
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()[-limit:]
-    for ln in lines:
-        ln = ln.strip()
-        if not ln:
-            continue
-        try:
-            out.append(json.loads(ln))
-        except Exception:
-            continue
+def _read_list_file(path: str) -> List[str]:
+    out: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = (line or "").strip()
+                if not s or s.startswith("#"):
+                    continue
+                out.append(s)
+    except Exception as e:
+        log.error(f"Failed to read list file {path}: {e}")
     return out
 
-# ----------------------------- DB -----------------------------
+def normalize_channel_name(raw: str) -> str:
+    """Normalize any of: '@name', 'https://t.me/name', 't.me/name', 'name' -> 'name'."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    s = s.replace("https://", "").replace("http://", "")
+    s = s.replace("t.me/", "").replace("t.me/s/", "").replace("/s/", "")
+    s = s.strip()
+    if s.startswith("@"):
+        s = s[1:]
+    # if user pasted post link like name/123 -> keep name only
+    s = s.split("/")[0].strip()
+    return s
+
+def load_groups_list() -> List[str]:
+    # Priority: ENV CHANNEL_LIST -> /data/groups.txt or repo data/groups.txt -> DEFAULT_CHANNELS
+    env_list = [normalize_channel_name(x) for x in os.getenv("CHANNEL_LIST", "").split(",") if x.strip()]
+    env_list = [x for x in env_list if x]
+    if env_list:
+        return env_list
+
+    fp = _resolve_data_file("groups.txt")
+    if fp:
+        items = [normalize_channel_name(x) for x in _read_list_file(fp)]
+        items = [x for x in items if x]
+        if items:
+            log.info(f"[SCRAPER] loaded groups from {fp}: {len(items)}")
+            return items
+
+    return list(DEFAULT_CHANNELS)
+
+DEFAULT_KEYWORDS = [
+    # core
+    "стройка", "строительство", "строит", "строят", "строятcя", "строительный",
+    "самострой", "самостро", "самосострой", "незаконная стройка", "незаконное строительство",
+    "котлован", "фундамент", "арматура", "бетон", "опалубка", "плита", "перекрытие",
+    "кран", "башенный кран", "забор", "ограждение", "пристройка", "надстройка", "реконструкция",
+    "склад", "ангар", "павильон",
+    # permits / control signals
+    "разрешение на строительство", "рнс", "гпзу", "зос", "стройнадзор",
+]
+
+CADASTRAL_RE = re.compile(r"\b\d{2}:\d{2}:\d{6,7}:\d+\b")
+COORD_RE = re.compile(r"\b\d{1,2}\.\d{4,7}\s*,\s*\d{1,2}\.\d{4,7}\b")
+
+def load_keywords_list() -> List[str]:
+    # Priority: ENV KEYWORDS (csv) -> /data/keywords.txt or repo data/keywords.txt -> DEFAULT_KEYWORDS
+    env_kw = [x.strip() for x in os.getenv("KEYWORDS", "").split(",") if x.strip()]
+    if env_kw:
+        return env_kw
+
+    fp = _resolve_data_file("keywords.txt")
+    if fp:
+        items = [x.strip() for x in _read_list_file(fp)]
+        items = [x for x in items if x]
+        if items:
+            log.info(f"[SCRAPER] loaded keywords from {fp}: {len(items)}")
+            return items
+
+    return list(DEFAULT_KEYWORDS)
+
+CHANNEL_LIST = load_groups_list()
+KEYWORDS = load_keywords_list()
+
+KEYWORDS_LOWER = [k.lower() for k in KEYWORDS]
+
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
 def init_db():
-    con = sqlite3.connect(SCRAPER_DB)
-    cur = con.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cards (
+    conn = db()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS seen_posts (
+            channel TEXT NOT NULL,
+            post_id TEXT NOT NULL,
+            first_seen_ts INTEGER NOT NULL,
+            PRIMARY KEY (channel, post_id)
+        );
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS card_decisions (
             card_id TEXT PRIMARY KEY,
-            created_ts INTEGER,
-            payload TEXT
-        )
-        """
+            decision TEXT NOT NULL,
+            decided_by INTEGER NOT NULL,
+            decided_ts INTEGER NOT NULL
+        );
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS train_daily (
+            day TEXT PRIMARY KEY,
+            total INTEGER NOT NULL,
+            work INTEGER NOT NULL,
+            wrong INTEGER NOT NULL,
+            attach INTEGER NOT NULL
+        );
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_roles (
+            user_id INTEGER PRIMARY KEY,
+            role TEXT NOT NULL
+        );
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS model_params (
+            key TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL
+        );
+    """)
+
+    # seed roles if empty
+    cnt = int(conn.execute("SELECT COUNT(*) FROM user_roles;").fetchone()[0] or 0)
+    if cnt == 0:
+        for uid in DEFAULT_LEADERSHIP:
+            conn.execute("INSERT OR REPLACE INTO user_roles(user_id, role) VALUES (?, ?);", (int(uid), "leadership"))
+        for uid in DEFAULT_ADMINS:
+            conn.execute("INSERT OR REPLACE INTO user_roles(user_id, role) VALUES (?, ?);", (int(uid), "admin"))
+        for uid in DEFAULT_MODERATORS:
+            conn.execute("INSERT OR REPLACE INTO user_roles(user_id, role) VALUES (?, ?);", (int(uid), "moderator"))
+
+    conn.execute(
+        "INSERT OR IGNORE INTO model_params(key, value_json) VALUES (?, ?);",
+        ("threshold", json.dumps({"value": DEFAULT_THRESHOLD}, ensure_ascii=False))
     )
-    con.commit()
-    con.close()
-
-def save_card(card: Dict):
-    con = sqlite3.connect(SCRAPER_DB)
-    cur = con.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO cards(card_id, created_ts, payload) VALUES (?, ?, ?)",
-        (card["card_id"], int(card.get("created_ts", now_ts())), json.dumps(card, ensure_ascii=False)),
+    # weights: per-channel bias in probability points ([-25..25]) + label weights for aggregation
+    conn.execute(
+        "INSERT OR IGNORE INTO model_params(key, value_json) VALUES (?, ?);",
+        ("weights", json.dumps({"channels": {}, "label_weights": {"work": 1.0, "wrong": 1.0, "attach": 1.0}}, ensure_ascii=False))
     )
-    con.commit()
-    con.close()
 
-def load_card(card_id: str) -> Optional[Dict]:
-    con = sqlite3.connect(SCRAPER_DB)
-    cur = con.cursor()
-    cur.execute("SELECT payload FROM cards WHERE card_id=?", (card_id,))
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return None
-    try:
-        return json.loads(row[0])
-    except Exception:
-        return None
+    conn.commit()
+    conn.close()
 
-# ----------------------------- BIAS (channel/keyword) -----------------------------
-def load_json_file(path: str, default: Any):
-    if not os.path.exists(path):
-        return default
+init_db()
+
+
+def load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
 
-def save_json_file(path: str, obj: Any):
-    with open(path, "w", encoding="utf-8") as f:
+def save_json(path: str, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
-CHANNEL_BIAS = load_json_file(CHANNEL_BIAS_FILE, {})
-KEYWORD_BIAS = load_json_file(KEYWORD_BIAS_FILE, {})
+def load_settings() -> Dict:
+    return load_json(SETTINGS_FILE, {})
+
+def save_settings(s: Dict):
+    save_json(SETTINGS_FILE, s)
+
+def get_prob_threshold() -> int:
+    s = load_settings()
+    try:
+        v = int(s.get("prob_threshold", DEFAULT_THRESHOLD))
+        return max(0, min(100, v))
+    except Exception:
+        return DEFAULT_THRESHOLD
+
+def set_prob_threshold(v: int):
+    v = max(0, min(100, int(v)))
+    s = load_settings()
+    s["prob_threshold"] = v
+    save_settings(s)
+
+def get_update_offset() -> int:
+    s = load_settings()
+    try:
+        return int(s.get("update_offset", 0))
+    except Exception:
+        return 0
+
+def set_update_offset(v: int):
+    s = load_settings()
+    s["update_offset"] = int(v)
+    save_settings(s)
+
+def get_role(user_id: int) -> Optional[str]:
+    conn = db()
+    row = conn.execute("SELECT role FROM user_roles WHERE user_id=?;", (int(user_id),)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def is_admin(user_id: int) -> bool:
+    return get_role(int(user_id)) == "admin"
+
+def is_moderator(user_id: int) -> bool:
+    return get_role(int(user_id)) == "moderator"
+
+def is_leadership(user_id: int) -> bool:
+    return get_role(int(user_id)) == "leadership"
+
+def list_users_by_role(role: str) -> List[int]:
+    conn = db()
+    rows = conn.execute("SELECT user_id FROM user_roles WHERE role=? ORDER BY user_id;", (role,)).fetchall()
+    conn.close()
+    return [int(r[0]) for r in rows]
+
+def upsert_role(user_id: int, role: str) -> None:
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO user_roles(user_id, role) VALUES (?, ?);", (int(user_id), role))
+    conn.commit()
+    conn.close()
+
+def remove_role(user_id: int) -> None:
+    conn = db()
+    conn.execute("DELETE FROM user_roles WHERE user_id=?;", (int(user_id),))
+    conn.commit()
+    conn.close()
+
+def add_admin(user_id: int): upsert_role(int(user_id), "admin")
+def add_moderator(user_id: int): upsert_role(int(user_id), "moderator")
+def add_leadership(user_id: int): upsert_role(int(user_id), "leadership")
+
+def remove_admin(user_id: int): remove_role(int(user_id))
+def remove_moderator(user_id: int): remove_role(int(user_id))
+def remove_leadership(user_id: int): remove_role(int(user_id))
+
+def acquire_lock_or_exit() -> None:
+    """
+    Prevent multiple instances from running getUpdates poller on Railway volume.
+    """
+    try:
+        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        log.info(f"Lock acquired: {LOCK_PATH}")
+    except FileExistsError:
+        log.error("Another instance holds poller lock. Exiting (prevents 409 getUpdates conflict).")
+        raise SystemExit(0)
+
+def release_lock():
+    try:
+        if os.path.exists(LOCK_PATH):
+            os.remove(LOCK_PATH)
+            log.info("Lock released.")
+    except Exception:
+        pass
+
+def now_ts() -> int:
+    return int(time.time())
+
+def append_jsonl(path: str, obj: Dict):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+def normalize_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = text.replace("\n", " ").replace("\t", " ")
+    text = " ".join(text.split())
+    return text.strip()
+
+def detect_keywords(text: str) -> List[str]:
+    """Return list of matched keywords / signals.
+
+    In addition to substring keywords, treats cadastral numbers and координаты as strong signals,
+    because many source posts contain only those identifiers.
+    """
+    low = (text or "").lower()
+
+    hits = [kw for kw in KEYWORDS_LOWER if kw and kw in low]
+
+    # Strong identifier signals
+    if CADASTRAL_RE.search(text or ""):
+        hits.append("кадастровый номер")
+    if COORD_RE.search(text or ""):
+        hits.append("координаты")
+
+    # de-dup preserving order
+    out: List[str] = []
+    seen = set()
+    for h in hits:
+        hh = (h or "").strip()
+        if not hh or hh in seen:
+            continue
+        seen.add(hh)
+        out.append(hh)
+    return out
+
+def parse_tg_datetime(dt_str: str) -> int:
+    """
+    Telegram embeds: <time datetime="2025-12-14T16:27:14+00:00">
+    Convert to unix ts.
+    """
+    if not dt_str:
+        return now_ts()
+    try:
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return now_ts()
+
+
+def _get_model_param(key: str, default_obj: Dict) -> Dict:
+    conn = db()
+    row = conn.execute("SELECT value_json FROM model_params WHERE key=?;", (key,)).fetchone()
+    conn.close()
+    if not row:
+        return default_obj
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return default_obj
+
+def _set_model_param(key: str, obj: Dict) -> None:
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO model_params(key, value_json) VALUES (?, ?);", (key, json.dumps(obj, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
 
 def get_channel_bias(channel: str) -> float:
+    w = _get_model_param("weights", {"channels": {}, "label_weights": {}})
     try:
-        return float(CHANNEL_BIAS.get(channel, 0.0))
+        return float(w.get("channels", {}).get(channel, 0.0))
     except Exception:
         return 0.0
 
-def get_keyword_bias_points(text: str) -> float:
-    total = 0.0
-    low = text.lower()
-    for k, v in KEYWORD_BIAS.items():
-        if k and k in low:
+def update_channel_bias(channel: str, label: str) -> None:
+    """
+    Adaptive calibration:
+    - If admins often mark channel posts as "work/attach" -> increase bias (more aggressive)
+    - If often "wrong" -> decrease bias
+    Stored as +/- probability points.
+    """
+    w = _get_model_param("weights", {"channels": {}, "label_weights": {"work": 1.0, "wrong": 1.0, "attach": 1.0}})
+    ch = w.setdefault("channels", {})
+    cur = float(ch.get(channel, 0.0) or 0.0)
+
+    step = 1.5  # points per decision
+    if label in ("work", "attach"):
+        cur += step
+    elif label == "wrong":
+        cur -= step
+
+    cur = max(-25.0, min(25.0, cur))
+    ch[channel] = round(cur, 2)
+    _set_model_param("weights", w)
+
+
+def mark_seen(channel: str, post_id: str, ts: int) -> bool:
+    conn = db()
+    try:
+        conn.execute("INSERT OR IGNORE INTO seen_posts(channel, post_id, first_seen_ts) VALUES(?,?,?)", (channel, post_id, ts))
+        changed = conn.execute("SELECT changes()").fetchone()[0] == 1
+        return changed
+    finally:
+        conn.close()
+
+def decision_exists(card_id: str) -> Optional[Tuple[str, int, int]]:
+    conn = db()
+    try:
+        row = conn.execute("SELECT decision, decided_by, decided_ts FROM card_decisions WHERE card_id=?", (card_id,)).fetchone()
+        return row if row else None
+    finally:
+        conn.close()
+
+def set_decision(card_id: str, decision: str, user_id: int) -> bool:
+    """
+    Idempotent global decision: only first admin click is accepted.
+    """
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE;")
+        row = conn.execute("SELECT card_id FROM card_decisions WHERE card_id=?", (card_id,)).fetchone()
+        if row:
+            conn.execute("COMMIT;")
+            return False
+        conn.execute(
+            "INSERT INTO card_decisions(card_id, decision, decided_by, decided_ts) VALUES(?,?,?,?)",
+            (card_id, decision, int(user_id), now_ts()),
+        )
+        conn.execute("COMMIT;")
+        return True
+    except Exception:
+        conn.execute("ROLLBACK;")
+        raise
+    finally:
+        conn.close()
+
+def update_train_daily(label: str):
+    d = date.today().isoformat()
+    conn = db()
+    try:
+        row = conn.execute("SELECT total, work, wrong, attach FROM train_daily WHERE day=?", (d,)).fetchone()
+        if row:
+            total, work, wrong, attach = row
+        else:
+            total = work = wrong = attach = 0
+        total += 1
+        if label == "work":
+            work += 1
+        elif label == "wrong":
+            wrong += 1
+        elif label == "attach":
+            attach += 1
+        conn.execute(
+            "INSERT OR REPLACE INTO train_daily(day,total,work,wrong,attach) VALUES(?,?,?,?,?)",
+            (d, total, work, wrong, attach),
+        )
+    finally:
+        conn.close()
+
+def log_training_event(card_id: str, label: str, text: str, channel: str, admin_id: int):
+    rec = {
+        "timestamp": now_ts(),
+        "card_id": card_id,
+        "label": label,
+        "admin_id": int(admin_id),
+        "channel": channel,
+        "text": (text or "")[:5000],
+    }
+    append_jsonl(TRAINING_DATASET, rec)
+    update_train_daily(label)
+    update_channel_bias(channel, label)
+
+def compute_training_stats() -> Dict:
+    conn = db()
+    rows = conn.execute("SELECT total, work, wrong, attach FROM train_daily").fetchall()
+    conn.close()
+
+    total = sum(r[0] for r in rows) if rows else 0
+    work = sum(r[1] for r in rows) if rows else 0
+    wrong = sum(r[2] for r in rows) if rows else 0
+    attach = sum(r[3] for r in rows) if rows else 0
+
+    last_ts = None
+    try:
+        with open(TRAINING_DATASET, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size > 0:
+                f.seek(max(0, size - 8192), os.SEEK_SET)
+                chunk = f.read().decode("utf-8", errors="ignore")
+                lines = [ln for ln in chunk.splitlines() if ln.strip()]
+                for ln in reversed(lines):
+                    try:
+                        obj = json.loads(ln)
+                        ts = obj.get("timestamp")
+                        if isinstance(ts, int):
+                            last_ts = ts
+                            break
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    prog = 0.0 if TARGET_DATASET_SIZE <= 0 else min(1.0, total / TARGET_DATASET_SIZE)
+    return {
+        "total": total,
+        "work": work,
+        "wrong": wrong,
+        "attach": attach,
+        "progress": round(prog * 100.0, 2),
+        "confidence": round(prog * 100.0, 2),
+        "last_ts": last_ts,
+        "target": TARGET_DATASET_SIZE,
+    }
+
+def tail_training_log(limit: int = MAX_TRAIN_LOG) -> List[Dict]:
+    if not os.path.exists(TRAINING_DATASET):
+        return []
+    try:
+        with open(TRAINING_DATASET, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        out = []
+        for ln in lines[-limit:]:
+            ln = ln.strip()
+            if not ln:
+                continue
             try:
-                total += float(v)
+                out.append(json.loads(ln))
             except Exception:
                 pass
-    return total
-
-# ----------------------------- ONZS CATALOG -----------------------------
-ONZS_MAP: Dict[int, str] = {}
-
-def _to_onzs_int(v) -> Optional[int]:
-    """Extract ONZS number 1..12 from a cell value (robust to '1.0', '1 – ...', etc.)."""
-    if v is None:
-        return None
-    s = str(v).strip()
-    if not s or s.lower() in ("nan", "none"):
-        return None
-    m = re.search(r"(\d+)", s)
-    if not m:
-        return None
-    try:
-        n = int(m.group(1))
+        return out
     except Exception:
-        return None
-    return n if 1 <= n <= 12 else None
+        return []
 
-def load_onzs_catalog():
-    """Load ONZS catalog from Excel.
-    Robust mode:
-      - reads all sheets
-      - no header dependency
-      - finds numbers 1..12 in any column
-      - extracts description from right neighbor or first meaningful text in row
+def sparkline(values: List[int]) -> str:
+    if not values:
+        return "—"
+    blocks = "▁▂▃▄▅▆▇█"
+    mn, mx = min(values), max(values)
+    if mx == mn:
+        return blocks[0] * len(values)
+    out = []
+    for v in values:
+        idx = int((v - mn) * (len(blocks) - 1) / (mx - mn))
+        out.append(blocks[idx])
+    return "".join(out)
+
+def training_plot_text(days: int = 14) -> str:
+    rows = _fetch_train_daily_last(days)
+    if not rows:
+        return "📊 График роста обучения: данных пока нет."
+    labels = [r[0][5:] for r in rows]
+    totals = [int(r[1]) for r in rows]
+    return "📊 График роста обучения (событий в день):\n" + sparkline(totals) + "\n" + " | ".join(f"{labels[i]}:{totals[i]}" for i in range(len(labels)))
+
+
+def select_few_shot_examples(text: str, k: int = 3) -> List[Dict]:
     """
-    global ONZS_MAP
-    try:
-        path = resolve_path(ONZS_XLSX)
-        log.info(f"[ONZS] trying path: {path}")
-        if not os.path.exists(path):
-            debug_paths_for_file(path)
-
-        sheets = pd.read_excel(path, sheet_name=None, header=None)
-        mp: Dict[int, str] = {}
-
-        for sheet_name, df in (sheets or {}).items():
-            if df is None or df.empty:
-                continue
-
-            for _, row in df.iterrows():
-                cells = row.tolist()
-
-                found_n = None
-                found_idx = None
-                for i, c in enumerate(cells):
-                    n = _to_onzs_int(c)
-                    if n is not None:
-                        found_n = n
-                        found_idx = i
-                        break
-                if found_n is None:
-                    continue
-
-                desc = ""
-
-                # Prefer the right neighbor of the ONZS number cell
-                if found_idx is not None and found_idx + 1 < len(cells):
-                    v = cells[found_idx + 1]
-                    if v is not None:
-                        sv = str(v).strip()
-                        if sv and sv.lower() not in ("nan", "none"):
-                            desc = sv
-
-                # Otherwise: first non-empty non-numeric text in the row excluding the number cell
-                if not desc:
-                    for j, v in enumerate(cells):
-                        if j == found_idx:
-                            continue
-                        if v is None:
-                            continue
-                        sv = str(v).strip()
-                        if not sv or sv.lower() in ("nan", "none"):
-                            continue
-                        if re.fullmatch(r"\d+(?:\.\d+)?", sv):
-                            continue
-                        desc = sv
-                        break
-
-                if desc:
-                    mp[found_n] = desc
-
-        ONZS_MAP = mp
-        log.info(f"[ONZS] catalog loaded: {len(ONZS_MAP)} items")
-        if not ONZS_MAP:
-            log.error("[ONZS] loaded 0 items: check Excel structure (numbers/description).")
-
-    except Exception as e:
-        ONZS_MAP = {}
-        log.error(f"[ONZS] catalog load error: {e}")
-
-# ----------------------------- TELEGRAM API HELPERS -----------------------------
-def tg_get(method: str, params: Dict, timeout_override: Optional[int] = None) -> Optional[Dict]:
-    if not TELEGRAM_API_URL:
-        return None
-    # For long-polling getUpdates, Telegram can hold the request up to `timeout` seconds.
-    # We must set HTTP client timeout > Telegram timeout to avoid premature Read timed out.
-    try:
-        tg_timeout = int((params or {}).get("timeout", 0) or 0)
-    except Exception:
-        tg_timeout = 0
-    effective_timeout = timeout_override if timeout_override is not None else HTTP_TIMEOUT
-    # Make sure effective timeout safely exceeds long-poll timeout
-    effective_timeout = max(int(effective_timeout or 0), tg_timeout + 10, 30)
-
-    try:
-        r = requests.get(f"{TELEGRAM_API_URL}/{method}", params=params, timeout=effective_timeout)
-        return r.json()
-    except Exception as e:
-        log.error(f"Telegram GET {method} error: {e}")
-        return None
-
-def tg_post(method: str, payload: Dict) -> Optional[Dict]:
-    """POST wrapper with basic resiliency (timeouts/resets/429) and safe JSON parsing."""
-    if not TELEGRAM_API_URL:
-        return None
-
-    max_attempts = int(os.getenv("TG_HTTP_RETRIES", "5"))
-    base_sleep = float(os.getenv("TG_HTTP_RETRY_SLEEP", "1.0"))  # seconds
-    last_err: Optional[Exception] = None
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            r = requests.post(
-                f"{TELEGRAM_API_URL}/{method}",
-                json=payload,
-                timeout=HTTP_TIMEOUT,
-            )
-
-            # Telegram sometimes rate-limits (429) with retry_after in response JSON.
-            if r.status_code == 429:
-                try:
-                    j = r.json()
-                    retry_after = float(j.get("parameters", {}).get("retry_after", 1))
-                except Exception:
-                    retry_after = 1.0
-                sleep_s = max(1.0, retry_after)
-                log.warning(f"Telegram POST {method} rate-limited (429). Sleeping {sleep_s:.1f}s (attempt {attempt}/{max_attempts})")
-                time.sleep(sleep_s)
-                continue
-
-            # Non-200: still try to parse JSON for diagnostics, but retry on 5xx.
-            if r.status_code >= 500:
-                log.warning(f"Telegram POST {method} server error {r.status_code}. Attempt {attempt}/{max_attempts}")
-                time.sleep(base_sleep * attempt)
-                continue
-
-            try:
-                return r.json()
-            except Exception:
-                # Not JSON (rare). Log a short snippet and do not crash.
-                snippet = (r.text or "")[:300]
-                log.error(f"Telegram POST {method} non-JSON response (status={r.status_code}): {snippet}")
-                return None
-
-        except Exception as e:
-            last_err = e
-            log.error(f"Telegram POST {method} error: {e!r} (attempt {attempt}/{max_attempts})")
-            time.sleep(base_sleep * attempt)
-
-    if last_err:
-        log.error(f"Telegram POST {method} failed after {max_attempts} attempts: {last_err!r}")
-    return None
-
-def answer_callback(callback_query_id: str, text: str = "", show_alert: bool = False):
-    tg_post("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text, "show_alert": show_alert})
-
-# Backward-compatible alias used by some handlers
-def answer_callback_query(callback_query_id: str, text: str = "", show_alert: bool = False):
-    return answer_callback(callback_query_id, text=text, show_alert=show_alert)
-
-def edit_reply_markup(chat_id: int, message_id: int, reply_markup: Optional[Dict] = None):
-    payload = {"chat_id": chat_id, "message_id": message_id}
-    if reply_markup is not None:
-        payload["reply_markup"] = reply_markup
-    resp = tg_post("editMessageReplyMarkup", payload)
-    if resp and not resp.get("ok", True):
-        log.error(f"editMessageReplyMarkup failed: {resp}")
-    return resp
-
-def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: Optional[Dict] = None):
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "disable_web_page_preview": False}
-    if reply_markup is not None:
-        payload["reply_markup"] = reply_markup
-    resp = tg_post("editMessageText", payload)
-    if resp and not resp.get("ok", True):
-        desc = str(resp.get("description", ""))
-        # Telegram returns this when trying to set the same text/markup; not a real failure.
-        if "message is not modified" in desc:
-            log.debug(f"editMessageText not modified: {desc}")
-        else:
-            log.error(f"editMessageText failed: {resp}")
-    return resp
-
-
-# --------------------------------------------
-#               ADMIN PANEL
-# --------------------------------------------
-def admin_menu_text() -> str:
-    return (
-        "🛠 Админ-панель\n"
-        f"• Admins: {len(ROLES.get('admins',[]))}\n"
-        f"• Moderators: {len(ROLES.get('moderators',[]))}\n"
-        f"• Leadership: {len(ROLES.get('leadership',[]))}\n"
-        f"• Reports targets: {len(ROLES.get('report_targets',[]))}\n"
-        "\nВыберите раздел:"
-    )
-
-def admin_menu_kb():
-    return {"inline_keyboard": [
-        [{"text":"👥 Роли", "callback_data":"admin:roles"}],
-        [{"text":"📊 Статистика", "callback_data":"admin:stats"}],
-        [{"text":"🧾 Отчёты", "callback_data":"admin:reports"}],
-        [{"text":"⚙️ Настройки", "callback_data":"admin:settings"}],
-    ]}
-
-def admin_roles_kb():
-    return {"inline_keyboard": [
-        [{"text":"➕ Добавить админа", "callback_data":"admin:add_admin"}],
-        [{"text":"➖ Удалить админа", "callback_data":"admin:del_admin"}],
-        [{"text":"➕ Добавить модератора", "callback_data":"admin:add_mod"}],
-        [{"text":"➖ Удалить модератора", "callback_data":"admin:del_mod"}],
-        [{"text":"➕ Добавить руководство", "callback_data":"admin:add_lead"}],
-        [{"text":"➖ Удалить руководство", "callback_data":"admin:del_lead"}],
-        [{"text":"📋 Показать роли", "callback_data":"admin:list_roles"}],
-        [{"text":"⬅️ Назад", "callback_data":"admin:back"}],
-    ]}
-
-def admin_reports_kb():
-    return {"inline_keyboard": [
-        [{"text":"📤 Отчёт за сутки", "callback_data":"admin:report_day"}],
-        [{"text":"📬 Получатели отчётов", "callback_data":"admin:report_targets"}],
-        [{"text":"➕ Добавить получателя", "callback_data":"admin:add_report_target"}],
-        [{"text":"➖ Удалить получателя", "callback_data":"admin:del_report_target"}],
-        [{"text":"⬅️ Назад", "callback_data":"admin:back"}],
-    ]}
-
-def admin_settings_kb():
-    return {"inline_keyboard": [
-        [ {"text": f"🎚 Порог AI-gate: {MIN_AI_GATE:.1f}%", "callback_data": "admin:set_aigate"} ],
-        [{"text":"🔄 Перезагрузить ОНзС", "callback_data":"admin:reload_onzs"}],
-        [{"text":"🧪 Тест YandexGPT", "callback_data":"admin:test_yagpt"}],
-        [{"text":"⬅️ Назад", "callback_data":"admin:back"}],
-    ]}
-
-ADMIN_STATE_PATH = os.path.join(DATA_DIR, "admin_state.json")
-# --------------------------------------------
-#               PERSISTENT CONFIG (DATA_DIR)
-# --------------------------------------------
-CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
-
-def load_config() -> dict:
-    try:
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f) or {}
-    except Exception:
-        pass
-    return {}
-
-def save_config(cfg: dict) -> None:
-    try:
-        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg or {}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def get_cfg_float(key: str, default: float) -> float:
-    cfg = load_config()
-    v = cfg.get(key, default)
-    try:
-        return float(str(v).replace(",", "."))
-    except Exception:
-        return float(default)
-
-def set_cfg_value(key: str, value) -> None:
-    cfg = load_config()
-    cfg[key] = value
-    save_config(cfg)
-
-
-def load_admin_state():
-    try:
-        if os.path.exists(ADMIN_STATE_PATH):
-            with open(ADMIN_STATE_PATH, "r", encoding="utf-8") as f:
-                return json.load(f) or {}
-    except Exception:
-        pass
-    return {}
-
-def save_admin_state(st):
-    try:
-        with open(ADMIN_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(st, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-ADMIN_STATE = load_admin_state()
-
-def set_admin_mode(*args):
-    """Set per-user admin mode.
-    Supports signatures:
-      set_admin_mode(uid, mode)
-      set_admin_mode(chat_id, uid, mode)  # chat_id is ignored (kept for backward compatibility)
+    Retrieves recent labeled examples by keyword overlap for few-shot calibration.
     """
-    if len(args) == 2:
-        uid, mode = args
-    elif len(args) == 3:
-        _chat_id, uid, mode = args
-    else:
-        raise TypeError("set_admin_mode expected (uid, mode) or (chat_id, uid, mode)")
-    try:
-        uid = int(uid)
-    except Exception:
-        uid = int(str(uid).strip())
-    ADMIN_STATE[str(uid)] = {"mode": str(mode), "ts": int(time.time())}
+    keys = set(detect_keywords((text or "").lower()))
+    if not keys:
+        return []
+    events = tail_training_log(limit=250)
+    scored = []
+    for e in events:
+        t = (e.get("text") or "").lower()
+        if not t:
+            continue
+        ekeys = set(detect_keywords(t))
+        score = len(keys & ekeys)
+        if score > 0:
+            scored.append((score, e))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [e for _, e in scored[:k]]
 
-def clear_admin_mode(*args):
-    """Clear per-user admin mode.
-    Supports signatures:
-      clear_admin_mode(uid)
-      clear_admin_mode(uid)  # chat_id is ignored
-    """
-    if len(args) == 1:
-        uid = args[0]
-    elif len(args) == 2:
-        _chat_id, uid = args
-    else:
-        raise TypeError("clear_admin_mode expected (uid) or (chat_id, uid)")
-    try:
-        uid = int(uid)
-    except Exception:
-        uid = int(str(uid).strip())
-    ADMIN_STATE.pop(str(uid), None)
-    save_admin_state(ADMIN_STATE)
-
-def pop_admin_mode(uid:int):
-    ADMIN_STATE.pop(str(uid), None)
-    save_admin_state(ADMIN_STATE)
-
-def get_admin_mode(uid:int):
-    v = ADMIN_STATE.get(str(uid))
-    return v.get("mode") if v else None
-
-def _roles_add(key:str, uid:int):
-    arr = ROLES.get(key, [])
-    if uid not in arr:
-        arr.append(uid)
-    ROLES[key] = sorted(list(dict.fromkeys(arr)))
-    save_roles(ROLES)
-    roles_refresh_globals()
-
-def _roles_del(key:str, uid:int):
-    arr = [x for x in ROLES.get(key, []) if x != uid]
-    ROLES[key] = arr
-    save_roles(ROLES)
-    roles_refresh_globals()
-
-def build_roles_text():
-    def fmt(lst):
-        return ", ".join(str(x) for x in lst) if lst else "—"
-    return (
-        "👥 Текущие роли\n"
-        f"Admins: {fmt(ROLES.get('admins',[]))}\n"
-        f"Moderators: {fmt(ROLES.get('moderators',[]))}\n"
-        f"Leadership: {fmt(ROLES.get('leadership',[]))}\n"
-        f"Report targets: {fmt(ROLES.get('report_targets',[]))}"
-    )
-def send_message(chat_id: int, text: str, reply_markup: Optional[Dict] = None):
-    # Telegram limit ~4096; chunk to avoid 400
-    max_len = 3900
-    chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [""]
-    last = None
-    for idx, ch in enumerate(chunks):
-        payload = {"chat_id": chat_id, "text": ch, "disable_web_page_preview": False}
-        if reply_markup is not None and idx == len(chunks) - 1:
-            payload["reply_markup"] = reply_markup
-        last = tg_post("sendMessage", payload)
-        if last and not last.get("ok", True):
-            log.error(f"sendMessage failed: {last}")
-    return last
-
-# ----------------------------- CARD UI -----------------------------
-def build_card_keyboard(card_id: str) -> Dict:
-    return {
-        "inline_keyboard": [
-            [{"text": "✅ В работу", "callback_data": f"card:{card_id}:work"},
-             {"text": "❌ Неверно", "callback_data": f"card:{card_id}:wrong"}],
-            [{"text": "📎 Привязать", "callback_data": f"card:{card_id}:attach"}],
-            [{"text": "✏️ Изменить ОНзС", "callback_data": f"onzs:edit:{card_id}"},
-             {"text": "✅ Подтвердить ОНзС", "callback_data": f"onzs:confirm:{card_id}"}],
-        ]
-    }
-
-def build_onzs_pick_keyboard(card_id: str) -> Dict:
-    rows = []
-    row = []
-    for n in range(1, 13):
-        row.append({"text": str(n), "callback_data": f"onzs:set:{card_id}:{n}"})
-        if len(row) == 6:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([{"text": "⬅️ Назад к карточке", "callback_data": f"onzs:back:{card_id}"}])
-    return {"inline_keyboard": rows}
-
-# ----------------------------- TEXT NORMALIZATION -----------------------------
-URL_RE = re.compile(r"(https?://\S+)")
-MENTION_RE = re.compile(r"@\w+")
-HASHTAG_RE = re.compile(r"#\w+")
-
-def build_admin_keyboard() -> Dict:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "📊 Статистика ОНзС", "callback_data": "admin:onzs_stats"},
-                {"text": "🔄 Перезагрузить ОНзС", "callback_data": "admin:reload_onzs"},
-            ],
-            [
-                {"text": "🧪 Тест YandexGPT", "callback_data": "admin:test_yagpt"},
-            ],
-        ]
-    }
-
-
-def clean_text_for_ai(text: str) -> str:
-    t = (text or "").strip()
-    t = URL_RE.sub(" ", t)
-    t = MENTION_RE.sub(" ", t)
-    t = HASHTAG_RE.sub(" ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    # keep bounded
-    if len(t) > 2500:
-        t = t[:2500] + "…"
-    return t
-
-def is_stop_topic(text: str) -> bool:
-    low = (text or "").lower()
-    if any(w in low for w in STOP_TOPICS):
-        # Allow if strong construction hints exist (rare but possible)
-        if any(h in low for h in CONSTR_HINTS):
-            return False
-        return True
-    return False
-
-# ----------------------------- YANDEX GPT -----------------------------
-def call_yandex_gpt_raw(messages: List[Dict]) -> Tuple[Optional[str], Optional[Dict]]:
-    if not (YAGPT_API_KEY and YAGPT_FOLDER_ID and YAGPT_MODEL):
-        return None, {"error": "YandexGPT not configured"}
-    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-    headers = {"Authorization": f"Api-Key {YAGPT_API_KEY}"}
-    payload = {
-        "modelUri": YAGPT_MODEL,
-        "completionOptions": {"stream": False, "temperature": 0.2, "maxTokens": 400},
-        "messages": messages,
-    }
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=20)
-        txt = r.text
-        if not r.ok:
-            return None, {"status": r.status_code, "text": txt}
-        js = r.json()
-        try:
-            out = js["result"]["alternatives"][0]["message"]["text"]
-        except Exception:
-            out = txt
-        return out, js
-    except Exception as e:
-        return None, {"error": str(e)}
-
-JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-def extract_json_from_text(text: str) -> Optional[Dict]:
-    if not text:
-        return None
-    # Try direct json
-    t = text.strip()
-    try:
-        return json.loads(t)
-    except Exception:
-        pass
-    m = JSON_OBJ_RE.search(t)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except Exception:
+def call_yandex_gpt_json(text: str) -> Optional[Dict]:
+    if not YAGPT_API_KEY or not YAGPT_FOLDER_ID:
         return None
 
-def call_yandex_gpt_json(prompt: str, channel: Optional[str] = None) -> Optional[Dict]:
-    cleaned = clean_text_for_ai(prompt)
-    # hard skip for stop topics (prevents refusals)
-    if is_stop_topic(cleaned):
-        return {"probability": 0, "comment": "Отсев: новость/политика (стоп-тема)."}
-    # Few-shot from history: last N labeled cards for relevance
-    few = read_last_jsonl(HISTORY_CARDS, limit=12)
+    model_uri = YAGPT_MODEL.format(folder_id=YAGPT_FOLDER_ID)
+
+    few = select_few_shot_examples(text, k=3)
     few_block = ""
     if few:
-        lines = []
-        for ex in few[-10:]:
-            t = clean_text_for_ai(ex.get("text", ""))
-            lbl = ex.get("label", "")
-            hint = ex.get("reason", "")
-            if not t or not lbl:
-                continue
+        lines = ["Примеры разметки (для калибровки):"]
+        for ex in few:
+            lbl = ex.get("label")
+            t = re.sub(r"\s+", " ", (ex.get("text") or "")).strip()[:240]
+            hint = "70-100" if lbl == "work" else ("0-30" if lbl == "wrong" else "40-70")
             lines.append(f"- Метка={lbl} (ориентир {hint}). Текст: {t}")
         few_block = "\n" + "\n".join(lines) + "\n"
 
-    # our own bias to stabilize decisions (channel/keyword learning)
-    bias_ch = get_channel_bias(channel) if channel else 0.0
-    bias_kw = get_keyword_bias_points(cleaned)
-    bias_total = bias_ch + bias_kw
-
-    prompt_full = (
-        "Ты помощник инспектора строительного надзора.\n"
-        "Твоя задача: оценить вероятность (0-100), что текст относится к самовольному строительству/нарушениям на стройке.\n"
-        "Запрещено: новости, политика, общие рассуждения.\n"
-        "Если текст содержит запрещённые/неподходящие темы, всё равно верни JSON с probability=0 и кратким comment.\n"
-        "Ответь СТРОГО одним JSON без пояснений и без Markdown.\n"
-        'Формат: {"probability": <0-100>, "comment": "..."}\n'
-        f"Калибровка (bias, прибавь к вероятности): {bias_total:+.1f}\n"
-        + few_block +
-        "\nТекст:\n" + cleaned
-    )
-
-    messages = [
-        {"role": "system", "text": "Отвечай строго JSON."},
-        {"role": "user", "text": prompt_full},
-    ]
-
-    # retries for stability
-    for attempt in range(4):
-        out_text, meta = call_yandex_gpt_raw(messages)
-        if out_text is None:
-            # retry on transient
-            time.sleep(0.8 * (attempt + 1))
-            continue
-        js = extract_json_from_text(out_text)
-        if js is None:
-            # if model refused, do not crash; return minimal
-            if "не могу обсуждать" in out_text.lower():
-                return {"probability": 0, "comment": "Отказ модели: неподходящая тема."}
-            # retry once
-            time.sleep(0.6 * (attempt + 1))
-            continue
-        if "probability" not in js:
-            # allow legacy keys
-            if "prob" in js:
-                js["probability"] = js["prob"]
-        return js
-    return None
-
-# ----------------------------- ONZS DETECTION -----------------------------
-def detect_onzs_with_yagpt(text: str, channel: Optional[str] = None) -> Optional[Dict]:
-    if not ONZS_MAP:
-        return None
-
-    cleaned = clean_text_for_ai(text)
-    if is_stop_topic(cleaned):
-        return {"onzs": None, "confidence": 0.0, "reason": "Отсев: стоп-тема."}
-
-    catalog = "\n".join([f"{k}: {v}" for k, v in sorted(ONZS_MAP.items())])
-
     prompt = (
-        "Ты инспектор строительного надзора.\n"
-        "Определи номер ОНзС (1–12) по описанию. Если нельзя определить — onzs=null.\n"
-        "Ответь СТРОГО одним JSON без пояснений.\n"
-        'Формат: {"onzs": <1-12|null>, "confidence": <0-1>, "reason": "..."}\n\n'
-        "Классификатор ОНзС:\n"
-        f"{catalog}\n\n"
-        "Текст:\n"
-        f"{cleaned}"
+        "Ты помощник инспектора строительного надзора.\n"
+        "Оцени вероятность, что сообщение относится к незаконному строительству (самострой).\n"
+        "Верни строго JSON:\n"
+        "{\n"
+        '  \"probability\": <0-100>,\n'
+        '  \"comment\": \"краткий комментарий\"\n'
+        "}\n"
+        + few_block +
+        "\nТекст сообщения:\n" + (text or "")
     )
 
-    messages = [
-        {"role": "system", "text": "Отвечай строго JSON."},
-        {"role": "user", "text": prompt},
-    ]
-
-    for attempt in range(4):
-        out_text, meta = call_yandex_gpt_raw(messages)
-        if out_text is None:
-            time.sleep(0.8 * (attempt + 1))
-            continue
-        js = extract_json_from_text(out_text)
-        if js is None:
-            if "не могу обсуждать" in out_text.lower():
-                return {"onzs": None, "confidence": 0.0, "reason": "Отказ модели."}
-            time.sleep(0.6 * (attempt + 1))
-            continue
-        return js
-    return None
-
-def save_onzs_training(text: str, onzs: int, confirmed: bool):
-    rec = {"text": clean_text_for_ai(text), "onzs": int(onzs), "confirmed": bool(confirmed), "ts": now_ts()}
-    append_jsonl(ONZS_TRAIN_FILE, rec)
-
-
-def build_daily_report_text() -> str:
-    today = datetime.now().date().isoformat()
-    lines = ["🧾 Отчёт за сутки", f"Дата: {today}"]
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = [r[0] for r in cur.fetchall()]
-        if not tables:
-            conn.close()
-            lines.append("Нет таблиц в БД.")
-            return "\n".join(lines)
-        table = "cards" if "cards" in tables else tables[0]
-        try:
-            cur.execute(f"SELECT status, COUNT(*) FROM {table} WHERE date(ts)=? GROUP BY status", (today,))
-            rows = cur.fetchall()
-            if rows:
-                lines.append("Статусы:")
-                for st,cnt in rows:
-                    lines.append(f"• {st}: {cnt}")
-        except Exception:
-            pass
-        try:
-            cur.execute(f"SELECT COUNT(*) FROM {table} WHERE date(ts)=? AND onzs_final IS NOT NULL", (today,))
-            n = cur.fetchone()[0]
-            lines.append(f"Подтверждённые ОНзС: {n}")
-        except Exception:
-            pass
-        conn.close()
-    except Exception as e:
-        lines.append(f"Ошибка отчёта: {e}")
-    return "\n".join(lines)
-def build_onzs_stats() -> str:
-    if not os.path.exists(ONZS_TRAIN_FILE):
-        return "Нет данных по ОНзС."
-    stats: Dict[int, Dict[str, int]] = {}
-    with open(ONZS_TRAIN_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            o = r.get("onzs")
-            if o is None:
-                continue
-            try:
-                o = int(o)
-            except Exception:
-                continue
-            stats.setdefault(o, {"ok": 0, "all": 0})
-            stats[o]["all"] += 1
-            if r.get("confirmed"):
-                stats[o]["ok"] += 1
-
-    total_all = sum(v["all"] for v in stats.values()) or 0
-    total_ok = sum(v["ok"] for v in stats.values()) or 0
-    acc_total = int(100 * total_ok / total_all) if total_all else 0
-
-    out = [f"🎯 Точность ИИ по ОНзС: {acc_total}% (верно {total_ok}/{total_all})"]
-    for o in sorted(stats.keys()):
-        s = stats[o]
-        acc = int(100 * s["ok"] / s["all"]) if s["all"] else 0
-        out.append(f"ОНзС-{o}: {acc}% ({s['ok']}/{s['all']})")
-    return "\n".join(out)
-
-# ----------------------------- CARD PIPELINE -----------------------------
-def build_card_id(channel: str, post_id: Any) -> str:
-    return sha1(f"{channel}:{post_id}")
-
-def extract_links(text: str) -> List[str]:
-    return URL_RE.findall(text or "")
-
-def extract_keywords_hit(text: str, keywords: List[str]) -> List[str]:
-    low = (text or "").lower()
-    hits = []
-    for k in keywords:
-        if k and k.lower() in low:
-            hits.append(k)
-    return hits
-
-DEFAULT_KEYWORDS = [
-    "самострой", "стройка", "строительство", "котлован", "фундамент", "бетон", "арматура",
-    "кран", "опалубка", "забор", "пристройка", "надстройка", "реконструкция",
-    "этаж", "плита", "перекрытие"
-]
-
-def classify_with_ai(text: str, channel: str) -> Optional[Dict]:
-    # AI gate mandatory; returns {"probability":..., "comment":...} or None
-    return call_yandex_gpt_json(text, channel=channel)
-
-def create_card(channel: str, post_id: Any, text: str) -> Optional[Dict]:
-    # stop-topic prefilter
-    if is_stop_topic(text):
-        return None
-
-    keywords_hit = extract_keywords_hit(text, DEFAULT_KEYWORDS)
-    # soft filter: require at least one keyword OR strong construction hint
-    if not keywords_hit and not any(h in (text or "").lower() for h in CONSTR_HINTS):
-        return None
-
-    ai = classify_with_ai(text, channel)
-    if ai is None:
-        # strict: no AI -> no card
-        log.info("Skip card: YandexGPT unavailable")
-        return None
-
-    try:
-        prob = float(ai.get("probability", 0))
-    except Exception:
-        prob = 0.0
-
-    if prob < MIN_AI_GATE:
-        return None
-
-    card_id = build_card_id(channel, post_id)
-    card = {
-        "card_id": card_id,
-        "created_ts": now_ts(),
-        "timestamp": now_ts(),
-        "channel": channel,
-        "post_id": post_id,
-        "text": text,
-        "keywords": keywords_hit,
-        "links": extract_links(text),
-        "ai": {
-            "probability": prob,
-            "comment": ai.get("comment", ""),
-        },
-        "onzs": {},
+    body = {
+        "modelUri": model_uri,
+        "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": 220},
+        "messages": [{"role": "user", "text": prompt}],
+    }
+    headers = {
+        "Authorization": f"Api-Key {YAGPT_API_KEY}",
+        "x-folder-id": YAGPT_FOLDER_ID,
+        "Content-Type": "application/json",
     }
 
-    # ONZS detect AFTER passing AI gate
-    onzs = detect_onzs_with_yagpt(text, channel=channel)
-    if onzs and onzs.get("onzs"):
-        try:
-            o = int(onzs.get("onzs"))
-        except Exception:
-            o = None
-        if o and 1 <= o <= 12:
-            card["onzs"] = {
-                "ai": o,
-                "confidence": float(onzs.get("confidence", 0) or 0),
-                "reason": (onzs.get("reason") or "").strip(),
-                "source": "ai",
-                "confirmed": False,
-            }
+    try:
+        resp = requests.post(YAGPT_ENDPOINT, headers=headers, json=body, timeout=25)
+        data = resp.json()
+    except Exception as e:
+        log.error(f"YandexGPT request error: {e}")
+        return None
 
-    save_card(card)
-    return card
+    try:
+        text_out = data["result"]["alternatives"][0]["message"]["text"]
+    except Exception as e:
+        log.error(f"YandexGPT response parse error: {e}; data={data}")
+        return None
+
+    out = text_out.strip()
+    if not out.startswith("{"):
+        s = out.find("{")
+        e = out.rfind("}")
+        if s != -1 and e != -1 and e > s:
+            out = out[s:e+1]
+    try:
+        return json.loads(out)
+    except Exception as e:
+        log.error(f"YandexGPT JSON parse error: {e}; text={text_out[:300]}")
+        return None
+
+def enrich_card_with_yagpt(card: Dict) -> None:
+    t = (card.get("text") or "").strip()
+    if not t:
+        return
+    res = call_yandex_gpt_json(t)
+    if not res:
+        return
+    prob = res.get("probability")
+    comment = (res.get("comment") or "").strip()
+
+    prob_f = None
+    try:
+        prob_f = float(prob)
+    except Exception:
+        prob_f = None
+
+    if prob_f is not None:
+        prob_f = max(0.0, min(100.0, prob_f))
+        # calibration bias
+        bias = get_channel_bias(card.get("channel", ""))
+        prob_adj = max(0.0, min(100.0, prob_f + bias))
+        card.setdefault("ai", {})
+        card["ai"]["probability_raw"] = round(prob_f, 1)
+        card["ai"]["bias"] = bias
+        card["ai"]["probability"] = round(prob_adj, 1)
+
+    if comment:
+        card.setdefault("ai", {})
+        card["ai"]["comment"] = comment[:600]
+
+
+def generate_card_id() -> str:
+    return str(uuid.uuid4())[:12]
+
+def save_card(card: Dict) -> str:
+    path = os.path.join(CARDS_DIR, f"{card['card_id']}.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(card, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    return path
+
+def load_card(card_id: str) -> Optional[Dict]:
+    path = os.path.join(CARDS_DIR, f"{card_id}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 def build_card_text(card: Dict) -> str:
     ts = int(card.get("timestamp", now_ts()))
@@ -1175,16 +792,16 @@ def build_card_text(card: Dict) -> str:
 
     ai = card.get("ai") or {}
     prob = ai.get("probability")
+    raw = ai.get("probability_raw")
+    bias = ai.get("bias")
     comment = ai.get("comment")
 
-    ai_lines: List[str] = []
+    ai_lines = []
     if prob is not None:
-        try:
-            p = float(prob)
-        except Exception:
-            p = None
-        if p is not None:
-            ai_lines.append(f"🤖 Вероятность самостроя (ИИ): {p:.1f}%")
+        if raw is not None and bias is not None:
+            ai_lines.append(f"🤖 Вероятность самостроя (ИИ): {prob:.1f}% (raw {raw:.1f}%, bias {bias:+.1f})")
+        else:
+            ai_lines.append(f"🤖 Вероятность самостроя (ИИ): {float(prob):.1f}%")
     if comment:
         ai_lines.append(f"💬 Комментарий ИИ: {comment}")
 
@@ -1200,31 +817,8 @@ def build_card_text(card: Dict) -> str:
         f"{links_str}\n\n"
         f"🆔 ID карточки: {card.get('card_id','—')}"
     )
-
     if ai_lines:
         base += "\n\n" + "\n".join(ai_lines)
-
-    # ONZS block
-    oz = card.get("onzs") or {}
-    val = oz.get("value") if oz.get("value") else oz.get("ai")
-    if val:
-        src = oz.get("source") or ("ai" if oz.get("ai") else "manual")
-        conf = oz.get("confidence")
-        confirmed = oz.get("confirmed")
-        line = f"🏗 ОНзС: {val}"
-        if src == "ai" and conf is not None:
-            try:
-                line += f" ({int(float(conf)*100)}%)"
-            except Exception:
-                pass
-        if confirmed:
-            line += " ✅ подтверждено"
-        base += "\n\n" + line
-
-        reason = (oz.get("reason") or "").strip()
-        if src == "ai" and reason:
-            base += "\n" + f"📌 Причина: {reason}"
-
     return base
 
 def append_history(entry: Dict):
@@ -1232,738 +826,739 @@ def append_history(entry: Dict):
     entry["ts"] = now_ts()
     append_jsonl(HISTORY_CARDS, entry)
 
-# ----------------------------- CALLBACK HANDLER -----------------------------
-def handle_message(upd: Dict):
-    # --- ensure chat_id is always defined ---
-    msg = upd.get('message') or {}
-    chat = msg.get('chat') or {}
-    chat_id = int(chat.get('id', 0) or 0)
-    text = (msg.get('text') or '').strip()
-    if not text: 
-        return
-    # ---------------------------------------
 
-    msg = upd.get("message") or {}
-    text = (msg.get("text") or "").strip()
-
-    # --- ADMIN MODE INPUT (role management) ---
-    uid = get_sender_user_id(upd)
-    mode = get_admin_mode(uid)
-    # Если админ в режиме ввода (например, порог AI-gate), но прислал команду (/admin и т.п.),
-    # выходим из режима и даём обработаться команде.
-    if mode and text and text.startswith("/"):
-        clear_admin_mode(uid)
-        mode = None
-    if mode == "set_aigate":
-        # If user entered a command while waiting for a threshold value, cancel input mode and process the command normally.
-        if text and text.startswith("/"):
-            clear_admin_mode(uid)
-            mode = None
-        
-        raw = (text or "").strip().replace(",", ".")
-        try:
-            v = float(raw)
-        except Exception:
-            send_message(chat_id, "❌ Неверный формат. Введи число от 0 до 100 (например: 5 или 12.5).")
-            return
-        if v < 0 or v > 100:
-            send_message(chat_id, "❌ Диапазон: от 0 до 100.")
-            return
-        global MIN_AI_GATE
-        MIN_AI_GATE = float(v)
-        set_cfg_value("min_ai_gate", MIN_AI_GATE)
-        clear_admin_mode(uid)
-        send_message(chat_id, f"✅ Готово. Новый AI‑gate порог: {MIN_AI_GATE:.1f}%")
-        return
-
-        if mode == "add_admin":
-            _roles_add("admins", target_uid); send_message(chat_id, f"✅ Добавлен админ: {target_uid}")
-        elif mode == "del_admin":
-            _roles_del("admins", target_uid); send_message(chat_id, f"✅ Удалён админ: {target_uid}")
-        elif mode == "add_mod":
-            _roles_add("moderators", target_uid); send_message(chat_id, f"✅ Добавлен модератор: {target_uid}")
-        elif mode == "del_mod":
-            _roles_del("moderators", target_uid); send_message(chat_id, f"✅ Удалён модератор: {target_uid}")
-        elif mode == "add_lead":
-            _roles_add("leadership", target_uid); send_message(chat_id, f"✅ Добавлено руководство: {target_uid}")
-        elif mode == "del_lead":
-            _roles_del("leadership", target_uid); send_message(chat_id, f"✅ Удалено руководство: {target_uid}")
-        elif mode == "add_report_target":
-            _roles_add("report_targets", target_uid); send_message(chat_id, f"✅ Добавлен получатель отчётов: {target_uid}")
-        elif mode == "del_report_target":
-            _roles_del("report_targets", target_uid); send_message(chat_id, f"✅ Удалён получатель отчётов: {target_uid}")
-        pop_admin_mode(uid)
-        return
-
-    if text == "/admin":
-        if not is_privileged(uid):
-            send_message(chat_id, "❌ Нет доступа.")
-            return
-        send_message(chat_id, admin_menu_text(), reply_markup=admin_menu_kb())
-        return
-    chat_id = (msg.get("chat") or {}).get("id")
-    from_user = (msg.get("from") or {}).get("id")
-    if not chat_id or not from_user:
-        return
-
-    if text == "/admin":
-        uid = get_sender_user_id(upd)
-        if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
-            send_message(chat_id, "❌ Нет доступа.")
-            return
-
-        onzs_cnt = len(ONZS_MAP) if isinstance(ONZS_MAP, dict) else 0
-        yagpt_enabled = bool(YAGPT_API_KEY and YAGPT_FOLDER_ID)
-        info = []
-        info.append("🛠 Админ-панель")
-        info.append(f"ID: {from_user}")
-        info.append(f"YandexGPT: {'ON' if yagpt_enabled else 'OFF'} | model={YAGPT_MODEL}")
-        info.append(f"AI-gate: {MIN_AI_GATE}% | HTTP_TIMEOUT={HTTP_TIMEOUT}s")
-        info.append(f"ОНзС каталог: {onzs_cnt} | файл: {ONZS_XLSX}")
-        info.append(f"Admins: {len(ADMINS)} | Moderators: {len(MODERATORS)} | Leadership: {len(LEADERSHIP)}")
-        send_message(chat_id, "\n".join(info), reply_markup=build_admin_keyboard())
-        return
-
-    if text == "/onzs_ai_stats":
-        uid = get_sender_user_id(upd)
-        if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
-            send_message(chat_id, "❌ Нет доступа.")
-            return
-        send_message(chat_id, build_onzs_stats())
-        return
-
-    if text == "/start":
-        send_message(chat_id, "Бот запущен.")
-        return
-
-# ----------------------------- GETUPDATES LOOP -----------------------------def acquire_lock() -> bool:
+def tg_get(method: str, params: Dict) -> Optional[Dict]:
+    if not TELEGRAM_API_URL:
+        return None
     try:
-        if os.path.exists(LOCK_FILE):
-            # stale lock check: 10 minutes
-            if now_ts() - int(os.path.getmtime(LOCK_FILE)) > 600:
-                os.remove(LOCK_FILE)
-            else:
-                return False
-        with open(LOCK_FILE, "w", encoding="utf-8") as f:
-            f.write(str(now_ts()))
-        return True
+        r = requests.get(f"{TELEGRAM_API_URL}/{method}", params=params, timeout=HTTP_TIMEOUT)
+        return r.json()
+    except Exception as e:
+        log.error(f"Telegram GET {method} error: {e}")
+        return None
+
+def tg_post(method: str, payload: Dict) -> Optional[Dict]:
+    if not TELEGRAM_API_URL:
+        return None
+    try:
+        r = requests.post(f"{TELEGRAM_API_URL}/{method}", json=payload, timeout=HTTP_TIMEOUT)
+        return r.json()
+    except Exception as e:
+        log.error(f"Telegram POST {method} error: {e}")
+        return None
+
+def send_message(chat_id: int, text: str, reply_markup: Optional[Dict] = None) -> Optional[Dict]:
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": False}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    return tg_post("sendMessage", payload)
+
+def edit_reply_markup(chat_id: int, message_id: int, reply_markup: Optional[Dict]):
+    payload = {"chat_id": chat_id, "message_id": message_id}
+    # To remove inline keyboard for everyone, omit reply_markup field.
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    resp = tg_post("editMessageReplyMarkup", payload)
+    if resp and not resp.get("ok", True):
+        log.error(f"editMessageReplyMarkup failed: {resp}")
+    return resp
+
+
+def answer_callback(cb_id: str, text: str = "", show_alert: bool = False):
+    return tg_post("answerCallbackQuery", {"callback_query_id": cb_id, "text": text, "show_alert": show_alert})
+
+def send_document(chat_id: int, file_path: str, filename: Optional[str] = None, caption: str = ""):
+    if not BOT_TOKEN:
+        return
+    filename = filename or os.path.basename(file_path)
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    with open(file_path, "rb") as f:
+        files = {"document": (filename, f)}
+        data = {"chat_id": chat_id, "caption": caption}
+        r = requests.post(url, data=data, files=files, timeout=HTTP_TIMEOUT)
+        if not r.ok:
+            log.error(f"sendDocument failed: {r.text}")
+
+def send_photo(chat_id: int, file_path: str, caption: str = ""):
+    if not BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    with open(file_path, "rb") as f:
+        files = {"photo": (os.path.basename(file_path), f)}
+        data = {"chat_id": chat_id, "caption": caption}
+        r = requests.post(url, data=data, files=files, timeout=HTTP_TIMEOUT)
+        if not r.ok:
+            log.error(f"sendPhoto failed: {r.text}")
+
+def build_card_keyboard(card_id: str) -> Dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ В работу", "callback_data": f"card:{card_id}:work"},
+             {"text": "❌ Неверно", "callback_data": f"card:{card_id}:wrong"}],
+            [{"text": "📎 Привязать", "callback_data": f"card:{card_id}:attach"}],
+        ]
+    }
+
+
+ADMIN_STATE: Dict[int, str] = {}  # user_id -> pending_action
+
+def build_admin_keyboard() -> Dict:
+    thr = get_prob_threshold()
+    return {
+        "inline_keyboard": [
+            [{"text": f"🎯 Порог вероятности: {thr}%", "callback_data": "admin:threshold:menu"}],
+            [{"text": "📊 Статистика обучения", "callback_data": "admin:trainstats"}],
+            [{"text": "📈 График роста обучения (текст)", "callback_data": "admin:trainplot:text"}],
+            [{"text": "🖼 PNG график обучения", "callback_data": "admin:trainplot:png"}],
+            [{"text": "🗂 Журнал обучения", "callback_data": "admin:trainlog"}],
+            [{"text": "👥 Управление администраторами", "callback_data": "admin:admins:menu"}],
+            [{"text": "🧑‍⚖️ Управление модераторами", "callback_data": "admin:mods:menu"}],
+            [{"text": "🏛 Управление руководством", "callback_data": "admin:leaders:menu"}],
+            [{"text": "📄 Отчёт XLSX", "callback_data": "admin:report:xlsx"}],
+            [{"text": "🧾 Отчёт PDF", "callback_data": "admin:report:pdf"}],
+            [{"text": "📊 Дашборд KPI", "callback_data": "admin:kpi"}],
+        ]
+    }
+
+def build_threshold_keyboard() -> Dict:
+    presets = [0, 20, 40, 60, 70, 80, 90]
+    rows, row = [], []
+    for p in presets:
+        row.append({"text": f"{p}%", "callback_data": f"admin:threshold:set:{p}"})
+        if len(row) == 4:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "✍️ Ввести вручную (0-100)", "callback_data": "admin:threshold:manual"}])
+    rows.append([{"text": "⬅️ Назад", "callback_data": "admin:menu"}])
+    return {"inline_keyboard": rows}
+
+def build_users_keyboard(kind: str) -> Dict:
+    # kind in admins/mods/leaders
+    mapping = {
+        "admins": ("администратора", "admin"),
+        "mods": ("модератора", "moderator"),
+        "leaders": ("руководство", "leadership"),
+    }
+    title, role = mapping[kind]
+    return {
+        "inline_keyboard": [
+            [{"text": f"➕ Добавить {title}", "callback_data": f"admin:{kind}:add"}],
+            [{"text": f"➖ Удалить {title}", "callback_data": f"admin:{kind}:del"}],
+            [{"text": "📋 Показать список", "callback_data": f"admin:{kind}:list"}],
+            [{"text": "⬅️ Назад", "callback_data": "admin:menu"}],
+        ]
+    }
+
+def fetch_channel_page(url: str) -> Optional[str]:
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Safari/537.36"}
+    try:
+        r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        if r.status_code != 200:
+            log.error(f"HTTP {r.status_code} for {url}")
+            return None
+        return r.text
+    except Exception as e:
+        log.error(f"fetch_channel_page error {url}: {e}")
+        return None
+
+def extract_posts(html: str) -> List[Dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    messages = soup.find_all("div", class_="tgme_widget_message")
+    posts = []
+    for msg in messages:
+        try:
+            msg_id = msg.get("data-post", "")  # "channel/123"
+            text_block = msg.find("div", class_="tgme_widget_message_text")
+            text = text_block.get_text(" ", strip=True) if text_block else ""
+            time_tag = msg.find("time")
+            ts = parse_tg_datetime(time_tag.get("datetime") if time_tag else "")
+            links = []
+            for a in msg.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith("http"):
+                    links.append(href)
+            posts.append({"id": msg_id, "text": text, "timestamp": ts, "links": links})
+        except Exception as e:
+            log.error(f"extract_posts error: {e}")
+    return posts
+
+def process_channel(channel_username: str) -> List[Dict]:
+    url = f"https://t.me/s/{channel_username}"
+    html = fetch_channel_page(url)
+    if not html:
+        return []
+    posts = extract_posts(html)
+    hits = []
+    for p in posts:
+        text = normalize_text(p["text"])
+        found = detect_keywords(text)
+        if not found:
+            continue
+        if not mark_seen(channel_username, p["id"], p["timestamp"]):
+            continue
+        hits.append({
+            "channel": channel_username,
+            "post_id": p["id"],
+            "text": p["text"],
+            "timestamp": p["timestamp"],
+            "links": p.get("links", []),
+            "keywords": found,
+        })
+    return hits
+
+def scan_once() -> List[Dict]:
+    all_hits: List[Dict] = []
+    for ch in CHANNEL_LIST:
+        try:
+            hits = process_channel(ch)
+            if hits:
+                log.info(f"@{ch}: hits={len(hits)}")
+            all_hits.extend(hits)
+        except Exception as e:
+            log.error(f"scan channel @{ch} error: {e}")
+    return all_hits
+
+def generate_card(hit: Dict) -> Dict:
+    cid = generate_card_id()
+    card = {
+        "card_id": cid,
+        "channel": hit["channel"],
+        "post_id": hit["post_id"],
+        "timestamp": hit["timestamp"],
+        "text": hit["text"],
+        "keywords": hit["keywords"],
+        "links": hit.get("links", []),
+        "status": "new",
+        "history": [],
+    }
+    try:
+        enrich_card_with_yagpt(card)
+    except Exception as e:
+        log.error(f"enrich_card_with_yagpt error: {e}")
+    save_card(card)
+    return card
+
+def send_card_to_group(card: Dict) -> Optional[int]:
+    thr = get_prob_threshold()
+    prob = None
+    try:
+        prob = float((card.get("ai") or {}).get("probability"))
     except Exception:
-        return True
+        prob = None
+
+    if prob is not None and prob < thr:
+        card["status"] = "filtered"
+        card.setdefault("history", []).append({"event": "filtered", "threshold": thr, "ts": now_ts()})
+        save_card(card)
+        append_history({"event": "filtered", "card_id": card["card_id"], "threshold": thr, "prob": prob})
+        return None
+
+    res = send_message(TARGET_CHAT_ID, build_card_text(card), reply_markup=build_card_keyboard(card["card_id"]))
+    if not res or not res.get("ok"):
+        log.error(f"sendMessage failed: {res}")
+        return None
+
+    msg = res["result"]
+    card.setdefault("tg", {})
+    card["tg"]["chat_id"] = msg["chat"]["id"]
+    card["tg"]["message_id"] = msg["message_id"]
+    card["status"] = "sent"
+    card.setdefault("history", []).append({"event": "sent", "ts": now_ts(), "chat_id": card["tg"]["chat_id"], "message_id": card["tg"]["message_id"]})
+    save_card(card)
+    append_history({"event": "sent", "card_id": card["card_id"], "chat_id": card["tg"]["chat_id"], "message_id": card["tg"]["message_id"]})
+    return msg["message_id"]
+
+def apply_card_action(card_id: str, action: str, from_user: int) -> Tuple[str, bool]:
+    """
+    Returns (message, decided_now).
+    decided_now=True only for the first admin that made the decision.
+    """
+    existing = decision_exists(card_id)
+    if existing:
+        dec, by, ts = existing
+        dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+        return (f"Уже обработано: {dec} (админ {by}, {dt})", False)
+
+    if action not in ("work", "wrong", "attach"):
+        return ("Неизвестное действие.", False)
+
+    card = load_card(card_id)
+    if not card:
+        return ("Карточка не найдена.", False)
+
+    wrote = set_decision(card_id, action, from_user)
+    if not wrote:
+        return ("Уже обработано другим администратором.", False)
+
+    old_status = card.get("status", "new")
+    if action == "work":
+        new_status, label, msg = "in_work", "work", "Статус: В РАБОТУ ✅"
+    elif action == "wrong":
+        new_status, label, msg = "wrong", "wrong", "Статус: НЕВЕРНО ❌"
+    else:
+        new_status, label, msg = "bind", "attach", "Статус: ПРИВЯЗАТЬ 📎"
+
+    card["status"] = new_status
+    card.setdefault("history", []).append({"event": f"set_{new_status}", "from_user": int(from_user), "ts": now_ts()})
+    save_card(card)
+
+    append_history({"event": "status_change", "card_id": card_id, "from_user": int(from_user), "old_status": old_status, "new_status": new_status})
+    log_training_event(card_id, label, card.get("text", ""), card.get("channel", ""), admin_id=int(from_user))
+    return (msg, True)
 
 
+def _fetch_train_daily_last(days: int = 30):
+    conn = db()
+    rows = conn.execute("SELECT day, total, work, wrong, attach FROM train_daily ORDER BY day DESC LIMIT ?;", (int(days),)).fetchall()
+    conn.close()
+    return list(reversed(rows))
+
+def build_kpi_text() -> str:
+    rows = _fetch_train_daily_last(30)
+    if not rows:
+        return "📊 KPI: данных обучения пока нет."
+    total = sum(int(r[1]) for r in rows)
+    work = sum(int(r[2]) for r in rows)
+    wrong = sum(int(r[3]) for r in rows)
+    attach = sum(int(r[4]) for r in rows)
+    acc = ((work + attach) / total * 100.0) if total > 0 else 0.0
+    last_day = rows[-1][0]
+    return (
+        "📊 KPI (самострой-контроль)\n"
+        f"Период: последние {len(rows)} дн. (до {last_day})\n\n"
+        f"Всего решений: {total}\n"
+        f"В работу: {work}\n"
+        f"Неверно: {wrong}\n"
+        f"Привязать: {attach}\n"
+        f"Доля полезных (в работу+привязать): {acc:.1f}%\n"
+    )
+
+def build_report_xlsx() -> str:
+    out_path = os.path.join(REPORTS_DIR, f"report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "KPI"
+    ws.append(["Показатель", "Значение"])
+    for line in build_kpi_text().splitlines()[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            ws.append([k.strip(), v.strip()])
+
+    ws2 = wb.create_sheet("TrainingDaily")
+    ws2.append(["day", "total", "work", "wrong", "attach"])
+    for r in _fetch_train_daily_last(90):
+        ws2.append(list(r))
+
+    ws3 = wb.create_sheet("ChannelBias")
+    ws3.append(["channel", "bias_points"])
+    w = _get_model_param("weights", {"channels": {}})
+    for ch, b in sorted((w.get("channels") or {}).items(), key=lambda x: x[0]):
+        ws3.append([ch, b])
+
+    for wsx in [ws, ws2, ws3]:
+        for col in range(1, wsx.max_column + 1):
+            wsx.column_dimensions[get_column_letter(col)].width = 28
+
+    wb.save(out_path)
+    return out_path
+
+def build_report_pdf() -> str:
+    out_path = os.path.join(REPORTS_DIR, f"report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf")
+    c = canvas.Canvas(out_path, pagesize=A4)
+    width, height = A4
+    text = c.beginText(40, height - 60)
+    text.setFont("Helvetica", 12)
+    for line in build_kpi_text().splitlines():
+        text.textLine(line)
+    c.drawText(text)
+    c.showPage()
+    c.save()
+    return out_path
+
+def build_trainplot_png(days: int = 60) -> str:
+    out_path = os.path.join(REPORTS_DIR, f"trainplot_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png")
+    rows = _fetch_train_daily_last(days)
+    plt.figure(figsize=(10, 4))
+    if not rows:
+        plt.title("Training (no data)")
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        return out_path
+
+    days_list = [r[0] for r in rows]
+    total = [int(r[1]) for r in rows]
+    work = [int(r[2]) for r in rows]
+    wrong = [int(r[3]) for r in rows]
+    attach = [int(r[4]) for r in rows]
+
+    plt.plot(days_list, total, label="total")
+    plt.plot(days_list, work, label="work")
+    plt.plot(days_list, wrong, label="wrong")
+    plt.plot(days_list, attach, label="attach")
+    plt.xticks(rotation=45, ha="right")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    return out_path
+
+def get_all_report_recipients() -> List[int]:
+    ids = set()
+    for role in ("leadership", "admin", "moderator"):
+        for uid in list_users_by_role(role):
+            ids.add(int(uid))
+    return sorted(ids)
+
+def daily_reports_worker():
+    # Daily at 09:00 Moscow
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("Europe/Moscow")
+    except Exception:
+        tz = None
+
+    while True:
+        now = datetime.now(tz) if tz else datetime.now()
+        target = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target = target + timedelta(days=1)
+        time.sleep(max(5, int((target - now).total_seconds())))
+
+        try:
+            kpi = build_kpi_text()
+            xlsx = build_report_xlsx()
+            pdf = build_report_pdf()
+            png = build_trainplot_png()
+
+            for uid in get_all_report_recipients():
+                send_message(uid, kpi)
+                send_document(uid, xlsx, caption="📄 Ежедневный отчёт (XLSX)")
+                send_document(uid, pdf, caption="🧾 Ежедневный отчёт (PDF)")
+                send_photo(uid, png, caption="📈 График обучения")
+        except Exception as e:
+            log.exception(f"daily_reports_worker error: {e}")
+
+UPDATE_OFFSET = get_update_offset()
 
 def handle_callback_query(upd: Dict):
-    # --- normalize callback update ---
-    cq = upd.get('callback_query') or {}
-    data = cq.get('data')
-    cb_id = cq.get('id')
-    msg = cq.get('message') or {}
-    chat = msg.get('chat') or {}
-    chat_id = int(chat.get('id', 0) or 0)
-    msg_id = int(msg.get('message_id', 0) or 0)
-    if not data or not chat_id or not msg_id:
-        return
-    # ---------------------------------
-    # ---------------------------------
-
     cb = upd.get("callback_query") or {}
-    # data already set above
+    cb_id = cb.get("id")
+    from_user = int((cb.get("from") or {}).get("id", 0))
+    data = (cb.get("data") or "").strip()
+    msg_obj = cb.get("message") or {}
+    chat_id = (msg_obj.get("chat") or {}).get("id")
+    message_id = msg_obj.get("message_id")
 
-    # --- ADMIN PANEL CALLBACKS ---
-    uid = get_sender_user_id(upd)
-    if data and data.startswith("admin:"):
-        if not is_privileged(uid):
-            answer_callback_query(cb_id, "Нет доступа")
-            return
-        action = data.split(":",1)[1]
+    role = get_role(from_user)  # may be None
 
-        if action == "back":
-            edit_message_text(chat_id, msg_id, admin_menu_text(), reply_markup=admin_menu_kb())
-            answer_callback_query(cb_id, "OK")
-            return
-        if action == "roles":
-            edit_message_text(chat_id, msg_id, build_roles_text(), reply_markup=admin_roles_kb())
-            answer_callback_query(cb_id, "OK")
-            return
-        if action == "reports":
-            edit_message_text(chat_id, msg_id, "🧾 Отчёты", reply_markup=admin_reports_kb())
-            answer_callback_query(cb_id, "OK")
-            return
-        if action == "settings":
-            edit_message_text(chat_id, msg_id, "⚙️ Настройки", reply_markup=admin_settings_kb())
-            answer_callback_query(cb_id, "OK")
-            return
-        if action == "set_aigate":
-            set_admin_mode(uid, "set_aigate")
-            send_message(
-                chat_id,
-                f"🎚 AI‑gate порог (в процентах).\n\nТекущий: {MIN_AI_GATE:.1f}%\n\nВведи число от 0 до 100.",
-            )
-            answer_callback_query(cb_id, "Введите число 0–100")
-            return
-
-        if action == "stats":
-            try:
-                txt = build_onzs_stats()
-            except Exception:
-                txt = "📊 Статистика пока недоступна."
-            edit_message_text(chat_id, msg_id, txt, reply_markup={"inline_keyboard":[[{"text":"⬅️ Назад","callback_data":"admin:back"}]]})
-            answer_callback_query(cb_id, "OK")
-            return
-        if action == "list_roles":
-            answer_callback_query(cb_id, "OK")
-            send_message(chat_id, build_roles_text())
-            return
-        if action in ("add_admin","del_admin","add_mod","del_mod","add_lead","del_lead","add_report_target","del_report_target"):
-            set_admin_mode(uid, action)
-            answer_callback_query(cb_id, "OK")
-            send_message(chat_id, "✍️ Пришлите Telegram ID пользователя (числом).")
-            return
-        if action == "report_targets":
-            answer_callback_query(cb_id, "OK")
-            send_message(chat_id, build_roles_text())
-            return
-        if action == "report_day":
-            answer_callback_query(cb_id, "OK")
-            send_message(chat_id, build_daily_report_text())
-            return
-        if action == "reload_onzs":
-            load_onzs_catalog()
-            answer_callback_query(cb_id, "OK")
-            send_message(chat_id, f"✅ ОНзС перезагружен: {len(ONZS_MAP)}")
-            return
-        if action == "test_yagpt":
-            answer_callback_query(cb_id, "OK")
-            try:
-                t = call_yandex_gpt_raw([{"role":"user","text":"Тест. Ответь одним словом: ОК"}])
-                send_message(chat_id, f"🧪 YandexGPT: {str(t)[:500]}")
-            except Exception as e:
-                send_message(chat_id, f"🧪 YandexGPT ошибка: {e}")
-            return
-    cb_id = cb.get("id") or ""
-    msg = cb.get("message") or {}
-    from_user = (cb.get("from") or {}).get("id")
-    chat_id = (msg.get("chat") or {}).get("id")
-    message_id = msg.get("message_id")
-
-    if not from_user:
-        answer_callback(cb_id, "Ошибка", show_alert=True)
-        return
-
-    # -------------------- ADMIN ACTIONS --------------------
-    if data.startswith("admin:"):
-        # доступ: админ/модератор/руководство
-        if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
-            answer_callback(cb_id, "Нет доступа", show_alert=True)
-            return
-
-        op = data.split(":", 1)[1]
-
-        if op == "onzs_stats":
-            if chat_id:
-                send_message(chat_id, build_onzs_stats())
-            answer_callback(cb_id, "Готово")
-            return
-
-        if op == "reload_onzs":
-            load_onzs_catalog()
-            if chat_id:
-                send_message(chat_id, f"🔄 Каталог ОНзС перезагружен: {len(ONZS_MAP)} элементов")
-            answer_callback(cb_id, "Перезагружено")
-            return
-
-        if op == "test_yagpt":
-            ok = False
-            detail = ""
-            try:
-                out_text, meta = call_yandex_gpt_raw([
-                    {"role": "system", "text": "Отвечай одной строкой: OK."},
-                    {"role": "user", "text": "Ответь одной строкой: OK"},
-                ])
-                if isinstance(out_text, str) and "OK" in out_text.upper():
-                    ok = True
-                else:
-                    detail = (out_text or "")[:200]
-            except Exception as e:
-                detail = str(e)[:200]
-
-            if chat_id:
-                send_message(chat_id, "✅ YandexGPT: OK" if ok else f"⚠️ YandexGPT: нет ответа. {detail}")
-            answer_callback(cb_id, "OK" if ok else "Проблема")
-            return
-
-        answer_callback(cb_id, "Неизвестная команда", show_alert=True)
-        return
-
-    # -------------------- ONZS ACTIONS --------------------
-    if data.startswith("onzs:"):
-        if not is_moderator(from_user):
-            answer_callback(cb_id, "❌ Нет доступа.", show_alert=True)
-            return
-
-        parts = data.split(":")
-        op = parts[1] if len(parts) > 1 else ""
-
-        if op == "edit" and len(parts) == 3:
-            card_id = parts[2]
-            if chat_id and message_id:
-                edit_reply_markup(chat_id, message_id, reply_markup=build_onzs_pick_keyboard(card_id))
-            answer_callback(cb_id, "Выбери ОНзС (1–12)")
-            return
-
-        if op == "set" and len(parts) == 4:
-            card_id = parts[2]
-            try:
-                n = int(parts[3])
-            except Exception:
-                n = 0
-            if n < 1 or n > 12:
-                answer_callback(cb_id, "ОНзС должен быть 1–12", show_alert=True)
-                return
-
-            card = load_card(card_id)
-            if not card:
-                answer_callback(cb_id, "Карточка не найдена", show_alert=True)
-                return
-
-            card.setdefault("onzs", {})
-            card["onzs"]["value"] = n
-            card["onzs"]["source"] = "manual"
-            card["onzs"]["confirmed"] = False
-            card["onzs"]["updated_by"] = from_user
-            card["onzs"]["updated_ts"] = now_ts()
-            save_card(card)
-
-            # learning: manual correction is also a training signal (confirmed=False)
-            save_onzs_training(card.get("text", ""), n, confirmed=False)
-
-            if chat_id and message_id:
-                edit_message_text(chat_id, message_id, build_card_text(card), reply_markup=build_card_keyboard(card_id))
-            answer_callback(cb_id, f"ОНзС установлен: {n}")
-            return
-
-        if op == "confirm" and len(parts) == 3:
-            card_id = parts[2]
-            card = load_card(card_id)
-            if not card:
-                answer_callback(cb_id, "Карточка не найдена", show_alert=True)
-                return
-
-            oz = card.get("onzs") or {}
-            val = oz.get("value") if oz.get("value") else oz.get("ai")
-            if not val:
-                answer_callback(cb_id, "ОНзС ещё не определён", show_alert=True)
-                return
-
-            card.setdefault("onzs", {})
-            card["onzs"]["confirmed"] = True
-            card["onzs"]["confirmed_by"] = from_user
-            card["onzs"]["confirmed_ts"] = now_ts()
-            save_card(card)
-
-            # learning: confirmation is a positive example
-            save_onzs_training(card.get("text", ""), int(val), confirmed=True)
-
-            if chat_id and message_id:
-                edit_message_text(chat_id, message_id, build_card_text(card), reply_markup=build_card_keyboard(card_id))
-            answer_callback(cb_id, "ОНзС подтверждён")
-            return
-
-        if op == "back" and len(parts) == 3:
-            card_id = parts[2]
-            if chat_id and message_id:
-                edit_reply_markup(chat_id, message_id, reply_markup=build_card_keyboard(card_id))
-            answer_callback(cb_id, "Ок")
-            return
-
-        answer_callback(cb_id, "Неизвестная команда ОНзС", show_alert=True)
-        return
-
-    # -------------------- CARD ACTIONS --------------------
+    # Card actions
     if data.startswith("card:"):
-        parts = data.split(":")
-        if len(parts) != 3:
-            answer_callback(cb_id, "Ошибка", show_alert=True)
-            return
-        card_id, action = parts[1], parts[2]
-        if not is_moderator(from_user):
-            answer_callback(cb_id, "❌ Нет доступа.", show_alert=True)
+        if not is_admin(from_user):
+            answer_callback(cb_id, "Только администраторы могут менять статус.", show_alert=True)
             return
 
-        card = load_card(card_id)
-        if not card:
-            answer_callback(cb_id, "Карточка не найдена", show_alert=True)
-            return
-
-        label = None
-        if action == "work":
-            label = "work"
-            answer_callback(cb_id, "Принято: В работу")
-        elif action == "wrong":
-            label = "wrong"
-            answer_callback(cb_id, "Принято: Неверно")
-        elif action == "attach":
-            label = "attach"
-            answer_callback(cb_id, "Принято: Привязать")
-        else:
-            answer_callback(cb_id, "Неизвестное действие", show_alert=True)
-            return
-
-        append_history({"text": card.get("text", ""), "label": label, "channel": card.get("channel", ""), "reason": "user_action"})
-
-        # Remove buttons after action
-        if chat_id and message_id:
-            edit_reply_markup(chat_id, message_id, reply_markup={"inline_keyboard": []})
-        return
-
-    answer_callback(cb_id, "OK")
-
-# ----------------------------- COMMANDS -----------------------------def handle_message(upd: Dict):
-    # --- ensure chat_id is always defined ---
-    msg = upd.get('message') or {}
-    chat = msg.get('chat') or {}
-    chat_id = int(chat.get('id', 0) or 0)
-    text = (msg.get('text') or '').strip()
-    if not text: 
-        return
-    # ---------------------------------------
-
-    msg = upd.get("message") or {}
-    text = (msg.get("text") or "").strip()
-
-    # --- ADMIN MODE INPUT (role management) ---
-    uid = get_sender_user_id(upd)
-    mode = get_admin_mode(uid)
-    if mode and text and not text.startswith("/"):
-        m_id = re.search(r"(\d+)", text)
-        if not m_id:
-            send_message(chat_id, "⚠️ Пришлите числовой Telegram ID пользователя.")
-            return
-        target_uid = int(m_id.group(1))
-        if mode == "add_admin":
-            _roles_add("admins", target_uid); send_message(chat_id, f"✅ Добавлен админ: {target_uid}")
-        elif mode == "del_admin":
-            _roles_del("admins", target_uid); send_message(chat_id, f"✅ Удалён админ: {target_uid}")
-        elif mode == "add_mod":
-            _roles_add("moderators", target_uid); send_message(chat_id, f"✅ Добавлен модератор: {target_uid}")
-        elif mode == "del_mod":
-            _roles_del("moderators", target_uid); send_message(chat_id, f"✅ Удалён модератор: {target_uid}")
-        elif mode == "add_lead":
-            _roles_add("leadership", target_uid); send_message(chat_id, f"✅ Добавлено руководство: {target_uid}")
-        elif mode == "del_lead":
-            _roles_del("leadership", target_uid); send_message(chat_id, f"✅ Удалено руководство: {target_uid}")
-        elif mode == "add_report_target":
-            _roles_add("report_targets", target_uid); send_message(chat_id, f"✅ Добавлен получатель отчётов: {target_uid}")
-        elif mode == "del_report_target":
-            _roles_del("report_targets", target_uid); send_message(chat_id, f"✅ Удалён получатель отчётов: {target_uid}")
-        pop_admin_mode(uid)
-        return
-
-    if text == "/admin":
-        if not is_privileged(uid):
-            send_message(chat_id, "❌ Нет доступа.")
-            return
-        send_message(chat_id, admin_menu_text(), reply_markup=admin_menu_kb())
-        return
-    chat_id = (msg.get("chat") or {}).get("id")
-    from_user = (msg.get("from") or {}).get("id")
-    if not chat_id or not from_user:
-        return
-
-    if text == "/admin":
-        uid = get_sender_user_id(upd)
-        if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
-            send_message(chat_id, "❌ Нет доступа.")
-            return
-
-        onzs_cnt = len(ONZS_MAP) if isinstance(ONZS_MAP, dict) else 0
-        yagpt_enabled = bool(YAGPT_API_KEY and YAGPT_FOLDER_ID)
-        info = []
-        info.append("🛠 Админ-панель")
-        info.append(f"ID: {from_user}")
-        info.append(f"YandexGPT: {'ON' if yagpt_enabled else 'OFF'} | model={YAGPT_MODEL}")
-        info.append(f"AI-gate: {MIN_AI_GATE}% | HTTP_TIMEOUT={HTTP_TIMEOUT}s")
-        info.append(f"ОНзС каталог: {onzs_cnt} | файл: {ONZS_XLSX}")
-        info.append(f"Admins: {len(ADMINS)} | Moderators: {len(MODERATORS)} | Leadership: {len(LEADERSHIP)}")
-        send_message(chat_id, "\n".join(info), reply_markup=build_admin_keyboard())
-        return
-
-    if text == "/onzs_ai_stats":
-        uid = get_sender_user_id(upd)
-        if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
-            send_message(chat_id, "❌ Нет доступа.")
-            return
-        send_message(chat_id, build_onzs_stats())
-        return
-
-    if text == "/start":
-        send_message(chat_id, "Бот запущен.")
-        return
-
-# ----------------------------- GETUPDATES LOOP -----------------------------def acquire_lock() -> bool:
-    try:
-        if os.path.exists(LOCK_FILE):
-            # stale lock check: 10 minutes
-            if now_ts() - int(os.path.getmtime(LOCK_FILE)) > 600:
-                os.remove(LOCK_FILE)
-            else:
-                return False
-        with open(LOCK_FILE, "w", encoding="utf-8") as f:
-            f.write(str(now_ts()))
-        return True
-    except Exception:
-        return True
-
-def touch_lock():
-    try:
-        with open(LOCK_FILE, "w", encoding="utf-8") as f:
-            f.write(str(now_ts()))
-    except Exception:
-        pass
-
-
-# ----------------- TELETHON WATCHER (OPTIONAL) -----------------
-def _ensure_telethon_session_file() -> Optional[str]:
-    """Materialize Telethon .session file from TG_SESSION_B64 into DATA_DIR.
-    Returns session file path (without requiring the bot to be added to source chats).
-    """
-    if not TG_API_ID or not TG_API_HASH:
-        return None
-    session_path = TG_SESSION_PATH.strip() if TG_SESSION_PATH else os.path.join(DATA_DIR, "telethon.session")
-    # If user provided a ready session file path and it exists, use it
-    if TG_SESSION_PATH and os.path.exists(session_path):
-        return session_path
-
-    if not TG_SESSION_B64:
-        # allow running without Telethon
-        if os.path.exists(session_path):
-            return session_path
-        return None
-
-    try:
-        raw = base64.b64decode(TG_SESSION_B64.encode("utf-8"), validate=False)
-        os.makedirs(os.path.dirname(session_path) or ".", exist_ok=True)
-        # write only if differs (avoid disk churn)
-        need_write = True
-        if os.path.exists(session_path):
-            try:
-                with open(session_path, "rb") as f:
-                    if f.read() == raw:
-                        need_write = False
-            except Exception:
-                pass
-        if need_write:
-            with open(session_path, "wb") as f:
-                f.write(raw)
-        return session_path
-    except Exception as e:
-        log.error(f"[TL] Failed to decode/write TG_SESSION_B64: {e}")
-        return None
-
-def _tme_link(source: str, msg_id: int) -> str:
-    s = (source or "").strip()
-    if s.startswith("@"):
-        s = s[1:]
-    # for public chats, t.me/<username>/<id>
-    if s and re.match(r"^[A-Za-z0-9_]{5,}$", s):
-        return f"https://t.me/{s}/{msg_id}"
-    return ""
-
-async def _telethon_watch_loop():
-    if TelegramClient is None:
-        log.warning("[TL] Telethon is not installed. Add 'telethon' to requirements.txt to enable source reading.")
-        return
-    session_path = _ensure_telethon_session_file()
-    if not session_path:
-        log.info("[TL] Telethon watcher disabled (no TG_API_ID/TG_API_HASH or no session).")
-        return
-    if not SOURCE_CHATS:
-        log.info("[TL] Telethon watcher disabled (SOURCE_CHATS empty).")
-        return
-
-    client = TelegramClient(session_path, TG_API_ID, TG_API_HASH)
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            log.error("[TL] Telethon session is not authorized. Recreate session and set TG_SESSION_B64.")
-            return
-
-        log.info(f"[TL] Watching {len(SOURCE_CHATS)} source chat(s): {SOURCE_CHATS}")
-
-        state_path = os.path.join(DATA_DIR, "telethon_state.json")
-        state: Dict[str, int] = {}
         try:
-            if os.path.exists(state_path):
-                with open(state_path, "r", encoding="utf-8") as f:
-                    state = {k: int(v) for k, v in (json.load(f) or {}).items()}
-        except Exception:
-            state = {}
+            _, card_id, action = data.split(":", 2)
+        except ValueError:
+            answer_callback(cb_id, "Ошибка формата данных.", show_alert=True)
+            return
 
-        entity_cache: Dict[str, Any] = {}
+        result, decided_now = apply_card_action(card_id, action, from_user)
 
-        while True:
-            try:
-                touch_lock()
-                for src in SOURCE_CHATS:
-                    try:
-                        if src not in entity_cache:
-                            entity_cache[src] = await client.get_entity(src)
-                        ent = entity_cache[src]
-                        last_id = int(state.get(src, 0) or 0)
-
-                        # Process in chronological order
-                        async for msg in client.iter_messages(ent, min_id=last_id, reverse=True):
-                            if not msg:
-                                continue
-                            txt0 = (msg.message or "").strip()
-                            if not txt0:
-                                continue
-                            link = _tme_link(src, msg.id)
-                            text = txt0 + (f"\n\nИсточник: {link}" if link else "")
-
-                            card = create_card(channel=str(src), post_id=msg.id, text=text)
-                            if card:
-                                try:
-                                    send_message(TARGET_CHAT_ID, build_card_text(card), reply_markup=build_card_keyboard(card.get("card_id", "")))
-                                except Exception as e:
-                                    log.error(f"[TL] Failed to send card to TARGET_CHAT_ID: {e}")
-
-                            state[src] = max(int(state.get(src, 0) or 0), int(msg.id))
-
-                        # persist after each source
-                        try:
-                            with open(state_path, "w", encoding="utf-8") as f:
-                                json.dump(state, f, ensure_ascii=False)
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        log.error(f"[TL] Source {src!r} error: {e}")
-
-                await asyncio.sleep(max(10, int(SCAN_INTERVAL or 300)))
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log.error(f"[TL] Watch loop error: {e}")
-                await asyncio.sleep(10)
-    finally:
+        # Always try to remove keyboard; even if already decided (for cleanliness)
         try:
-            await client.disconnect()
+            if chat_id is not None and message_id is not None:
+                edit_reply_markup(chat_id, message_id, reply_markup=None)
         except Exception:
             pass
 
-def start_telethon_watcher():
-    """Start Telethon watcher in a background thread (non-blocking)."""
-    def _runner():
-        try:
-            asyncio.run(_telethon_watch_loop())
-        except Exception as e:
-            log.error(f"[TL] Thread crashed: {e}")
-
-    th = threading.Thread(target=_runner, daemon=True)
-    th.start()
-    return th
-
-def run_poller():
-    offset = 0
-    backoff = 2
-    max_backoff = 30
-
-    while True:
-        touch_lock()
-
-        # Use long-polling (timeout=45) and ensure HTTP timeout exceeds it
-        resp = tg_get("getUpdates", {"timeout": 45, "offset": offset}, timeout_override=max(HTTP_TIMEOUT, 60))
-
-        if not resp or not resp.get("ok"):
-            # Network is often unstable on some hosts; apply exponential backoff
-            time.sleep(backoff)
-            backoff = min(max_backoff, backoff * 2)
-            continue
-
-        # Successful response -> reset backoff
-        backoff = 2
-
-        updates = resp.get("result", [])
-        for u in updates:
-            offset = max(offset, (u.get("update_id", 0) + 1))
-            if "callback_query" in u:
-                handle_callback_query(u)
-            elif "message" in u:
-                handle_message(u)
-
-# ----------------------------- MAIN -----------------------------
-
-def start_health_server():
-    """Start a minimal HTTP server on PORT for Railway/Web-style deployments.
-
-    Railway "Web" services expect a process to bind to $PORT. If you deploy this
-    bot as a Web service, lack of an open port may cause the platform to stop
-    the container as "unhealthy".
-
-    If PORT is not set (or invalid), this function does nothing.
-    """
-    port_s = os.getenv("PORT")
-    if not port_s:
-        return
-    try:
-        port = int(port_s)
-    except Exception:
-        log.warning(f"[HEALTH] invalid PORT={port_s!r}; skipping health server")
+        answer_callback(cb_id, result, show_alert=False)
         return
 
-    class _Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"OK")
-
-        def log_message(self, fmt, *args):
-            # silence default http.server access logs
+    # Admin panel
+    if data.startswith("admin:"):
+        if not is_admin(from_user):
+            answer_callback(cb_id, "❌ Нет доступа.", show_alert=True)
             return
 
-    def _serve():
-        try:
-            httpd = HTTPServer(("0.0.0.0", port), _Handler)
-            log.info(f"[HEALTH] listening on 0.0.0.0:{port}")
-            httpd.serve_forever()
-        except Exception as e:
-            log.warning(f"[HEALTH] server failed: {e}")
+        parts = data.split(":")
 
-    t = threading.Thread(target=_serve, name="health_server", daemon=True)
-    t.start()
+        if data == "admin:menu":
+            send_message(chat_id, "🛠 Админ-панель:", reply_markup=build_admin_keyboard())
+            answer_callback(cb_id, "Ок"); return
+
+        # Threshold
+        if data == "admin:threshold:menu":
+            send_message(chat_id, "🎯 Настройка порога вероятности (0–100):", reply_markup=build_threshold_keyboard())
+            answer_callback(cb_id, "Ок"); return
+
+        if len(parts) == 4 and parts[1] == "threshold" and parts[2] == "set":
+            try: v = int(parts[3])
+            except Exception: v = DEFAULT_THRESHOLD
+            set_prob_threshold(v)
+            send_message(chat_id, f"✅ Порог установлен: {get_prob_threshold()}%", reply_markup=build_admin_keyboard())
+            answer_callback(cb_id, "Сохранено"); return
+
+        if data == "admin:threshold:manual":
+            ADMIN_STATE[from_user] = "await_threshold"
+            send_message(chat_id, "Введите порог числом 0–100 (сообщением).")
+            answer_callback(cb_id, "Ожидаю ввод"); return
+
+        # Users management
+        if data == "admin:admins:menu":
+            send_message(chat_id, "👥 Управление администраторами:", reply_markup=build_users_keyboard("admins"))
+            answer_callback(cb_id, "Ок"); return
+        if data == "admin:mods:menu":
+            send_message(chat_id, "🧑‍⚖️ Управление модераторами:", reply_markup=build_users_keyboard("mods"))
+            answer_callback(cb_id, "Ок"); return
+        if data == "admin:leaders:menu":
+            send_message(chat_id, "🏛 Управление руководством:", reply_markup=build_users_keyboard("leaders"))
+            answer_callback(cb_id, "Ок"); return
+
+        # list/add/del handlers
+        if len(parts) == 3 and parts[2] == "list" and parts[1] in ("admins","mods","leaders"):
+            role_map = {"admins":"admin","mods":"moderator","leaders":"leadership"}
+            role_key = role_map[parts[1]]
+            ids = list_users_by_role(role_key)
+            txt = "\n".join(str(i) for i in ids) if ids else "Список пуст."
+            send_message(chat_id, f"Список ({role_key}):\n{txt}")
+            answer_callback(cb_id, "Ок"); return
+
+        if len(parts) == 3 and parts[2] in ("add","del") and parts[1] in ("admins","mods","leaders"):
+            op = parts[2]
+            ADMIN_STATE[from_user] = f"await_{op}_{parts[1]}"
+            send_message(chat_id, "Отправьте Telegram ID (числом) следующим сообщением.")
+            answer_callback(cb_id, "Ожидаю ID"); return
+
+        # Reports & KPI
+        if data == "admin:report:xlsx":
+            p = build_report_xlsx()
+            send_document(chat_id, p, caption="📄 Отчёт (XLSX)")
+            answer_callback(cb_id, "Готово"); return
+
+        if data == "admin:report:pdf":
+            p = build_report_pdf()
+            send_document(chat_id, p, caption="🧾 Отчёт (PDF)")
+            answer_callback(cb_id, "Готово"); return
+
+        if data == "admin:kpi":
+            send_message(chat_id, build_kpi_text())
+            answer_callback(cb_id, "Ок"); return
+
+        # Training info
+        if data == "admin:trainstats":
+            st = compute_training_stats()
+            last = st["last_ts"]
+            last_s = datetime.fromtimestamp(last).strftime("%d.%m.%Y %H:%M") if last else "—"
+            send_message(
+                chat_id,
+                "📊 Статистика обучения (агрегация по всем админам):\n\n"
+                f"• Всего событий: {st['total']}\n"
+                f"   ├─ В работу: {st['work']}\n"
+                f"   ├─ Неверно: {st['wrong']}\n"
+                f"   └─ Привязать: {st['attach']}\n\n"
+                f"• Прогресс к цели ({st['target']}): {st['progress']}%\n"
+                f"• Условная уверенность: {st['confidence']}%\n"
+                f"• Последнее событие: {last_s}\n"
+            )
+            answer_callback(cb_id, "Ок"); return
+
+        if data == "admin:trainplot:text":
+            send_message(chat_id, training_plot_text(days=14))
+            answer_callback(cb_id, "Ок"); return
+
+        if data == "admin:trainplot:png":
+            p = build_trainplot_png()
+            send_photo(chat_id, p, caption="📈 График обучения (PNG)")
+            answer_callback(cb_id, "Ок"); return
+
+        if data == "admin:trainlog":
+            events = tail_training_log(limit=MAX_TRAIN_LOG)
+            if not events:
+                send_message(chat_id, "🗂 Журнал обучения пуст.")
+                answer_callback(cb_id, "Ок"); return
+            lines = ["🗂 Последние события обучения:"]
+            for e in events[-MAX_TRAIN_LOG:]:
+                ts = e.get("timestamp")
+                dt = datetime.fromtimestamp(int(ts)).strftime("%d.%m %H:%M") if isinstance(ts, int) else "—"
+                lbl = e.get("label", "—")
+                adm = e.get("admin_id", "—")
+                cid = e.get("card_id", "—")
+                ch = e.get("channel", "—")
+                lines.append(f"• {dt} | {lbl} | @{ch} | admin={adm} | card={cid}")
+            send_message(chat_id, "\n".join(lines))
+            answer_callback(cb_id, "Ок"); return
+
+        answer_callback(cb_id, "Неизвестное действие.", show_alert=False)
+        return
+
+    answer_callback(cb_id, "")
+
+def handle_message(upd: Dict):
+    msg = upd.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    from_user = int((msg.get("from") or {}).get("id", 0))
+    text = (msg.get("text") or "").strip()
+
+    # stateful admin inputs
+    if is_admin(from_user) and from_user in ADMIN_STATE and not text.startswith("/"):
+        st = ADMIN_STATE.pop(from_user, "")
+
+        if st == "await_threshold":
+            m = re.findall(r"-?\d+", text)
+            if not m:
+                send_message(chat_id, "❌ Не распознал число. Введите 0–100.")
+                ADMIN_STATE[from_user] = "await_threshold"
+                return
+            set_prob_threshold(int(m[0]))
+            send_message(chat_id, f"✅ Порог установлен: {get_prob_threshold()}%", reply_markup=build_admin_keyboard())
+            return
+
+        # user role operations
+        m = re.findall(r"\d+", text)
+        if not m:
+            send_message(chat_id, "❌ Не распознал ID. Отправьте число.")
+            ADMIN_STATE[from_user] = st
+            return
+        uid = int(m[0])
+
+        if st == "await_add_admins":
+            add_admin(uid); send_message(chat_id, f"✅ Администратор добавлен: {uid}", reply_markup=build_admin_keyboard()); return
+        if st == "await_del_admins":
+            if uid == from_user:
+                send_message(chat_id, "❌ Нельзя удалить самого себя через меню. Используйте другого админа."); return
+            remove_admin(uid); send_message(chat_id, f"🗑 Администратор удалён: {uid}", reply_markup=build_admin_keyboard()); return
+
+        if st == "await_add_mods":
+            add_moderator(uid); send_message(chat_id, f"✅ Модератор добавлен: {uid}", reply_markup=build_admin_keyboard()); return
+        if st == "await_del_mods":
+            remove_moderator(uid); send_message(chat_id, f"🗑 Модератор удалён: {uid}", reply_markup=build_admin_keyboard()); return
+
+        if st == "await_add_leaders":
+            add_leadership(uid); send_message(chat_id, f"✅ Добавлено в руководство: {uid}", reply_markup=build_admin_keyboard()); return
+        if st == "await_del_leaders":
+            remove_leadership(uid); send_message(chat_id, f"🗑 Удалено из руководства: {uid}", reply_markup=build_admin_keyboard()); return
+
+        # unknown state
+        send_message(chat_id, "⚠️ Неизвестная операция. /admin")
+        return
+
+    if not text.startswith("/"):
+        return
+
+    cmd = text.split()[0].split("@")[0]
+
+    if cmd == "/admin":
+        if not is_admin(from_user):
+            send_message(chat_id, "❌ Команда /admin доступна только администраторам.")
+            return
+        send_message(chat_id, "🛠 Админ-панель:", reply_markup=build_admin_keyboard())
+        return
+
+    if cmd == "/dashboard":
+        if not (is_admin(from_user) or is_leadership(from_user)):
+            send_message(chat_id, "❌ Нет доступа.")
+            return
+        send_message(chat_id, build_kpi_text())
+        p = build_trainplot_png()
+        send_photo(chat_id, p, caption="📈 График обучения (PNG)")
+        return
+
+    if cmd == "/trainstats":
+        if not is_admin(from_user):
+            send_message(chat_id, "❌ Команда доступна только администраторам.")
+            return
+        st = compute_training_stats()
+        last = st["last_ts"]
+        last_s = datetime.fromtimestamp(last).strftime("%d.%m.%Y %H:%M") if last else "—"
+        send_message(chat_id, f"Всего={st['total']} (work={st['work']}, wrong={st['wrong']}, attach={st['attach']}), последн={last_s}")
+        return
+
+def poll_updates_loop():
+    global UPDATE_OFFSET
+    if not TELEGRAM_API_URL:
+        log.warning("Telegram API not configured; poller not started.")
+        return
+
+    try:
+        tg_post("deleteWebhook", {"drop_pending_updates": False})
+    except Exception:
+        pass
+
+    log.info("Starting getUpdates poller...")
+    while True:
+        try:
+            params = {"timeout": 25, "offset": UPDATE_OFFSET, "allowed_updates": ["message", "callback_query"]}
+            data = tg_get("getUpdates", params=params)
+            if not data:
+                time.sleep(2); continue
+
+            if not data.get("ok"):
+                if data.get("error_code") == 409:
+                    log.error("getUpdates conflict (409). Exiting.")
+                    raise SystemExit(0)
+                log.error(f"getUpdates error: {data}")
+                time.sleep(3); continue
+
+            updates = data.get("result", []) or []
+            if not updates:
+                continue
+
+            for upd in updates:
+                UPDATE_OFFSET = max(UPDATE_OFFSET, int(upd["update_id"]) + 1)
+                if "callback_query" in upd:
+                    handle_callback_query(upd)
+                elif "message" in upd:
+                    handle_message(upd)
+
+            # persist offset (so restart doesn't replay)
+            set_update_offset(UPDATE_OFFSET)
+
+        except SystemExit:
+            raise
+        except Exception as e:
+            log.error(f"poll_updates exception: {e}")
+            time.sleep(3)
+
+def run_scan_cycle() -> int:
+    hits = scan_once()
+    if not hits:
+        return 0
+    sent_count = 0
+    for h in hits:
+        card = generate_card(h)
+        mid = send_card_to_group(card)
+        if mid:
+            sent_count += 1
+            time.sleep(0.4)
+    return sent_count
 
 def main():
-    init_db()
-    load_onzs_catalog()
-    log.info('=== VERSION: ONZS + AI-GATE + BUTTONS + STATS ===')
-
-    # If deployed as a Web service, keep the platform health-checks satisfied.
-    start_health_server()
-
-    if YAGPT_API_KEY and YAGPT_FOLDER_ID:
-        log.info(f"[YAGPT] enabled | folder={YAGPT_FOLDER_ID} | model={YAGPT_MODEL}")
-    else:
-        log.warning("[YAGPT] disabled (missing key/folder)")
-
     log.info("SAMASTROI SCRAPER starting...")
     log.info(f"DATA_DIR={DATA_DIR}")
     log.info(f"TARGET_CHAT_ID={TARGET_CHAT_ID}")
     log.info(f"SCAN_INTERVAL={SCAN_INTERVAL}")
-    log.info(f"Admins: {ADMINS}")
-    log.info(f"Moderators: {MODERATORS}")
-    log.info(f"Leadership: {LEADERSHIP}")
-    log.info(f"Prob threshold: {MIN_AI_GATE}%")
-    _acq = globals().get('acquire_lock')
-    log.info(f"[LOCK] acquire_lock callable={callable(_acq)}")
-    if callable(_acq) and (not _acq()):
-        log.error("Lock exists: another poller is running. Exiting.")
-        return
+    log.info(f"Admins: {list_users_by_role('admin')}")
+    log.info(f"Moderators: {list_users_by_role('moderator')}")
+    log.info(f"Leadership: {list_users_by_role('leadership')}")
+    log.info(f"Prob threshold: {get_prob_threshold()}%")
 
-    log.info(f"Lock acquired: {LOCK_FILE}")
-    log.info("Starting getUpdates poller...")
+    acquire_lock_or_exit()
+
     try:
-        run_poller()
+        # poller + daily reports in daemon threads
+        threading.Thread(target=poll_updates_loop, daemon=True).start()
+        threading.Thread(target=daily_reports_worker, daemon=True).start()
+
+        while True:
+            try:
+                sent = run_scan_cycle()
+                if sent:
+                    log.info(f"Cycle done: sent={sent}")
+            except Exception as e:
+                log.error(f"scan cycle error: {e}")
+            time.sleep(SCAN_INTERVAL)
     finally:
         release_lock()
 
