@@ -14,6 +14,7 @@ SAMASTROI SCRAPER (Railway-ready, OFFICIAL)
 """
 
 import os
+import shutil
 import re
 import json
 import time
@@ -58,6 +59,30 @@ HISTORY_CARDS = os.path.join(DATA_DIR, "history_cards.jsonl")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 DB_PATH = os.path.join(DATA_DIR, "scraper.db")
 LOCK_PATH = os.path.join(DATA_DIR, ".poller.lock")
+
+
+def _seed_config_files() -> None:
+    """Seed /data/groups.txt and /data/keywords.txt from repo files if present.
+
+    Railway volumes persist across deploys. If you keep config files in the repo under ./data,
+    this helper copies them into DATA_DIR on first run so the scraper will load them.
+    """
+    try:
+        pairs = [
+            (os.path.join(DATA_DIR, "groups.txt"), ["/app/data/groups.txt", os.path.join(os.getcwd(), "data", "groups.txt")]),
+            (os.path.join(DATA_DIR, "keywords.txt"), ["/app/data/keywords.txt", os.path.join(os.getcwd(), "data", "keywords.txt")]),
+        ]
+        for dst, srcs in pairs:
+            if os.path.isfile(dst):
+                continue
+            src = next((s for s in srcs if s and os.path.isfile(s)), None)
+            if src:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copyfile(src, dst)
+                log.info(f"[CFG] seeded {dst} from {src}")
+    except Exception as e:
+        log.warning(f"[CFG] seeding config files failed: {e}")
+
 
 def _ensure_file(path: str, default: str = ""):
     if not os.path.exists(path):
@@ -177,7 +202,7 @@ def load_channel_list() -> List[str]:
     candidate_files = []
     if GROUPS_FILE:
         candidate_files.append(GROUPS_FILE)
-    candidate_files += [os.path.join(DATA_DIR, "groups.txt"), "/app/data/groups.txt"]
+    candidate_files += [os.path.join(DATA_DIR, "groups.txt"), "/app/data/groups.txt", os.path.join(os.getcwd(), "data", "groups.txt")]
     fp = _find_first_existing(candidate_files)
     if fp:
         raw = _read_lines_file(fp)
@@ -207,7 +232,7 @@ def load_keywords_list() -> List[str]:
     candidate_files = []
     if KEYWORDS_FILE:
         candidate_files.append(KEYWORDS_FILE)
-    candidate_files += [os.path.join(DATA_DIR, "keywords.txt"), "/app/data/keywords.txt"]
+    candidate_files += [os.path.join(DATA_DIR, "keywords.txt"), "/app/data/keywords.txt", os.path.join(os.getcwd(), "data", "keywords.txt")]
     fp = _find_first_existing(candidate_files)
     if fp:
         res = _read_lines_file(fp)
@@ -1579,6 +1604,7 @@ def main():
     log.info(f"DATA_DIR={DATA_DIR}")
     log.info(f"TARGET_CHAT_ID={TARGET_CHAT_ID}")
     log.info(f"SCAN_INTERVAL={SCAN_INTERVAL}")
+    _seed_config_files()
     log.info(f"Admins: {list_users_by_role('admin')}")
     log.info(f"Moderators: {list_users_by_role('moderator')}")
     log.info(f"Leadership: {list_users_by_role('leadership')}")
