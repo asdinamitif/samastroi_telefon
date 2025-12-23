@@ -124,17 +124,44 @@ def _find_first_existing(paths: List[str]) -> Optional[str]:
     return None
 
 def _normalize_source(s: str) -> Optional[str]:
+    """Normalize a channel/group source token to a public username usable in https://t.me/s/<username>.
+
+    Accepts:
+      - @username
+      - username
+      - https://t.me/username or https://t.me/s/username
+    Skips:
+      - numeric chat ids (-100..., 12345) because web preview can't use them
+      - invite links (joinchat/+...)
+    """
     s = (s or "").strip()
     if not s:
         return None
+
+    # drop comments in files
+    if s.startswith("#") or s.startswith("//"):
+        return None
+
     s = s.replace("https://", "").replace("http://", "")
+
+    # skip invite links (not web-scrapable)
+    low = s.lower()
+    if "joinchat" in low or "/+" in low or low.startswith("+"):
+        return None
+
     s = s.replace("t.me/s/", "t.me/").replace("t.me/", "")
     s = s.lstrip("@").strip().strip("/")
     if not s:
         return None
+
     # keep only username part before any query params
-    s = s.split("?")[0].split("#")[0]
-    return s
+    s = s.split("?")[0].split("#")[0].strip()
+
+    # skip numeric ids (web preview requires username)
+    if re.fullmatch(r"-?\d+", s):
+        return None
+
+    return s.lower()
 
 def load_channel_list() -> List[str]:
     env = (os.getenv("CHANNEL_LIST", "") or "").strip()
@@ -405,8 +432,29 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 def detect_keywords(text: str) -> List[str]:
-    low = text.lower()
-    return [kw for kw in KEYWORDS_LOWER if kw in low]
+    low = (text or "").lower()
+    hits = [kw for kw in KEYWORDS_LOWER if kw and kw in low]
+
+    # tolerate common typos/variants around "самострой"
+    if any(x in low for x in ("самостро", "самосостро", "самоcтро", "самос т ро")):
+        if "самострой" not in hits:
+            hits.append("самострой")
+
+    # extra high-signal patterns (even if keywords list is short)
+    if CADASTRE_RE.search(text or ""):
+        hits.append("кадастровый номер")
+    if COORD_RE.search(text or ""):
+        hits.append("координаты")
+
+    # de-dup while preserving order
+    out = []
+    seen = set()
+    for h in hits:
+        if h in seen:
+            continue
+        seen.add(h)
+        out.append(h)
+    return out
 
 def parse_tg_datetime(dt_str: str) -> int:
     """
@@ -1487,8 +1535,9 @@ def poll_updates_loop():
 
             if not data.get("ok"):
                 if data.get("error_code") == 409:
-                    log.error("getUpdates conflict (409). Exiting.")
-                    raise SystemExit(0)
+                    log.error("getUpdates conflict (409). Another process is consuming updates for this BOT_TOKEN. Poller will retry in 60s.\nFix: ensure only ONE instance runs and no other bot/service uses getUpdates/webhook with the same token.")
+                    time.sleep(60)
+                    continue
                 log.error(f"getUpdates error: {data}")
                 time.sleep(3); continue
 
