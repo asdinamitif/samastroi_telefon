@@ -220,7 +220,7 @@ CHANNEL_BIAS_FILE = os.path.join(DATA_DIR, "channel_bias.json")
 KEYWORD_BIAS_FILE = os.path.join(DATA_DIR, "keyword_bias.json")
 
 # ONZS files
-ONZS_XLSX = os.getenv("ONZS_XLSX", "Номера ОНзС.xlsx").strip()
+ONZS_XLSX = os.getenv("ONZS_XLSX", "ÐÐ¾Ð¼ÐµÑÐ° ÐÐÐ·Ð¡.xlsx").strip()
 
 # Base dir / path resolver (Railway may run with different CWD)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -273,16 +273,16 @@ LOCK_FILE = os.path.join(DATA_DIR, ".poller.lock")
 
 # ----------------------------- STOP TOPICS (anti-news/politics noise) -----------------------------
 STOP_TOPICS = [
-    "путин", "украин", "войн", "политик", "санкц", "выбор", "митинг", "байден",
-    "трамп", "хамас", "израил", "террор", "дрон", "ракет", "фронт", "мобилиз",
-    "наступлен", "обстрел", "всу", "армия", "нато", "премьер", "президент",
+    "Ð¿ÑÑÐ¸Ð½", "ÑÐºÑÐ°Ð¸Ð½", "Ð²Ð¾Ð¹Ð½", "Ð¿Ð¾Ð»Ð¸ÑÐ¸Ðº", "ÑÐ°Ð½ÐºÑ", "Ð²ÑÐ±Ð¾Ñ", "Ð¼Ð¸ÑÐ¸Ð½Ð³", "Ð±Ð°Ð¹Ð´ÐµÐ½",
+    "ÑÑÐ°Ð¼Ð¿", "ÑÐ°Ð¼Ð°Ñ", "Ð¸Ð·ÑÐ°Ð¸Ð»", "ÑÐµÑÑÐ¾Ñ", "Ð´ÑÐ¾Ð½", "ÑÐ°ÐºÐµÑ", "ÑÑÐ¾Ð½Ñ", "Ð¼Ð¾Ð±Ð¸Ð»Ð¸Ð·",
+    "Ð½Ð°ÑÑÑÐ¿Ð»ÐµÐ½", "Ð¾Ð±ÑÑÑÐµÐ»", "Ð²ÑÑ", "Ð°ÑÐ¼Ð¸Ñ", "Ð½Ð°ÑÐ¾", "Ð¿ÑÐµÐ¼ÑÐµÑ", "Ð¿ÑÐµÐ·Ð¸Ð´ÐµÐ½Ñ",
 ]
 
 # Construction signal words (soft allow)
 CONSTR_HINTS = [
-    "строй", "строит", "строител", "самостро", "котлован", "фундамент", "арматур",
-    "бетон", "плита", "монолит", "перекрыт", "этаж", "кран", "опалуб", "забор",
-    "пристрой", "надстрой", "реконструкц", "капремонт", "разрешен", "рнс", "гпзу",
+    "ÑÑÑÐ¾Ð¹", "ÑÑÑÐ¾Ð¸Ñ", "ÑÑÑÐ¾Ð¸ÑÐµÐ»", "ÑÐ°Ð¼Ð¾ÑÑÑÐ¾", "ÐºÐ¾ÑÐ»Ð¾Ð²Ð°Ð½", "ÑÑÐ½Ð´Ð°Ð¼ÐµÐ½Ñ", "Ð°ÑÐ¼Ð°ÑÑÑ",
+    "Ð±ÐµÑÐ¾Ð½", "Ð¿Ð»Ð¸ÑÐ°", "Ð¼Ð¾Ð½Ð¾Ð»Ð¸Ñ", "Ð¿ÐµÑÐµÐºÑÑÑ", "ÑÑÐ°Ð¶", "ÐºÑÐ°Ð½", "Ð¾Ð¿Ð°Ð»ÑÐ±", "Ð·Ð°Ð±Ð¾Ñ",
+    "Ð¿ÑÐ¸ÑÑÑÐ¾Ð¹", "Ð½Ð°Ð´ÑÑÑÐ¾Ð¹", "ÑÐµÐºÐ¾Ð½ÑÑÑÑÐºÑ", "ÐºÐ°Ð¿ÑÐµÐ¼Ð¾Ð½Ñ", "ÑÐ°Ð·ÑÐµÑÐµÐ½", "ÑÐ½Ñ", "Ð³Ð¿Ð·Ñ",
 ]
 
 # ----------------------------- UTIL -----------------------------
@@ -401,7 +401,7 @@ def get_keyword_bias_points(text: str) -> float:
 ONZS_MAP: Dict[int, str] = {}
 
 def _to_onzs_int(v) -> Optional[int]:
-    """Extract ONZS number 1..12 from a cell value (robust to '1.0', '1 – ...', etc.)."""
+    """Extract ONZS number 1..12 from a cell value (robust to '1.0', '1 â ...', etc.)."""
     if v is None:
         return None
     s = str(v).strip()
@@ -598,49 +598,49 @@ def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: Op
 # --------------------------------------------
 def admin_menu_text() -> str:
     return (
-        "🛠 Админ-панель\n"
-        f"• Admins: {len(ROLES.get('admins',[]))}\n"
-        f"• Moderators: {len(ROLES.get('moderators',[]))}\n"
-        f"• Leadership: {len(ROLES.get('leadership',[]))}\n"
-        f"• Reports targets: {len(ROLES.get('report_targets',[]))}\n"
-        "\nВыберите раздел:"
+        "ð  ÐÐ´Ð¼Ð¸Ð½-Ð¿Ð°Ð½ÐµÐ»Ñ\n"
+        f"â¢ Admins: {len(ROLES.get('admins',[]))}\n"
+        f"â¢ Moderators: {len(ROLES.get('moderators',[]))}\n"
+        f"â¢ Leadership: {len(ROLES.get('leadership',[]))}\n"
+        f"â¢ Reports targets: {len(ROLES.get('report_targets',[]))}\n"
+        "\nÐÑÐ±ÐµÑÐ¸ÑÐµ ÑÐ°Ð·Ð´ÐµÐ»:"
     )
 
 def admin_menu_kb():
     return {"inline_keyboard": [
-        [{"text":"👥 Роли", "callback_data":"admin:roles"}],
-        [{"text":"📊 Статистика", "callback_data":"admin:stats"}],
-        [{"text":"🧾 Отчёты", "callback_data":"admin:reports"}],
-        [{"text":"⚙️ Настройки", "callback_data":"admin:settings"}],
+        [{"text":"ð¥ Ð Ð¾Ð»Ð¸", "callback_data":"admin:roles"}],
+        [{"text":"ð Ð¡ÑÐ°ÑÐ¸ÑÑÐ¸ÐºÐ°", "callback_data":"admin:stats"}],
+        [{"text":"ð§¾ ÐÑÑÑÑÑ", "callback_data":"admin:reports"}],
+        [{"text":"âï¸ ÐÐ°ÑÑÑÐ¾Ð¹ÐºÐ¸", "callback_data":"admin:settings"}],
     ]}
 
 def admin_roles_kb():
     return {"inline_keyboard": [
-        [{"text":"➕ Добавить админа", "callback_data":"admin:add_admin"}],
-        [{"text":"➖ Удалить админа", "callback_data":"admin:del_admin"}],
-        [{"text":"➕ Добавить модератора", "callback_data":"admin:add_mod"}],
-        [{"text":"➖ Удалить модератора", "callback_data":"admin:del_mod"}],
-        [{"text":"➕ Добавить руководство", "callback_data":"admin:add_lead"}],
-        [{"text":"➖ Удалить руководство", "callback_data":"admin:del_lead"}],
-        [{"text":"📋 Показать роли", "callback_data":"admin:list_roles"}],
-        [{"text":"⬅️ Назад", "callback_data":"admin:back"}],
+        [{"text":"â ÐÐ¾Ð±Ð°Ð²Ð¸ÑÑ Ð°Ð´Ð¼Ð¸Ð½Ð°", "callback_data":"admin:add_admin"}],
+        [{"text":"â Ð£Ð´Ð°Ð»Ð¸ÑÑ Ð°Ð´Ð¼Ð¸Ð½Ð°", "callback_data":"admin:del_admin"}],
+        [{"text":"â ÐÐ¾Ð±Ð°Ð²Ð¸ÑÑ Ð¼Ð¾Ð´ÐµÑÐ°ÑÐ¾ÑÐ°", "callback_data":"admin:add_mod"}],
+        [{"text":"â Ð£Ð´Ð°Ð»Ð¸ÑÑ Ð¼Ð¾Ð´ÐµÑÐ°ÑÐ¾ÑÐ°", "callback_data":"admin:del_mod"}],
+        [{"text":"â ÐÐ¾Ð±Ð°Ð²Ð¸ÑÑ ÑÑÐºÐ¾Ð²Ð¾Ð´ÑÑÐ²Ð¾", "callback_data":"admin:add_lead"}],
+        [{"text":"â Ð£Ð´Ð°Ð»Ð¸ÑÑ ÑÑÐºÐ¾Ð²Ð¾Ð´ÑÑÐ²Ð¾", "callback_data":"admin:del_lead"}],
+        [{"text":"ð ÐÐ¾ÐºÐ°Ð·Ð°ÑÑ ÑÐ¾Ð»Ð¸", "callback_data":"admin:list_roles"}],
+        [{"text":"â¬ï¸ ÐÐ°Ð·Ð°Ð´", "callback_data":"admin:back"}],
     ]}
 
 def admin_reports_kb():
     return {"inline_keyboard": [
-        [{"text":"📤 Отчёт за сутки", "callback_data":"admin:report_day"}],
-        [{"text":"📬 Получатели отчётов", "callback_data":"admin:report_targets"}],
-        [{"text":"➕ Добавить получателя", "callback_data":"admin:add_report_target"}],
-        [{"text":"➖ Удалить получателя", "callback_data":"admin:del_report_target"}],
-        [{"text":"⬅️ Назад", "callback_data":"admin:back"}],
+        [{"text":"ð¤ ÐÑÑÑÑ Ð·Ð° ÑÑÑÐºÐ¸", "callback_data":"admin:report_day"}],
+        [{"text":"ð¬ ÐÐ¾Ð»ÑÑÐ°ÑÐµÐ»Ð¸ Ð¾ÑÑÑÑÐ¾Ð²", "callback_data":"admin:report_targets"}],
+        [{"text":"â ÐÐ¾Ð±Ð°Ð²Ð¸ÑÑ Ð¿Ð¾Ð»ÑÑÐ°ÑÐµÐ»Ñ", "callback_data":"admin:add_report_target"}],
+        [{"text":"â Ð£Ð´Ð°Ð»Ð¸ÑÑ Ð¿Ð¾Ð»ÑÑÐ°ÑÐµÐ»Ñ", "callback_data":"admin:del_report_target"}],
+        [{"text":"â¬ï¸ ÐÐ°Ð·Ð°Ð´", "callback_data":"admin:back"}],
     ]}
 
 def admin_settings_kb():
     return {"inline_keyboard": [
-        [ {"text": f"🎚 Порог AI-gate: {MIN_AI_GATE:.1f}%", "callback_data": "admin:set_aigate"} ],
-        [{"text":"🔄 Перезагрузить ОНзС", "callback_data":"admin:reload_onzs"}],
-        [{"text":"🧪 Тест YandexGPT", "callback_data":"admin:test_yagpt"}],
-        [{"text":"⬅️ Назад", "callback_data":"admin:back"}],
+        [ {"text": f"ð ÐÐ¾ÑÐ¾Ð³ AI-gate: {MIN_AI_GATE:.1f}%", "callback_data": "admin:set_aigate"} ],
+        [{"text":"ð ÐÐµÑÐµÐ·Ð°Ð³ÑÑÐ·Ð¸ÑÑ ÐÐÐ·Ð¡", "callback_data":"admin:reload_onzs"}],
+        [{"text":"ð§ª Ð¢ÐµÑÑ YandexGPT", "callback_data":"admin:test_yagpt"}],
+        [{"text":"â¬ï¸ ÐÐ°Ð·Ð°Ð´", "callback_data":"admin:back"}],
     ]}
 
 ADMIN_STATE_PATH = os.path.join(DATA_DIR, "admin_state.json")
@@ -759,9 +759,9 @@ def _roles_del(key:str, uid:int):
 
 def build_roles_text():
     def fmt(lst):
-        return ", ".join(str(x) for x in lst) if lst else "—"
+        return ", ".join(str(x) for x in lst) if lst else "â"
     return (
-        "👥 Текущие роли\n"
+        "ð¥ Ð¢ÐµÐºÑÑÐ¸Ðµ ÑÐ¾Ð»Ð¸\n"
         f"Admins: {fmt(ROLES.get('admins',[]))}\n"
         f"Moderators: {fmt(ROLES.get('moderators',[]))}\n"
         f"Leadership: {fmt(ROLES.get('leadership',[]))}\n"
@@ -785,11 +785,11 @@ def send_message(chat_id: int, text: str, reply_markup: Optional[Dict] = None):
 def build_card_keyboard(card_id: str) -> Dict:
     return {
         "inline_keyboard": [
-            [{"text": "✅ В работу", "callback_data": f"card:{card_id}:work"},
-             {"text": "❌ Неверно", "callback_data": f"card:{card_id}:wrong"}],
-            [{"text": "📎 Привязать", "callback_data": f"card:{card_id}:attach"}],
-            [{"text": "✏️ Изменить ОНзС", "callback_data": f"onzs:edit:{card_id}"},
-             {"text": "✅ Подтвердить ОНзС", "callback_data": f"onzs:confirm:{card_id}"}],
+            [{"text": "â Ð ÑÐ°Ð±Ð¾ÑÑ", "callback_data": f"card:{card_id}:work"},
+             {"text": "â ÐÐµÐ²ÐµÑÐ½Ð¾", "callback_data": f"card:{card_id}:wrong"}],
+            [{"text": "ð ÐÑÐ¸Ð²ÑÐ·Ð°ÑÑ", "callback_data": f"card:{card_id}:attach"}],
+            [{"text": "âï¸ ÐÐ·Ð¼ÐµÐ½Ð¸ÑÑ ÐÐÐ·Ð¡", "callback_data": f"onzs:edit:{card_id}"},
+             {"text": "â ÐÐ¾Ð´ÑÐ²ÐµÑÐ´Ð¸ÑÑ ÐÐÐ·Ð¡", "callback_data": f"onzs:confirm:{card_id}"}],
         ]
     }
 
@@ -803,7 +803,7 @@ def build_onzs_pick_keyboard(card_id: str) -> Dict:
             row = []
     if row:
         rows.append(row)
-    rows.append([{"text": "⬅️ Назад к карточке", "callback_data": f"onzs:back:{card_id}"}])
+    rows.append([{"text": "â¬ï¸ ÐÐ°Ð·Ð°Ð´ Ðº ÐºÐ°ÑÑÐ¾ÑÐºÐµ", "callback_data": f"onzs:back:{card_id}"}])
     return {"inline_keyboard": rows}
 
 # ----------------------------- TEXT NORMALIZATION -----------------------------
@@ -815,11 +815,11 @@ def build_admin_keyboard() -> Dict:
     return {
         "inline_keyboard": [
             [
-                {"text": "📊 Статистика ОНзС", "callback_data": "admin:onzs_stats"},
-                {"text": "🔄 Перезагрузить ОНзС", "callback_data": "admin:reload_onzs"},
+                {"text": "ð Ð¡ÑÐ°ÑÐ¸ÑÑÐ¸ÐºÐ° ÐÐÐ·Ð¡", "callback_data": "admin:onzs_stats"},
+                {"text": "ð ÐÐµÑÐµÐ·Ð°Ð³ÑÑÐ·Ð¸ÑÑ ÐÐÐ·Ð¡", "callback_data": "admin:reload_onzs"},
             ],
             [
-                {"text": "🧪 Тест YandexGPT", "callback_data": "admin:test_yagpt"},
+                {"text": "ð§ª Ð¢ÐµÑÑ YandexGPT", "callback_data": "admin:test_yagpt"},
             ],
         ]
     }
@@ -833,7 +833,7 @@ def clean_text_for_ai(text: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     # keep bounded
     if len(t) > 2500:
-        t = t[:2500] + "…"
+        t = t[:2500] + "â¦"
     return t
 
 def is_stop_topic(text: str) -> bool:
@@ -893,7 +893,7 @@ def call_yandex_gpt_json(prompt: str, channel: Optional[str] = None) -> Optional
     cleaned = clean_text_for_ai(prompt)
     # hard skip for stop topics (prevents refusals)
     if is_stop_topic(cleaned):
-        return {"probability": 0, "comment": "Отсев: новость/политика (стоп-тема)."}
+        return {"probability": 0, "comment": "ÐÑÑÐµÐ²: Ð½Ð¾Ð²Ð¾ÑÑÑ/Ð¿Ð¾Ð»Ð¸ÑÐ¸ÐºÐ° (ÑÑÐ¾Ð¿-ÑÐµÐ¼Ð°)."}
     # Few-shot from history: last N labeled cards for relevance
     few = read_last_jsonl(HISTORY_CARDS, limit=12)
     few_block = ""
@@ -905,7 +905,7 @@ def call_yandex_gpt_json(prompt: str, channel: Optional[str] = None) -> Optional
             hint = ex.get("reason", "")
             if not t or not lbl:
                 continue
-            lines.append(f"- Метка={lbl} (ориентир {hint}). Текст: {t}")
+            lines.append(f"- ÐÐµÑÐºÐ°={lbl} (Ð¾ÑÐ¸ÐµÐ½ÑÐ¸Ñ {hint}). Ð¢ÐµÐºÑÑ: {t}")
         few_block = "\n" + "\n".join(lines) + "\n"
 
     # our own bias to stabilize decisions (channel/keyword learning)
@@ -914,19 +914,19 @@ def call_yandex_gpt_json(prompt: str, channel: Optional[str] = None) -> Optional
     bias_total = bias_ch + bias_kw
 
     prompt_full = (
-        "Ты помощник инспектора строительного надзора.\n"
-        "Твоя задача: оценить вероятность (0-100), что текст относится к самовольному строительству/нарушениям на стройке.\n"
-        "Запрещено: новости, политика, общие рассуждения.\n"
-        "Если текст содержит запрещённые/неподходящие темы, всё равно верни JSON с probability=0 и кратким comment.\n"
-        "Ответь СТРОГО одним JSON без пояснений и без Markdown.\n"
-        'Формат: {"probability": <0-100>, "comment": "..."}\n'
-        f"Калибровка (bias, прибавь к вероятности): {bias_total:+.1f}\n"
+        "Ð¢Ñ Ð¿Ð¾Ð¼Ð¾ÑÐ½Ð¸Ðº Ð¸Ð½ÑÐ¿ÐµÐºÑÐ¾ÑÐ° ÑÑÑÐ¾Ð¸ÑÐµÐ»ÑÐ½Ð¾Ð³Ð¾ Ð½Ð°Ð´Ð·Ð¾ÑÐ°.\n"
+        "Ð¢Ð²Ð¾Ñ Ð·Ð°Ð´Ð°ÑÐ°: Ð¾ÑÐµÐ½Ð¸ÑÑ Ð²ÐµÑÐ¾ÑÑÐ½Ð¾ÑÑÑ (0-100), ÑÑÐ¾ ÑÐµÐºÑÑ Ð¾ÑÐ½Ð¾ÑÐ¸ÑÑÑ Ðº ÑÐ°Ð¼Ð¾Ð²Ð¾Ð»ÑÐ½Ð¾Ð¼Ñ ÑÑÑÐ¾Ð¸ÑÐµÐ»ÑÑÑÐ²Ñ/Ð½Ð°ÑÑÑÐµÐ½Ð¸ÑÐ¼ Ð½Ð° ÑÑÑÐ¾Ð¹ÐºÐµ.\n"
+        "ÐÐ°Ð¿ÑÐµÑÐµÐ½Ð¾: Ð½Ð¾Ð²Ð¾ÑÑÐ¸, Ð¿Ð¾Ð»Ð¸ÑÐ¸ÐºÐ°, Ð¾Ð±ÑÐ¸Ðµ ÑÐ°ÑÑÑÐ¶Ð´ÐµÐ½Ð¸Ñ.\n"
+        "ÐÑÐ»Ð¸ ÑÐµÐºÑÑ ÑÐ¾Ð´ÐµÑÐ¶Ð¸Ñ Ð·Ð°Ð¿ÑÐµÑÑÐ½Ð½ÑÐµ/Ð½ÐµÐ¿Ð¾Ð´ÑÐ¾Ð´ÑÑÐ¸Ðµ ÑÐµÐ¼Ñ, Ð²ÑÑ ÑÐ°Ð²Ð½Ð¾ Ð²ÐµÑÐ½Ð¸ JSON Ñ probability=0 Ð¸ ÐºÑÐ°ÑÐºÐ¸Ð¼ comment.\n"
+        "ÐÑÐ²ÐµÑÑ Ð¡Ð¢Ð ÐÐÐ Ð¾Ð´Ð½Ð¸Ð¼ JSON Ð±ÐµÐ· Ð¿Ð¾ÑÑÐ½ÐµÐ½Ð¸Ð¹ Ð¸ Ð±ÐµÐ· Markdown.\n"
+        'Ð¤Ð¾ÑÐ¼Ð°Ñ: {"probability": <0-100>, "comment": "..."}\n'
+        f"ÐÐ°Ð»Ð¸Ð±ÑÐ¾Ð²ÐºÐ° (bias, Ð¿ÑÐ¸Ð±Ð°Ð²Ñ Ðº Ð²ÐµÑÐ¾ÑÑÐ½Ð¾ÑÑÐ¸): {bias_total:+.1f}\n"
         + few_block +
-        "\nТекст:\n" + cleaned
+        "\nÐ¢ÐµÐºÑÑ:\n" + cleaned
     )
 
     messages = [
-        {"role": "system", "text": "Отвечай строго JSON."},
+        {"role": "system", "text": "ÐÑÐ²ÐµÑÐ°Ð¹ ÑÑÑÐ¾Ð³Ð¾ JSON."},
         {"role": "user", "text": prompt_full},
     ]
 
@@ -940,8 +940,8 @@ def call_yandex_gpt_json(prompt: str, channel: Optional[str] = None) -> Optional
         js = extract_json_from_text(out_text)
         if js is None:
             # if model refused, do not crash; return minimal
-            if "не могу обсуждать" in out_text.lower():
-                return {"probability": 0, "comment": "Отказ модели: неподходящая тема."}
+            if "Ð½Ðµ Ð¼Ð¾Ð³Ñ Ð¾Ð±ÑÑÐ¶Ð´Ð°ÑÑ" in out_text.lower():
+                return {"probability": 0, "comment": "ÐÑÐºÐ°Ð· Ð¼Ð¾Ð´ÐµÐ»Ð¸: Ð½ÐµÐ¿Ð¾Ð´ÑÐ¾Ð´ÑÑÐ°Ñ ÑÐµÐ¼Ð°."}
             # retry once
             time.sleep(0.6 * (attempt + 1))
             continue
@@ -959,23 +959,23 @@ def detect_onzs_with_yagpt(text: str, channel: Optional[str] = None) -> Optional
 
     cleaned = clean_text_for_ai(text)
     if is_stop_topic(cleaned):
-        return {"onzs": None, "confidence": 0.0, "reason": "Отсев: стоп-тема."}
+        return {"onzs": None, "confidence": 0.0, "reason": "ÐÑÑÐµÐ²: ÑÑÐ¾Ð¿-ÑÐµÐ¼Ð°."}
 
     catalog = "\n".join([f"{k}: {v}" for k, v in sorted(ONZS_MAP.items())])
 
     prompt = (
-        "Ты инспектор строительного надзора.\n"
-        "Определи номер ОНзС (1–12) по описанию. Если нельзя определить — onzs=null.\n"
-        "Ответь СТРОГО одним JSON без пояснений.\n"
-        'Формат: {"onzs": <1-12|null>, "confidence": <0-1>, "reason": "..."}\n\n'
-        "Классификатор ОНзС:\n"
+        "Ð¢Ñ Ð¸Ð½ÑÐ¿ÐµÐºÑÐ¾Ñ ÑÑÑÐ¾Ð¸ÑÐµÐ»ÑÐ½Ð¾Ð³Ð¾ Ð½Ð°Ð´Ð·Ð¾ÑÐ°.\n"
+        "ÐÐ¿ÑÐµÐ´ÐµÐ»Ð¸ Ð½Ð¾Ð¼ÐµÑ ÐÐÐ·Ð¡ (1â12) Ð¿Ð¾ Ð¾Ð¿Ð¸ÑÐ°Ð½Ð¸Ñ. ÐÑÐ»Ð¸ Ð½ÐµÐ»ÑÐ·Ñ Ð¾Ð¿ÑÐµÐ´ÐµÐ»Ð¸ÑÑ â onzs=null.\n"
+        "ÐÑÐ²ÐµÑÑ Ð¡Ð¢Ð ÐÐÐ Ð¾Ð´Ð½Ð¸Ð¼ JSON Ð±ÐµÐ· Ð¿Ð¾ÑÑÐ½ÐµÐ½Ð¸Ð¹.\n"
+        'Ð¤Ð¾ÑÐ¼Ð°Ñ: {"onzs": <1-12|null>, "confidence": <0-1>, "reason": "..."}\n\n'
+        "ÐÐ»Ð°ÑÑÐ¸ÑÐ¸ÐºÐ°ÑÐ¾Ñ ÐÐÐ·Ð¡:\n"
         f"{catalog}\n\n"
-        "Текст:\n"
+        "Ð¢ÐµÐºÑÑ:\n"
         f"{cleaned}"
     )
 
     messages = [
-        {"role": "system", "text": "Отвечай строго JSON."},
+        {"role": "system", "text": "ÐÑÐ²ÐµÑÐ°Ð¹ ÑÑÑÐ¾Ð³Ð¾ JSON."},
         {"role": "user", "text": prompt},
     ]
 
@@ -986,8 +986,8 @@ def detect_onzs_with_yagpt(text: str, channel: Optional[str] = None) -> Optional
             continue
         js = extract_json_from_text(out_text)
         if js is None:
-            if "не могу обсуждать" in out_text.lower():
-                return {"onzs": None, "confidence": 0.0, "reason": "Отказ модели."}
+            if "Ð½Ðµ Ð¼Ð¾Ð³Ñ Ð¾Ð±ÑÑÐ¶Ð´Ð°ÑÑ" in out_text.lower():
+                return {"onzs": None, "confidence": 0.0, "reason": "ÐÑÐºÐ°Ð· Ð¼Ð¾Ð´ÐµÐ»Ð¸."}
             time.sleep(0.6 * (attempt + 1))
             continue
         return js
@@ -1000,7 +1000,7 @@ def save_onzs_training(text: str, onzs: int, confirmed: bool):
 
 def build_daily_report_text() -> str:
     today = datetime.now().date().isoformat()
-    lines = ["🧾 Отчёт за сутки", f"Дата: {today}"]
+    lines = ["ð§¾ ÐÑÑÑÑ Ð·Ð° ÑÑÑÐºÐ¸", f"ÐÐ°ÑÐ°: {today}"]
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -1008,31 +1008,31 @@ def build_daily_report_text() -> str:
         tables = [r[0] for r in cur.fetchall()]
         if not tables:
             conn.close()
-            lines.append("Нет таблиц в БД.")
+            lines.append("ÐÐµÑ ÑÐ°Ð±Ð»Ð¸Ñ Ð² ÐÐ.")
             return "\n".join(lines)
         table = "cards" if "cards" in tables else tables[0]
         try:
             cur.execute(f"SELECT status, COUNT(*) FROM {table} WHERE date(ts)=? GROUP BY status", (today,))
             rows = cur.fetchall()
             if rows:
-                lines.append("Статусы:")
+                lines.append("Ð¡ÑÐ°ÑÑÑÑ:")
                 for st,cnt in rows:
-                    lines.append(f"• {st}: {cnt}")
+                    lines.append(f"â¢ {st}: {cnt}")
         except Exception:
             pass
         try:
             cur.execute(f"SELECT COUNT(*) FROM {table} WHERE date(ts)=? AND onzs_final IS NOT NULL", (today,))
             n = cur.fetchone()[0]
-            lines.append(f"Подтверждённые ОНзС: {n}")
+            lines.append(f"ÐÐ¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÑÐ½Ð½ÑÐµ ÐÐÐ·Ð¡: {n}")
         except Exception:
             pass
         conn.close()
     except Exception as e:
-        lines.append(f"Ошибка отчёта: {e}")
+        lines.append(f"ÐÑÐ¸Ð±ÐºÐ° Ð¾ÑÑÑÑÐ°: {e}")
     return "\n".join(lines)
 def build_onzs_stats() -> str:
     if not os.path.exists(ONZS_TRAIN_FILE):
-        return "Нет данных по ОНзС."
+        return "ÐÐµÑ Ð´Ð°Ð½Ð½ÑÑ Ð¿Ð¾ ÐÐÐ·Ð¡."
     stats: Dict[int, Dict[str, int]] = {}
     with open(ONZS_TRAIN_FILE, "r", encoding="utf-8") as f:
         for line in f:
@@ -1059,11 +1059,11 @@ def build_onzs_stats() -> str:
     total_ok = sum(v["ok"] for v in stats.values()) or 0
     acc_total = int(100 * total_ok / total_all) if total_all else 0
 
-    out = [f"🎯 Точность ИИ по ОНзС: {acc_total}% (верно {total_ok}/{total_all})"]
+    out = [f"ð¯ Ð¢Ð¾ÑÐ½Ð¾ÑÑÑ ÐÐ Ð¿Ð¾ ÐÐÐ·Ð¡: {acc_total}% (Ð²ÐµÑÐ½Ð¾ {total_ok}/{total_all})"]
     for o in sorted(stats.keys()):
         s = stats[o]
         acc = int(100 * s["ok"] / s["all"]) if s["all"] else 0
-        out.append(f"ОНзС-{o}: {acc}% ({s['ok']}/{s['all']})")
+        out.append(f"ÐÐÐ·Ð¡-{o}: {acc}% ({s['ok']}/{s['all']})")
     return "\n".join(out)
 
 # ----------------------------- CARD PIPELINE -----------------------------
@@ -1082,9 +1082,9 @@ def extract_keywords_hit(text: str, keywords: List[str]) -> List[str]:
     return hits
 
 DEFAULT_KEYWORDS = [
-    "самострой", "стройка", "строительство", "котлован", "фундамент", "бетон", "арматура",
-    "кран", "опалубка", "забор", "пристройка", "надстройка", "реконструкция",
-    "этаж", "плита", "перекрытие"
+    "ÑÐ°Ð¼Ð¾ÑÑÑÐ¾Ð¹", "ÑÑÑÐ¾Ð¹ÐºÐ°", "ÑÑÑÐ¾Ð¸ÑÐµÐ»ÑÑÑÐ²Ð¾", "ÐºÐ¾ÑÐ»Ð¾Ð²Ð°Ð½", "ÑÑÐ½Ð´Ð°Ð¼ÐµÐ½Ñ", "Ð±ÐµÑÐ¾Ð½", "Ð°ÑÐ¼Ð°ÑÑÑÐ°",
+    "ÐºÑÐ°Ð½", "Ð¾Ð¿Ð°Ð»ÑÐ±ÐºÐ°", "Ð·Ð°Ð±Ð¾Ñ", "Ð¿ÑÐ¸ÑÑÑÐ¾Ð¹ÐºÐ°", "Ð½Ð°Ð´ÑÑÑÐ¾Ð¹ÐºÐ°", "ÑÐµÐºÐ¾Ð½ÑÑÑÑÐºÑÐ¸Ñ",
+    "ÑÑÐ°Ð¶", "Ð¿Ð»Ð¸ÑÐ°", "Ð¿ÐµÑÐµÐºÑÑÑÐ¸Ðµ"
 ]
 
 def classify_with_ai(text: str, channel: str) -> Optional[Dict]:
@@ -1154,9 +1154,9 @@ def create_card(channel: str, post_id: Any, text: str) -> Optional[Dict]:
 def build_card_text(card: Dict) -> str:
     ts = int(card.get("timestamp", now_ts()))
     dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
-    kw = ", ".join(card.get("keywords", [])) or "—"
+    kw = ", ".join(card.get("keywords", [])) or "â"
     links = card.get("links") or []
-    links_str = "\n".join(links) if links else "нет ссылок"
+    links_str = "\n".join(links) if links else "Ð½ÐµÑ ÑÑÑÐ»Ð¾Ðº"
 
     ai = card.get("ai") or {}
     prob = ai.get("probability")
@@ -1169,21 +1169,21 @@ def build_card_text(card: Dict) -> str:
         except Exception:
             p = None
         if p is not None:
-            ai_lines.append(f"🤖 Вероятность самостроя (ИИ): {p:.1f}%")
+            ai_lines.append(f"ð¤ ÐÐµÑÐ¾ÑÑÐ½Ð¾ÑÑÑ ÑÐ°Ð¼Ð¾ÑÑÑÐ¾Ñ (ÐÐ): {p:.1f}%")
     if comment:
-        ai_lines.append(f"💬 Комментарий ИИ: {comment}")
+        ai_lines.append(f"ð¬ ÐÐ¾Ð¼Ð¼ÐµÐ½ÑÐ°ÑÐ¸Ð¹ ÐÐ: {comment}")
 
     base = (
-        "🔎 Обнаружено подозрительное сообщение\n"
-        f"Источник: @{card.get('channel','—')}\n"
-        f"Дата: {dt}\n"
-        f"ID поста: {card.get('post_id','—')}\n\n"
-        f"🔑 Ключевые слова: {kw}\n\n"
-        "📝 Текст:\n"
+        "ð ÐÐ±Ð½Ð°ÑÑÐ¶ÐµÐ½Ð¾ Ð¿Ð¾Ð´Ð¾Ð·ÑÐ¸ÑÐµÐ»ÑÐ½Ð¾Ðµ ÑÐ¾Ð¾Ð±ÑÐµÐ½Ð¸Ðµ\n"
+        f"ÐÑÑÐ¾ÑÐ½Ð¸Ðº: @{card.get('channel','â')}\n"
+        f"ÐÐ°ÑÐ°: {dt}\n"
+        f"ID Ð¿Ð¾ÑÑÐ°: {card.get('post_id','â')}\n\n"
+        f"ð ÐÐ»ÑÑÐµÐ²ÑÐµ ÑÐ»Ð¾Ð²Ð°: {kw}\n\n"
+        "ð Ð¢ÐµÐºÑÑ:\n"
         f"{card.get('text','')}\n\n"
-        "📎 Ссылки:\n"
+        "ð Ð¡ÑÑÐ»ÐºÐ¸:\n"
         f"{links_str}\n\n"
-        f"🆔 ID карточки: {card.get('card_id','—')}"
+        f"ð ID ÐºÐ°ÑÑÐ¾ÑÐºÐ¸: {card.get('card_id','â')}"
     )
 
     if ai_lines:
@@ -1196,19 +1196,19 @@ def build_card_text(card: Dict) -> str:
         src = oz.get("source") or ("ai" if oz.get("ai") else "manual")
         conf = oz.get("confidence")
         confirmed = oz.get("confirmed")
-        line = f"🏗 ОНзС: {val}"
+        line = f"ð ÐÐÐ·Ð¡: {val}"
         if src == "ai" and conf is not None:
             try:
                 line += f" ({int(float(conf)*100)}%)"
             except Exception:
                 pass
         if confirmed:
-            line += " ✅ подтверждено"
+            line += " â Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¾"
         base += "\n\n" + line
 
         reason = (oz.get("reason") or "").strip()
         if src == "ai" and reason:
-            base += "\n" + f"📌 Причина: {reason}"
+            base += "\n" + f"ð ÐÑÐ¸ÑÐ¸Ð½Ð°: {reason}"
 
     return base
 
@@ -1219,23 +1219,30 @@ def append_history(entry: Dict):
 
 # ----------------------------- CALLBACK HANDLER -----------------------------
 def handle_message(upd: Dict):
-    # --- ensure chat_id is always defined ---
-    msg = upd.get('message') or {}
-    chat = msg.get('chat') or {}
-    chat_id = int(chat.get('id', 0) or 0)
-    text = (msg.get('text') or '').strip()
-    if not text: 
-        return
-    # ---------------------------------------
+    """ÐÐ±ÑÐ°Ð±Ð°ÑÑÐ²Ð°ÐµÑ Ð²ÑÐ¾Ð´ÑÑÐ¸Ðµ ÑÐ¾Ð¾Ð±ÑÐµÐ½Ð¸Ñ Ð¸ Ð¿Ð¾ÑÑÑ.
 
-    msg = upd.get("message") or {}
-    text = (msg.get("text") or "").strip()
+    ÐÐ¾Ð´Ð´ÐµÑÐ¶Ð¸Ð²Ð°ÐµÑ update-Ð¿Ð¾Ð»Ñ: message / edited_message / channel_post / edited_channel_post.
+    ÐÐ»Ñ Ð¼ÐµÐ´Ð¸Ð° (ÑÐ¾ÑÐ¾/Ð²Ð¸Ð´ÐµÐ¾/Ð´Ð¾ÐºÑÐ¼ÐµÐ½Ñ) Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐµÑ caption.
+    """
+    msg = (
+        upd.get("message")
+        or upd.get("edited_message")
+        or upd.get("channel_post")
+        or upd.get("edited_channel_post")
+        or {}
+    )
+    chat = msg.get("chat") or {}
+    chat_id = int(chat.get("id", 0) or 0)
+
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    if not text:
+        return
 
     # --- ADMIN MODE INPUT (role management) ---
     uid = get_sender_user_id(upd)
     mode = get_admin_mode(uid)
-    # Если админ в режиме ввода (например, порог AI-gate), но прислал команду (/admin и т.п.),
-    # выходим из режима и даём обработаться команде.
+    # ÐÑÐ»Ð¸ Ð°Ð´Ð¼Ð¸Ð½ Ð² ÑÐµÐ¶Ð¸Ð¼Ðµ Ð²Ð²Ð¾Ð´Ð° (Ð½Ð°Ð¿ÑÐ¸Ð¼ÐµÑ, Ð¿Ð¾ÑÐ¾Ð³ AI-gate), Ð½Ð¾ Ð¿ÑÐ¸ÑÐ»Ð°Ð» ÐºÐ¾Ð¼Ð°Ð½Ð´Ñ (/admin Ð¸ Ñ.Ð¿.),
+    # Ð²ÑÑÐ¾Ð´Ð¸Ð¼ Ð¸Ð· ÑÐµÐ¶Ð¸Ð¼Ð° Ð¸ Ð´Ð°ÑÐ¼ Ð¾Ð±ÑÐ°Ð±Ð¾ÑÐ°ÑÑÑÑ ÐºÐ¾Ð¼Ð°Ð½Ð´Ðµ.
     if mode and text and text.startswith("/"):
         clear_admin_mode(uid)
         mode = None
@@ -1249,40 +1256,40 @@ def handle_message(upd: Dict):
         try:
             v = float(raw)
         except Exception:
-            send_message(chat_id, "❌ Неверный формат. Введи число от 0 до 100 (например: 5 или 12.5).")
+            send_message(chat_id, "â ÐÐµÐ²ÐµÑÐ½ÑÐ¹ ÑÐ¾ÑÐ¼Ð°Ñ. ÐÐ²ÐµÐ´Ð¸ ÑÐ¸ÑÐ»Ð¾ Ð¾Ñ 0 Ð´Ð¾ 100 (Ð½Ð°Ð¿ÑÐ¸Ð¼ÐµÑ: 5 Ð¸Ð»Ð¸ 12.5).")
             return
         if v < 0 or v > 100:
-            send_message(chat_id, "❌ Диапазон: от 0 до 100.")
+            send_message(chat_id, "â ÐÐ¸Ð°Ð¿Ð°Ð·Ð¾Ð½: Ð¾Ñ 0 Ð´Ð¾ 100.")
             return
         global MIN_AI_GATE
         MIN_AI_GATE = float(v)
         set_cfg_value("min_ai_gate", MIN_AI_GATE)
         clear_admin_mode(uid)
-        send_message(chat_id, f"✅ Готово. Новый AI‑gate порог: {MIN_AI_GATE:.1f}%")
+        send_message(chat_id, f"â ÐÐ¾ÑÐ¾Ð²Ð¾. ÐÐ¾Ð²ÑÐ¹ AIâgate Ð¿Ð¾ÑÐ¾Ð³: {MIN_AI_GATE:.1f}%")
         return
 
         if mode == "add_admin":
-            _roles_add("admins", target_uid); send_message(chat_id, f"✅ Добавлен админ: {target_uid}")
+            _roles_add("admins", target_uid); send_message(chat_id, f"â ÐÐ¾Ð±Ð°Ð²Ð»ÐµÐ½ Ð°Ð´Ð¼Ð¸Ð½: {target_uid}")
         elif mode == "del_admin":
-            _roles_del("admins", target_uid); send_message(chat_id, f"✅ Удалён админ: {target_uid}")
+            _roles_del("admins", target_uid); send_message(chat_id, f"â Ð£Ð´Ð°Ð»ÑÐ½ Ð°Ð´Ð¼Ð¸Ð½: {target_uid}")
         elif mode == "add_mod":
-            _roles_add("moderators", target_uid); send_message(chat_id, f"✅ Добавлен модератор: {target_uid}")
+            _roles_add("moderators", target_uid); send_message(chat_id, f"â ÐÐ¾Ð±Ð°Ð²Ð»ÐµÐ½ Ð¼Ð¾Ð´ÐµÑÐ°ÑÐ¾Ñ: {target_uid}")
         elif mode == "del_mod":
-            _roles_del("moderators", target_uid); send_message(chat_id, f"✅ Удалён модератор: {target_uid}")
+            _roles_del("moderators", target_uid); send_message(chat_id, f"â Ð£Ð´Ð°Ð»ÑÐ½ Ð¼Ð¾Ð´ÐµÑÐ°ÑÐ¾Ñ: {target_uid}")
         elif mode == "add_lead":
-            _roles_add("leadership", target_uid); send_message(chat_id, f"✅ Добавлено руководство: {target_uid}")
+            _roles_add("leadership", target_uid); send_message(chat_id, f"â ÐÐ¾Ð±Ð°Ð²Ð»ÐµÐ½Ð¾ ÑÑÐºÐ¾Ð²Ð¾Ð´ÑÑÐ²Ð¾: {target_uid}")
         elif mode == "del_lead":
-            _roles_del("leadership", target_uid); send_message(chat_id, f"✅ Удалено руководство: {target_uid}")
+            _roles_del("leadership", target_uid); send_message(chat_id, f"â Ð£Ð´Ð°Ð»ÐµÐ½Ð¾ ÑÑÐºÐ¾Ð²Ð¾Ð´ÑÑÐ²Ð¾: {target_uid}")
         elif mode == "add_report_target":
-            _roles_add("report_targets", target_uid); send_message(chat_id, f"✅ Добавлен получатель отчётов: {target_uid}")
+            _roles_add("report_targets", target_uid); send_message(chat_id, f"â ÐÐ¾Ð±Ð°Ð²Ð»ÐµÐ½ Ð¿Ð¾Ð»ÑÑÐ°ÑÐµÐ»Ñ Ð¾ÑÑÑÑÐ¾Ð²: {target_uid}")
         elif mode == "del_report_target":
-            _roles_del("report_targets", target_uid); send_message(chat_id, f"✅ Удалён получатель отчётов: {target_uid}")
+            _roles_del("report_targets", target_uid); send_message(chat_id, f"â Ð£Ð´Ð°Ð»ÑÐ½ Ð¿Ð¾Ð»ÑÑÐ°ÑÐµÐ»Ñ Ð¾ÑÑÑÑÐ¾Ð²: {target_uid}")
         pop_admin_mode(uid)
         return
 
     if text == "/admin":
         if not is_privileged(uid):
-            send_message(chat_id, "❌ Нет доступа.")
+            send_message(chat_id, "â ÐÐµÑ Ð´Ð¾ÑÑÑÐ¿Ð°.")
             return
         send_message(chat_id, admin_menu_text(), reply_markup=admin_menu_kb())
         return
@@ -1294,17 +1301,17 @@ def handle_message(upd: Dict):
     if text == "/admin":
         uid = get_sender_user_id(upd)
         if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
-            send_message(chat_id, "❌ Нет доступа.")
+            send_message(chat_id, "â ÐÐµÑ Ð´Ð¾ÑÑÑÐ¿Ð°.")
             return
 
         onzs_cnt = len(ONZS_MAP) if isinstance(ONZS_MAP, dict) else 0
         yagpt_enabled = bool(YAGPT_API_KEY and YAGPT_FOLDER_ID)
         info = []
-        info.append("🛠 Админ-панель")
+        info.append("ð  ÐÐ´Ð¼Ð¸Ð½-Ð¿Ð°Ð½ÐµÐ»Ñ")
         info.append(f"ID: {from_user}")
         info.append(f"YandexGPT: {'ON' if yagpt_enabled else 'OFF'} | model={YAGPT_MODEL}")
         info.append(f"AI-gate: {MIN_AI_GATE}% | HTTP_TIMEOUT={HTTP_TIMEOUT}s")
-        info.append(f"ОНзС каталог: {onzs_cnt} | файл: {ONZS_XLSX}")
+        info.append(f"ÐÐÐ·Ð¡ ÐºÐ°ÑÐ°Ð»Ð¾Ð³: {onzs_cnt} | ÑÐ°Ð¹Ð»: {ONZS_XLSX}")
         info.append(f"Admins: {len(ADMINS)} | Moderators: {len(MODERATORS)} | Leadership: {len(LEADERSHIP)}")
         send_message(chat_id, "\n".join(info), reply_markup=build_admin_keyboard())
         return
@@ -1312,13 +1319,13 @@ def handle_message(upd: Dict):
     if text == "/onzs_ai_stats":
         uid = get_sender_user_id(upd)
         if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
-            send_message(chat_id, "❌ Нет доступа.")
+            send_message(chat_id, "â ÐÐµÑ Ð´Ð¾ÑÑÑÐ¿Ð°.")
             return
         send_message(chat_id, build_onzs_stats())
         return
 
     if text == "/start":
-        send_message(chat_id, "Бот запущен.")
+        send_message(chat_id, "ÐÐ¾Ñ Ð·Ð°Ð¿ÑÑÐµÐ½.")
         return
 
 # ----------------------------- GETUPDATES LOOP -----------------------------def acquire_lock() -> bool:
@@ -1358,7 +1365,7 @@ def handle_callback_query(upd: Dict):
     uid = get_sender_user_id(upd)
     if data and data.startswith("admin:"):
         if not is_privileged(uid):
-            answer_callback_query(cb_id, "Нет доступа")
+            answer_callback_query(cb_id, "ÐÐµÑ Ð´Ð¾ÑÑÑÐ¿Ð°")
             return
         action = data.split(":",1)[1]
 
@@ -1371,28 +1378,28 @@ def handle_callback_query(upd: Dict):
             answer_callback_query(cb_id, "OK")
             return
         if action == "reports":
-            edit_message_text(chat_id, msg_id, "🧾 Отчёты", reply_markup=admin_reports_kb())
+            edit_message_text(chat_id, msg_id, "ð§¾ ÐÑÑÑÑÑ", reply_markup=admin_reports_kb())
             answer_callback_query(cb_id, "OK")
             return
         if action == "settings":
-            edit_message_text(chat_id, msg_id, "⚙️ Настройки", reply_markup=admin_settings_kb())
+            edit_message_text(chat_id, msg_id, "âï¸ ÐÐ°ÑÑÑÐ¾Ð¹ÐºÐ¸", reply_markup=admin_settings_kb())
             answer_callback_query(cb_id, "OK")
             return
         if action == "set_aigate":
             set_admin_mode(uid, "set_aigate")
             send_message(
                 chat_id,
-                f"🎚 AI‑gate порог (в процентах).\n\nТекущий: {MIN_AI_GATE:.1f}%\n\nВведи число от 0 до 100.",
+                f"ð AIâgate Ð¿Ð¾ÑÐ¾Ð³ (Ð² Ð¿ÑÐ¾ÑÐµÐ½ÑÐ°Ñ).\n\nÐ¢ÐµÐºÑÑÐ¸Ð¹: {MIN_AI_GATE:.1f}%\n\nÐÐ²ÐµÐ´Ð¸ ÑÐ¸ÑÐ»Ð¾ Ð¾Ñ 0 Ð´Ð¾ 100.",
             )
-            answer_callback_query(cb_id, "Введите число 0–100")
+            answer_callback_query(cb_id, "ÐÐ²ÐµÐ´Ð¸ÑÐµ ÑÐ¸ÑÐ»Ð¾ 0â100")
             return
 
         if action == "stats":
             try:
                 txt = build_onzs_stats()
             except Exception:
-                txt = "📊 Статистика пока недоступна."
-            edit_message_text(chat_id, msg_id, txt, reply_markup={"inline_keyboard":[[{"text":"⬅️ Назад","callback_data":"admin:back"}]]})
+                txt = "ð Ð¡ÑÐ°ÑÐ¸ÑÑÐ¸ÐºÐ° Ð¿Ð¾ÐºÐ° Ð½ÐµÐ´Ð¾ÑÑÑÐ¿Ð½Ð°."
+            edit_message_text(chat_id, msg_id, txt, reply_markup={"inline_keyboard":[[{"text":"â¬ï¸ ÐÐ°Ð·Ð°Ð´","callback_data":"admin:back"}]]})
             answer_callback_query(cb_id, "OK")
             return
         if action == "list_roles":
@@ -1402,7 +1409,7 @@ def handle_callback_query(upd: Dict):
         if action in ("add_admin","del_admin","add_mod","del_mod","add_lead","del_lead","add_report_target","del_report_target"):
             set_admin_mode(uid, action)
             answer_callback_query(cb_id, "OK")
-            send_message(chat_id, "✍️ Пришлите Telegram ID пользователя (числом).")
+            send_message(chat_id, "âï¸ ÐÑÐ¸ÑÐ»Ð¸ÑÐµ Telegram ID Ð¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°ÑÐµÐ»Ñ (ÑÐ¸ÑÐ»Ð¾Ð¼).")
             return
         if action == "report_targets":
             answer_callback_query(cb_id, "OK")
@@ -1415,15 +1422,15 @@ def handle_callback_query(upd: Dict):
         if action == "reload_onzs":
             load_onzs_catalog()
             answer_callback_query(cb_id, "OK")
-            send_message(chat_id, f"✅ ОНзС перезагружен: {len(ONZS_MAP)}")
+            send_message(chat_id, f"â ÐÐÐ·Ð¡ Ð¿ÐµÑÐµÐ·Ð°Ð³ÑÑÐ¶ÐµÐ½: {len(ONZS_MAP)}")
             return
         if action == "test_yagpt":
             answer_callback_query(cb_id, "OK")
             try:
-                t = call_yandex_gpt_raw([{"role":"user","text":"Тест. Ответь одним словом: ОК"}])
-                send_message(chat_id, f"🧪 YandexGPT: {str(t)[:500]}")
+                t = call_yandex_gpt_raw([{"role":"user","text":"Ð¢ÐµÑÑ. ÐÑÐ²ÐµÑÑ Ð¾Ð´Ð½Ð¸Ð¼ ÑÐ»Ð¾Ð²Ð¾Ð¼: ÐÐ"}])
+                send_message(chat_id, f"ð§ª YandexGPT: {str(t)[:500]}")
             except Exception as e:
-                send_message(chat_id, f"🧪 YandexGPT ошибка: {e}")
+                send_message(chat_id, f"ð§ª YandexGPT Ð¾ÑÐ¸Ð±ÐºÐ°: {e}")
             return
     cb_id = cb.get("id") or ""
     msg = cb.get("message") or {}
@@ -1432,14 +1439,14 @@ def handle_callback_query(upd: Dict):
     message_id = msg.get("message_id")
 
     if not from_user:
-        answer_callback(cb_id, "Ошибка", show_alert=True)
+        answer_callback(cb_id, "ÐÑÐ¸Ð±ÐºÐ°", show_alert=True)
         return
 
     # -------------------- ADMIN ACTIONS --------------------
     if data.startswith("admin:"):
-        # доступ: админ/модератор/руководство
+        # Ð´Ð¾ÑÑÑÐ¿: Ð°Ð´Ð¼Ð¸Ð½/Ð¼Ð¾Ð´ÐµÑÐ°ÑÐ¾Ñ/ÑÑÐºÐ¾Ð²Ð¾Ð´ÑÑÐ²Ð¾
         if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
-            answer_callback(cb_id, "Нет доступа", show_alert=True)
+            answer_callback(cb_id, "ÐÐµÑ Ð´Ð¾ÑÑÑÐ¿Ð°", show_alert=True)
             return
 
         op = data.split(":", 1)[1]
@@ -1447,14 +1454,14 @@ def handle_callback_query(upd: Dict):
         if op == "onzs_stats":
             if chat_id:
                 send_message(chat_id, build_onzs_stats())
-            answer_callback(cb_id, "Готово")
+            answer_callback(cb_id, "ÐÐ¾ÑÐ¾Ð²Ð¾")
             return
 
         if op == "reload_onzs":
             load_onzs_catalog()
             if chat_id:
-                send_message(chat_id, f"🔄 Каталог ОНзС перезагружен: {len(ONZS_MAP)} элементов")
-            answer_callback(cb_id, "Перезагружено")
+                send_message(chat_id, f"ð ÐÐ°ÑÐ°Ð»Ð¾Ð³ ÐÐÐ·Ð¡ Ð¿ÐµÑÐµÐ·Ð°Ð³ÑÑÐ¶ÐµÐ½: {len(ONZS_MAP)} ÑÐ»ÐµÐ¼ÐµÐ½ÑÐ¾Ð²")
+            answer_callback(cb_id, "ÐÐµÑÐµÐ·Ð°Ð³ÑÑÐ¶ÐµÐ½Ð¾")
             return
 
         if op == "test_yagpt":
@@ -1462,8 +1469,8 @@ def handle_callback_query(upd: Dict):
             detail = ""
             try:
                 out_text, meta = call_yandex_gpt_raw([
-                    {"role": "system", "text": "Отвечай одной строкой: OK."},
-                    {"role": "user", "text": "Ответь одной строкой: OK"},
+                    {"role": "system", "text": "ÐÑÐ²ÐµÑÐ°Ð¹ Ð¾Ð´Ð½Ð¾Ð¹ ÑÑÑÐ¾ÐºÐ¾Ð¹: OK."},
+                    {"role": "user", "text": "ÐÑÐ²ÐµÑÑ Ð¾Ð´Ð½Ð¾Ð¹ ÑÑÑÐ¾ÐºÐ¾Ð¹: OK"},
                 ])
                 if isinstance(out_text, str) and "OK" in out_text.upper():
                     ok = True
@@ -1473,17 +1480,17 @@ def handle_callback_query(upd: Dict):
                 detail = str(e)[:200]
 
             if chat_id:
-                send_message(chat_id, "✅ YandexGPT: OK" if ok else f"⚠️ YandexGPT: нет ответа. {detail}")
-            answer_callback(cb_id, "OK" if ok else "Проблема")
+                send_message(chat_id, "â YandexGPT: OK" if ok else f"â ï¸ YandexGPT: Ð½ÐµÑ Ð¾ÑÐ²ÐµÑÐ°. {detail}")
+            answer_callback(cb_id, "OK" if ok else "ÐÑÐ¾Ð±Ð»ÐµÐ¼Ð°")
             return
 
-        answer_callback(cb_id, "Неизвестная команда", show_alert=True)
+        answer_callback(cb_id, "ÐÐµÐ¸Ð·Ð²ÐµÑÑÐ½Ð°Ñ ÐºÐ¾Ð¼Ð°Ð½Ð´Ð°", show_alert=True)
         return
 
     # -------------------- ONZS ACTIONS --------------------
     if data.startswith("onzs:"):
         if not is_moderator(from_user):
-            answer_callback(cb_id, "❌ Нет доступа.", show_alert=True)
+            answer_callback(cb_id, "â ÐÐµÑ Ð´Ð¾ÑÑÑÐ¿Ð°.", show_alert=True)
             return
 
         parts = data.split(":")
@@ -1493,7 +1500,7 @@ def handle_callback_query(upd: Dict):
             card_id = parts[2]
             if chat_id and message_id:
                 edit_reply_markup(chat_id, message_id, reply_markup=build_onzs_pick_keyboard(card_id))
-            answer_callback(cb_id, "Выбери ОНзС (1–12)")
+            answer_callback(cb_id, "ÐÑÐ±ÐµÑÐ¸ ÐÐÐ·Ð¡ (1â12)")
             return
 
         if op == "set" and len(parts) == 4:
@@ -1503,12 +1510,12 @@ def handle_callback_query(upd: Dict):
             except Exception:
                 n = 0
             if n < 1 or n > 12:
-                answer_callback(cb_id, "ОНзС должен быть 1–12", show_alert=True)
+                answer_callback(cb_id, "ÐÐÐ·Ð¡ Ð´Ð¾Ð»Ð¶ÐµÐ½ Ð±ÑÑÑ 1â12", show_alert=True)
                 return
 
             card = load_card(card_id)
             if not card:
-                answer_callback(cb_id, "Карточка не найдена", show_alert=True)
+                answer_callback(cb_id, "ÐÐ°ÑÑÐ¾ÑÐºÐ° Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½Ð°", show_alert=True)
                 return
 
             card.setdefault("onzs", {})
@@ -1524,20 +1531,20 @@ def handle_callback_query(upd: Dict):
 
             if chat_id and message_id:
                 edit_message_text(chat_id, message_id, build_card_text(card), reply_markup=build_card_keyboard(card_id))
-            answer_callback(cb_id, f"ОНзС установлен: {n}")
+            answer_callback(cb_id, f"ÐÐÐ·Ð¡ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½: {n}")
             return
 
         if op == "confirm" and len(parts) == 3:
             card_id = parts[2]
             card = load_card(card_id)
             if not card:
-                answer_callback(cb_id, "Карточка не найдена", show_alert=True)
+                answer_callback(cb_id, "ÐÐ°ÑÑÐ¾ÑÐºÐ° Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½Ð°", show_alert=True)
                 return
 
             oz = card.get("onzs") or {}
             val = oz.get("value") if oz.get("value") else oz.get("ai")
             if not val:
-                answer_callback(cb_id, "ОНзС ещё не определён", show_alert=True)
+                answer_callback(cb_id, "ÐÐÐ·Ð¡ ÐµÑÑ Ð½Ðµ Ð¾Ð¿ÑÐµÐ´ÐµÐ»ÑÐ½", show_alert=True)
                 return
 
             card.setdefault("onzs", {})
@@ -1551,47 +1558,47 @@ def handle_callback_query(upd: Dict):
 
             if chat_id and message_id:
                 edit_message_text(chat_id, message_id, build_card_text(card), reply_markup=build_card_keyboard(card_id))
-            answer_callback(cb_id, "ОНзС подтверждён")
+            answer_callback(cb_id, "ÐÐÐ·Ð¡ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÑÐ½")
             return
 
         if op == "back" and len(parts) == 3:
             card_id = parts[2]
             if chat_id and message_id:
                 edit_reply_markup(chat_id, message_id, reply_markup=build_card_keyboard(card_id))
-            answer_callback(cb_id, "Ок")
+            answer_callback(cb_id, "ÐÐº")
             return
 
-        answer_callback(cb_id, "Неизвестная команда ОНзС", show_alert=True)
+        answer_callback(cb_id, "ÐÐµÐ¸Ð·Ð²ÐµÑÑÐ½Ð°Ñ ÐºÐ¾Ð¼Ð°Ð½Ð´Ð° ÐÐÐ·Ð¡", show_alert=True)
         return
 
     # -------------------- CARD ACTIONS --------------------
     if data.startswith("card:"):
         parts = data.split(":")
         if len(parts) != 3:
-            answer_callback(cb_id, "Ошибка", show_alert=True)
+            answer_callback(cb_id, "ÐÑÐ¸Ð±ÐºÐ°", show_alert=True)
             return
         card_id, action = parts[1], parts[2]
         if not is_moderator(from_user):
-            answer_callback(cb_id, "❌ Нет доступа.", show_alert=True)
+            answer_callback(cb_id, "â ÐÐµÑ Ð´Ð¾ÑÑÑÐ¿Ð°.", show_alert=True)
             return
 
         card = load_card(card_id)
         if not card:
-            answer_callback(cb_id, "Карточка не найдена", show_alert=True)
+            answer_callback(cb_id, "ÐÐ°ÑÑÐ¾ÑÐºÐ° Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½Ð°", show_alert=True)
             return
 
         label = None
         if action == "work":
             label = "work"
-            answer_callback(cb_id, "Принято: В работу")
+            answer_callback(cb_id, "ÐÑÐ¸Ð½ÑÑÐ¾: Ð ÑÐ°Ð±Ð¾ÑÑ")
         elif action == "wrong":
             label = "wrong"
-            answer_callback(cb_id, "Принято: Неверно")
+            answer_callback(cb_id, "ÐÑÐ¸Ð½ÑÑÐ¾: ÐÐµÐ²ÐµÑÐ½Ð¾")
         elif action == "attach":
             label = "attach"
-            answer_callback(cb_id, "Принято: Привязать")
+            answer_callback(cb_id, "ÐÑÐ¸Ð½ÑÑÐ¾: ÐÑÐ¸Ð²ÑÐ·Ð°ÑÑ")
         else:
-            answer_callback(cb_id, "Неизвестное действие", show_alert=True)
+            answer_callback(cb_id, "ÐÐµÐ¸Ð·Ð²ÐµÑÑÐ½Ð¾Ðµ Ð´ÐµÐ¹ÑÑÐ²Ð¸Ðµ", show_alert=True)
             return
 
         append_history({"text": card.get("text", ""), "label": label, "channel": card.get("channel", ""), "reason": "user_action"})
@@ -1622,31 +1629,31 @@ def handle_callback_query(upd: Dict):
     if mode and text and not text.startswith("/"):
         m_id = re.search(r"(\d+)", text)
         if not m_id:
-            send_message(chat_id, "⚠️ Пришлите числовой Telegram ID пользователя.")
+            send_message(chat_id, "â ï¸ ÐÑÐ¸ÑÐ»Ð¸ÑÐµ ÑÐ¸ÑÐ»Ð¾Ð²Ð¾Ð¹ Telegram ID Ð¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°ÑÐµÐ»Ñ.")
             return
         target_uid = int(m_id.group(1))
         if mode == "add_admin":
-            _roles_add("admins", target_uid); send_message(chat_id, f"✅ Добавлен админ: {target_uid}")
+            _roles_add("admins", target_uid); send_message(chat_id, f"â ÐÐ¾Ð±Ð°Ð²Ð»ÐµÐ½ Ð°Ð´Ð¼Ð¸Ð½: {target_uid}")
         elif mode == "del_admin":
-            _roles_del("admins", target_uid); send_message(chat_id, f"✅ Удалён админ: {target_uid}")
+            _roles_del("admins", target_uid); send_message(chat_id, f"â Ð£Ð´Ð°Ð»ÑÐ½ Ð°Ð´Ð¼Ð¸Ð½: {target_uid}")
         elif mode == "add_mod":
-            _roles_add("moderators", target_uid); send_message(chat_id, f"✅ Добавлен модератор: {target_uid}")
+            _roles_add("moderators", target_uid); send_message(chat_id, f"â ÐÐ¾Ð±Ð°Ð²Ð»ÐµÐ½ Ð¼Ð¾Ð´ÐµÑÐ°ÑÐ¾Ñ: {target_uid}")
         elif mode == "del_mod":
-            _roles_del("moderators", target_uid); send_message(chat_id, f"✅ Удалён модератор: {target_uid}")
+            _roles_del("moderators", target_uid); send_message(chat_id, f"â Ð£Ð´Ð°Ð»ÑÐ½ Ð¼Ð¾Ð´ÐµÑÐ°ÑÐ¾Ñ: {target_uid}")
         elif mode == "add_lead":
-            _roles_add("leadership", target_uid); send_message(chat_id, f"✅ Добавлено руководство: {target_uid}")
+            _roles_add("leadership", target_uid); send_message(chat_id, f"â ÐÐ¾Ð±Ð°Ð²Ð»ÐµÐ½Ð¾ ÑÑÐºÐ¾Ð²Ð¾Ð´ÑÑÐ²Ð¾: {target_uid}")
         elif mode == "del_lead":
-            _roles_del("leadership", target_uid); send_message(chat_id, f"✅ Удалено руководство: {target_uid}")
+            _roles_del("leadership", target_uid); send_message(chat_id, f"â Ð£Ð´Ð°Ð»ÐµÐ½Ð¾ ÑÑÐºÐ¾Ð²Ð¾Ð´ÑÑÐ²Ð¾: {target_uid}")
         elif mode == "add_report_target":
-            _roles_add("report_targets", target_uid); send_message(chat_id, f"✅ Добавлен получатель отчётов: {target_uid}")
+            _roles_add("report_targets", target_uid); send_message(chat_id, f"â ÐÐ¾Ð±Ð°Ð²Ð»ÐµÐ½ Ð¿Ð¾Ð»ÑÑÐ°ÑÐµÐ»Ñ Ð¾ÑÑÑÑÐ¾Ð²: {target_uid}")
         elif mode == "del_report_target":
-            _roles_del("report_targets", target_uid); send_message(chat_id, f"✅ Удалён получатель отчётов: {target_uid}")
+            _roles_del("report_targets", target_uid); send_message(chat_id, f"â Ð£Ð´Ð°Ð»ÑÐ½ Ð¿Ð¾Ð»ÑÑÐ°ÑÐµÐ»Ñ Ð¾ÑÑÑÑÐ¾Ð²: {target_uid}")
         pop_admin_mode(uid)
         return
 
     if text == "/admin":
         if not is_privileged(uid):
-            send_message(chat_id, "❌ Нет доступа.")
+            send_message(chat_id, "â ÐÐµÑ Ð´Ð¾ÑÑÑÐ¿Ð°.")
             return
         send_message(chat_id, admin_menu_text(), reply_markup=admin_menu_kb())
         return
@@ -1658,17 +1665,17 @@ def handle_callback_query(upd: Dict):
     if text == "/admin":
         uid = get_sender_user_id(upd)
         if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
-            send_message(chat_id, "❌ Нет доступа.")
+            send_message(chat_id, "â ÐÐµÑ Ð´Ð¾ÑÑÑÐ¿Ð°.")
             return
 
         onzs_cnt = len(ONZS_MAP) if isinstance(ONZS_MAP, dict) else 0
         yagpt_enabled = bool(YAGPT_API_KEY and YAGPT_FOLDER_ID)
         info = []
-        info.append("🛠 Админ-панель")
+        info.append("ð  ÐÐ´Ð¼Ð¸Ð½-Ð¿Ð°Ð½ÐµÐ»Ñ")
         info.append(f"ID: {from_user}")
         info.append(f"YandexGPT: {'ON' if yagpt_enabled else 'OFF'} | model={YAGPT_MODEL}")
         info.append(f"AI-gate: {MIN_AI_GATE}% | HTTP_TIMEOUT={HTTP_TIMEOUT}s")
-        info.append(f"ОНзС каталог: {onzs_cnt} | файл: {ONZS_XLSX}")
+        info.append(f"ÐÐÐ·Ð¡ ÐºÐ°ÑÐ°Ð»Ð¾Ð³: {onzs_cnt} | ÑÐ°Ð¹Ð»: {ONZS_XLSX}")
         info.append(f"Admins: {len(ADMINS)} | Moderators: {len(MODERATORS)} | Leadership: {len(LEADERSHIP)}")
         send_message(chat_id, "\n".join(info), reply_markup=build_admin_keyboard())
         return
@@ -1676,13 +1683,13 @@ def handle_callback_query(upd: Dict):
     if text == "/onzs_ai_stats":
         uid = get_sender_user_id(upd)
         if not (is_admin(from_user) or is_moderator(from_user) or is_lead(from_user)):
-            send_message(chat_id, "❌ Нет доступа.")
+            send_message(chat_id, "â ÐÐµÑ Ð´Ð¾ÑÑÑÐ¿Ð°.")
             return
         send_message(chat_id, build_onzs_stats())
         return
 
     if text == "/start":
-        send_message(chat_id, "Бот запущен.")
+        send_message(chat_id, "ÐÐ¾Ñ Ð·Ð°Ð¿ÑÑÐµÐ½.")
         return
 
 # ----------------------------- GETUPDATES LOOP -----------------------------def acquire_lock() -> bool:
@@ -1731,7 +1738,7 @@ def run_poller():
             offset = max(offset, (u.get("update_id", 0) + 1))
             if "callback_query" in u:
                 handle_callback_query(u)
-            elif "message" in u:
+            elif ("message" in u) or ("edited_message" in u) or ("channel_post" in u) or ("edited_channel_post" in u):
                 handle_message(u)
 
 # ----------------------------- MAIN -----------------------------
@@ -1812,3 +1819,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
