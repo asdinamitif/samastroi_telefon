@@ -1460,10 +1460,12 @@ def handle_callback_query(upd: Dict):
     answer_callback(cb_id, "")
 
 def handle_message(upd: Dict):
-    msg = upd.get("message") or {}
+    # message sources: private/group message, edited_message, channel_post, edited_channel_post
+    msg = (upd.get("message") or upd.get("edited_message") or upd.get("channel_post") or upd.get("edited_channel_post") or {})
     chat_id = (msg.get("chat") or {}).get("id")
     from_user = int((msg.get("from") or {}).get("id", 0))
-    text = (msg.get("text") or "").strip()
+    # commands/text can be in text or caption (media posts)
+    text = ((msg.get("text") or msg.get("caption") or "")).strip()
 
     # stateful admin inputs
     if is_admin(from_user) and from_user in ADMIN_STATE and not text.startswith("/"):
@@ -1512,6 +1514,7 @@ def handle_message(upd: Dict):
         return
 
     cmd = text.split()[0].split("@")[0]
+    log.info(f"[CMD] {cmd} from_user={from_user} chat_id={chat_id}")
 
     if cmd == "/admin":
         if not is_admin(from_user):
@@ -1553,7 +1556,7 @@ def poll_updates_loop():
     log.info("Starting getUpdates poller...")
     while True:
         try:
-            params = {"timeout": 25, "offset": UPDATE_OFFSET, "allowed_updates": ["message", "callback_query"]}
+            params = {"timeout": 25, "offset": UPDATE_OFFSET, "allowed_updates": ["message","edited_message","channel_post","edited_channel_post","callback_query"]}
             data = tg_get("getUpdates", params=params)
             if not data:
                 time.sleep(2); continue
@@ -1567,6 +1570,7 @@ def poll_updates_loop():
                 time.sleep(3); continue
 
             updates = data.get("result", []) or []
+            if updates: log.info(f"[POLL] received updates={len(updates)} next_offset={UPDATE_OFFSET}")
             if not updates:
                 continue
 
@@ -1574,7 +1578,7 @@ def poll_updates_loop():
                 UPDATE_OFFSET = max(UPDATE_OFFSET, int(upd["update_id"]) + 1)
                 if "callback_query" in upd:
                     handle_callback_query(upd)
-                elif "message" in upd:
+                elif any(k in upd for k in ("message","edited_message","channel_post","edited_channel_post")):
                     handle_message(upd)
 
             # persist offset (so restart doesn't replay)
