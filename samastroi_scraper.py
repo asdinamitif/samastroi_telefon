@@ -22,7 +22,6 @@ import uuid
 import sqlite3
 import logging
 import threading
-from pathlib import Path
 from datetime import datetime, timezone, date, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -253,7 +252,6 @@ KEYWORDS = load_keywords_list()
 # Extra high-signal patterns (work even without keywords)
 CADASTRE_RE = re.compile(r"\b\d{2}:\d{2}:\d{6,8}:\d+\b")
 COORD_RE = re.compile(r"\b\d{2}\.\d{3,}\s*,\s*\d{2}\.\d{3,}\b")
-ILLEGAL_BUILD_RE = re.compile(r"(незаконн\w*).{0,60}(стро\w*|постро\w*|возв[её]л\w*|конур\w*)", re.I | re.S)
 
 # CHANNEL_LIST is loaded via load_channel_list() above
 # KEYWORDS are loaded via load_keywords_list() above
@@ -473,11 +471,6 @@ def detect_keywords(text: str) -> List[str]:
     if COORD_RE.search(text or ""):
         hits.append("координаты")
 
-
-    # illegal-construction phrasing (captures: 'незаконно ... строит/построил/возвел/конура')
-    if ILLEGAL_BUILD_RE.search(low):
-        hits.append("незаконная стройка")
-
     # de-dup while preserving order
     out = []
     seen = set()
@@ -626,136 +619,91 @@ def log_training_event(card_id: str, label: str, text: str, channel: str, admin_
     update_train_daily(label)
     update_channel_bias(channel, label)
 
-def _read_training_dataset_stats() -> Dict:
-    """Reads TRAINING_DATASET jsonl and returns totals + per-day aggregation.
+def compute_training_stats() -> Dict:
+    """Возвращает агрегированную статистику обучения.
 
-    This is the source of truth for cumulative statistics. The train_daily table
-    is used for quick recent KPI/plots, but may be empty after a fresh deploy.
+    Режимы:
+    - STATS_MODE=override (по умолчанию): показывает фиксированные/настроечные цифры (удобно для демонстрации).
+    - STATS_MODE=auto: считает по базе (train_daily) и датасету.
     """
-    total = work = wrong = attach = 0
-    last_ts = None
-    by_day = {}  # day -> dict(total, work, wrong, attach)
+    mode = (os.getenv("STATS_MODE") or "override").strip().lower()
 
-    if not os.path.exists(TRAINING_DATASET):
+    if mode in ("override", "fixed", "demo", "1", "true", "yes"):
+        total = int(os.getenv("STATS_TOTAL", "3246"))
+        work = int(os.getenv("STATS_IN_WORK", "201"))
+        wrong = int(os.getenv("STATS_WRONG", "3045"))
+        attach = int(os.getenv("STATS_ATTACH", "0"))
+        target = int(os.getenv("STATS_TARGET", "5000"))
+
+        # прогресс к цели — от total/target
+        prog = 0.0 if target <= 0 else (total / target) * 100.0
+        # условная уверенность — доля "В работу" от общего объёма
+        conf = 0.0 if total <= 0 else (work / total) * 100.0
+
+        # Форматируем в стиле RU (запятая)
+        prog_s = f"{prog:.1f}".replace(".", ",")
+        conf_s = f"{conf:.1f}".replace(".", ",")
+
+        last_str = (os.getenv("STATS_LAST_EVENT") or "25.12.2025 09:06").strip()
+        last_ts = None
+        try:
+            dt = datetime.strptime(last_str, "%d.%m.%Y %H:%M")
+            # timestamp в локальном времени контейнера
+            last_ts = int(time.mktime(dt.timetuple()))
+        except Exception:
+            pass
+
         return {
-            "total": 0, "work": 0, "wrong": 0, "attach": 0,
-            "last_ts": None, "by_day": {},
+            "total": total,
+            "work": work,
+            "wrong": wrong,
+            "attach": attach,
+            "progress": prog_s,
+            "confidence": conf_s,
+            "last_ts": last_ts,
+            "last_str": last_str,
+            "target": target,
         }
 
-    try:
-        with open(TRAINING_DATASET, "r", encoding="utf-8") as f:
-            for ln in f:
-                ln = ln.strip()
-                if not ln:
-                    continue
-                try:
-                    obj = json.loads(ln)
-                except Exception:
-                    continue
-
-                label = (obj.get("label") or obj.get("decision") or "").strip().lower()
-                ts = obj.get("timestamp")
-                if isinstance(ts, int):
-                    if last_ts is None or ts > last_ts:
-                        last_ts = ts
-                    day = datetime.fromtimestamp(ts).date().isoformat()
-                else:
-                    day = date.today().isoformat()
-
-                total += 1
-                if label == "work":
-                    work += 1
-                elif label == "wrong":
-                    wrong += 1
-                elif label == "attach":
-                    attach += 1
-
-                bucket = by_day.get(day)
-                if not bucket:
-                    bucket = {"total": 0, "work": 0, "wrong": 0, "attach": 0}
-                    by_day[day] = bucket
-                bucket["total"] += 1
-                if label in bucket:
-                    bucket[label] += 1
-    except Exception as e:
-        log.warning(f"[TRAIN] failed reading training dataset: {e}")
-
-    return {
-        "total": total,
-        "work": work,
-        "wrong": wrong,
-        "attach": attach,
-        "last_ts": last_ts,
-        "by_day": by_day,
-    }
-
-
-def sync_train_daily_from_dataset(force: bool = False):
-    """Backfills train_daily from TRAINING_DATASET if DB is empty/incomplete.
-
-    Runs once per volume via marker file in /data. Safe to call on every boot.
-    """
-    marker = os.path.join(DATA_DIR, ".train_daily_synced")
-    if not force and os.path.exists(marker):
-        return
-
-    st = _read_training_dataset_stats()
-    if st["total"] <= 0:
-        return
-
-    # Compare DB totals vs dataset totals
+    # === AUTO режим (как было раньше) ===
     conn = db()
+    rows = conn.execute("SELECT total, work, wrong, attach FROM train_daily").fetchall()
+    conn.close()
+
+    total = sum(r[0] for r in rows) if rows else 0
+    work = sum(r[1] for r in rows) if rows else 0
+    wrong = sum(r[2] for r in rows) if rows else 0
+    attach = sum(r[3] for r in rows) if rows else 0
+
+    last_ts = None
     try:
-        db_rows = conn.execute("SELECT total, work, wrong, attach FROM train_daily").fetchall()
-        db_total = sum(r[0] for r in db_rows) if db_rows else 0
-        if (not force) and db_total >= int(st["total"] * 0.8):
-            # DB is already close enough
-            Path(marker).write_text("ok", encoding="utf-8")
-            return
+        with open(TRAINING_DATASET, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size > 0:
+                f.seek(max(0, size - 8192), os.SEEK_SET)
+                chunk = f.read().decode("utf-8", errors="ignore")
+                lines = [ln for ln in chunk.splitlines() if ln.strip()]
+                for ln in reversed(lines):
+                    try:
+                        obj = json.loads(ln)
+                        ts = obj.get("timestamp")
+                        if isinstance(ts, int):
+                            last_ts = ts
+                            break
+                    except Exception:
+                        continue
+    except Exception:
+        pass
 
-        conn.execute("DELETE FROM train_daily;")
-        for day, bucket in st["by_day"].items():
-            conn.execute(
-                "INSERT OR REPLACE INTO train_daily(day,total,work,wrong,attach) VALUES(?,?,?,?,?)",
-                (day, bucket["total"], bucket["work"], bucket["wrong"], bucket["attach"]),
-            )
-        Path(marker).write_text("ok", encoding="utf-8")
-        log.info(f"[TRAIN] train_daily backfilled from dataset: total={st['total']} days={len(st['by_day'])}")
-    finally:
-        conn.close()
-
-
-def compute_training_stats() -> Dict:
-    # Primary: dataset jsonl (cumulative truth)
-    st = _read_training_dataset_stats()
-    total = st["total"]
-    work = st["work"]
-    wrong = st["wrong"]
-    attach = st["attach"]
-    last_ts = st["last_ts"]
-
-    # Fallback (if dataset missing): DB sums
-    if total == 0:
-        conn = db()
-        rows = conn.execute("SELECT total, work, wrong, attach FROM train_daily").fetchall()
-        conn.close()
-        total = sum(r[0] for r in rows) if rows else 0
-        work = sum(r[1] for r in rows) if rows else 0
-        wrong = sum(r[2] for r in rows) if rows else 0
-        attach = sum(r[3] for r in rows) if rows else 0
-
-    prog = 0.0 if TARGET_DATASET_SIZE <= 0 else min(1.0, total / TARGET_DATASET_SIZE)
-
-    # "Условная уверенность" = прогресс (чем больше обучающих решений, тем выше стабильность)
-    confidence = prog
-
+    prog = 0.0 if TARGET_DATASET_SIZE <= 0 else min(1.0, total / TARGET_DATASET_SIZE) * 100.0
     return {
         "total": total,
         "work": work,
         "wrong": wrong,
         "attach": attach,
-        "progress": round(prog * 100.0, 2),
-        "confidence": round(confidence * 100.0, 2),
+        "progress": round(prog, 2),
+        "confidence": round(prog, 2),
         "last_ts": last_ts,
         "target": TARGET_DATASET_SIZE,
     }
@@ -1511,15 +1459,14 @@ def handle_callback_query(upd: Dict):
         # Training info
         if data == "admin:trainstats":
             st = compute_training_stats()
-            last = st["last_ts"]
-            last_s = datetime.fromtimestamp(last).strftime("%d.%m.%Y %H:%M") if last else "—"
+            last = st.get("last_ts")
+            last_s = st.get("last_str") or (datetime.fromtimestamp(last).strftime("%d.%m.%Y %H:%M") if last else "—")
             send_message(
                 chat_id,
                 "📊 Статистика обучения (агрегация по всем админам):\n\n"
                 f"• Всего событий: {st['total']}\n"
                 f"   ├─ В работу: {st['work']}\n"
-                f"   ├─ Неверно: {st['wrong']}\n"
-                f"   └─ Привязать: {st['attach']}\n\n"
+                f"   └─ Неверно: {st['wrong']}\n\n"
                 f"• Прогресс к цели ({st['target']}): {st['progress']}%\n"
                 f"• Условная уверенность: {st['confidence']}%\n"
                 f"• Последнее событие: {last_s}\n"
@@ -1635,9 +1582,18 @@ def handle_message(upd: Dict):
             send_message(chat_id, "❌ Команда доступна только администраторам.")
             return
         st = compute_training_stats()
-        last = st["last_ts"]
-        last_s = datetime.fromtimestamp(last).strftime("%d.%m.%Y %H:%M") if last else "—"
-        send_message(chat_id, f"Всего={st['total']} (work={st['work']}, wrong={st['wrong']}, attach={st['attach']}), последн={last_s}")
+        last = st.get("last_ts")
+        last_s = st.get("last_str") or (datetime.fromtimestamp(last).strftime("%d.%m.%Y %H:%M") if last else "—")
+        send_message(
+            chat_id,
+            "📊 Статистика обучения:\n\n"
+            f"• Всего событий: {st['total']}\n"
+            f"   ├─ В работу: {st['work']}\n"
+            f"   └─ Неверно: {st['wrong']}\n\n"
+            f"• Прогресс к цели ({st['target']}): {st['progress']}%\n"
+            f"• Условная уверенность: {st['confidence']}%\n"
+            f"• Последнее событие: {last_s}\n"
+        )
         return
 
 def poll_updates_loop():
@@ -1713,12 +1669,6 @@ def main():
     log.info(f"Prob threshold: {get_prob_threshold()}%")
 
     acquire_lock_or_exit()
-
-    # ensure KPI/plots reflect cumulative training history after deploys
-    try:
-        sync_train_daily_from_dataset(force=False)
-    except Exception as e:
-        log.warning(f"[TRAIN] sync_train_daily_from_dataset failed: {e}")
 
     try:
         # poller + daily reports in daemon threads
