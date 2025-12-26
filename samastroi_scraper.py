@@ -462,6 +462,19 @@ def append_jsonl(path: str, obj: Dict):
     with open(path, "a", encoding="utf-8") as f: 
         f.write(json.dumps(obj, ensure_ascii=False) + "\n") 
  
+
+def add_onzs_trace(card: Dict, step: str, data: Dict) -> None:
+    """Append ONZS trace step into card['onzs_trace'] preserving order."""
+    try:
+        card.setdefault("onzs_trace", [])
+        card["onzs_trace"].append({
+            "ts": now_ts(),
+            "step": step,
+            "data": data or {}
+        })
+    except Exception:
+        pass
+
 def normalize_text(text: str) -> str: 
     if not isinstance(text, str): 
         return "" 
@@ -961,6 +974,14 @@ def enrich_card_with_yagpt(card: Dict) -> None:
 
         # source of ONZS determination
         card["onzs_source"] = "ИИ"
+        add_onzs_trace(card, "ИИ", {
+            "onzs_category": card.get("onzs_category"),
+            "onzs_category_name": card.get("onzs_category_name"),
+            "confidence": card.get("onzs_confidence"),
+            "probability": (card.get("ai") or {}).get("probability"),
+            "comment": (card.get("ai") or {}).get("comment"),
+            "reason": (card.get("ai") or {}).get("reason")
+        })
     else:
         # If AI didn't give a valid ONZS, do not override heuristic/RGIS
         pass
@@ -1036,6 +1057,22 @@ def build_card_text(card: Dict) -> str:
                 base += f"🧠 Уверенность по ОНзС: {float(conf_):.0f}%\n"
             except Exception:
                 pass
+        tr = card.get("onzs_trace") or []
+        if tr:
+            base += "🧾 Трассировка ОНзС (RGIS → ИИ → итог):\n"
+            for step in tr[-6:]:
+                st = step.get("step", "—")
+                data = step.get("data") or {}
+                if st == "RGIS":
+                    base += f"  • RGIS: адрес={data.get('address') or '—'}; коорд={data.get('coordinates') or '—'}; кадастр={data.get('cadastral_number') or '—'}\n"
+                elif st == "RGIS_MAP":
+                    base += f"  • RGIS→ОНзС: {data.get('onzs_category') or '—'} — {data.get('onzs_category_name') or '—'} ({data.get('confidence') or '—'}%)\n"
+                elif st == "ЭВРИСТИКА":
+                    base += f"  • Эвристика: {data.get('onzs_category') or '—'} — {data.get('onzs_category_name') or '—'} ({data.get('confidence') or '—'}%)\n"
+                elif st == "ИИ":
+                    base += f"  • ИИ: {data.get('onzs_category') or '—'} — {data.get('onzs_category_name') or '—'} ({data.get('confidence') or '—'}%)\n"
+                elif st == "ИТОГ":
+                    base += f"  • Итог: {data.get('onzs_category') or '—'} — {data.get('onzs_category_name') or '—'} | источник={data.get('source') or '—'} | conf={data.get('confidence') or '—'}%\n"
     geo_info = card.get("geo_info", {})
     if geo_info:
         base += "\n📍 Гео-информация:\n"
@@ -1366,10 +1403,19 @@ def generate_card(hit: Dict) -> Dict:
         "status": "new",
         "history": [],
     }
+    card["onzs_trace"] = []
 
     # Extract and enrich geo info
     geo_info = extract_geo_info(card["text"])
     card["geo_info"] = enrich_geo_info(geo_info)
+    # RGIS stage (trace): if you later enrich geo_info from RGIS, log it here
+    add_onzs_trace(card, "RGIS", {
+        "cadastral_number": (card.get("geo_info") or {}).get("cadastral_number"),
+        "address": (card.get("geo_info") or {}).get("address"),
+        "coordinates": (card.get("geo_info") or {}).get("coordinates"),
+        "rgis_municipality": (card.get("geo_info") or {}).get("rgis_municipality"),
+        "rgis_raw": (card.get("geo_info") or {}).get("rgis_raw")
+    })
 
     # New: Categorize if a location is mentioned
     category_id = categorize_by_location(card["text"])
@@ -1378,6 +1424,11 @@ def generate_card(hit: Dict) -> Dict:
         card["onzs_category_name"] = ONZS_CATEGORIES[category_id]["name"]
         card["onzs_source"] = "эвристика"
         card["onzs_confidence"] = 55.0
+        add_onzs_trace(card, "ЭВРИСТИКА", {
+            "onzs_category": card.get("onzs_category"),
+            "onzs_category_name": card.get("onzs_category_name"),
+            "confidence": card.get("onzs_confidence")
+        })
 
     # RGIS hook (optional): if geo_info was enriched with rgis_municipality, try map to ONZS
     if not card.get("onzs_category"):
@@ -1391,6 +1442,12 @@ def generate_card(hit: Dict) -> Dict:
                     card["onzs_category_name"] = info["name"]
                     card["onzs_source"] = "RGIS"
                     card["onzs_confidence"] = 85.0
+                    add_onzs_trace(card, "RGIS_MAP", {
+                        "rgis_municipality": rgis_mun,
+                        "onzs_category": cid,
+                        "onzs_category_name": info["name"],
+                        "confidence": card.get("onzs_confidence")
+                    })
                     break
 
     try:
@@ -1399,6 +1456,13 @@ def generate_card(hit: Dict) -> Dict:
         # Ensure ONZS source is always present when ONZS exists.
         if card.get('onzs_category') and not card.get('onzs_source'):
             card['onzs_source'] = 'неизвестно'
+        add_onzs_trace(card, "ИТОГ", {
+            "onzs_category": card.get("onzs_category"),
+            "onzs_category_name": card.get("onzs_category_name"),
+            "source": card.get("onzs_source"),
+            "confidence": card.get("onzs_confidence"),
+            "probability": (card.get("ai") or {}).get("probability")
+        })
     except Exception as e:
         log.error(f"enrich_card_with_yagpt error: {e}")
     save_card(card)
