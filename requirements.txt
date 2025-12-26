@@ -1,15 +1,56 @@
-httpx==0.27.2
-python-dotenv==1.0.1
-loguru==0.7.2
-beautifulsoup4==4.12.3
-lxml>=5.2.1
-telethon==1.36.0
-requests>=2.32.3
+FROM python:3.11-slim
 
-# аналитика / обучение
-pandas>=2.2.3
-matplotlib>=3.8,<3.11
-openpyxl>=3.1.5
-reportlab>=4.1.0
-playwright==1.47.0
-RUN pip install playwright==1.47.0
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# 1) System deps for Playwright Chromium
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    ca-certificates \
+    gnupg \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpangocairo-1.0-0 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libgtk-3-0 \
+    libx11-6 \
+    libx11-xcb1 \
+    libxcb1 \
+    libxext6 \
+    libxrender1 \
+    libxshmfence1 \
+    libxss1 \
+    libxtst6 \
+    fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2) Python deps
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 3) Ensure Playwright exists (even if missing in requirements.txt)
+RUN pip install --no-cache-dir playwright==1.47.0
+
+# 4) Install Chromium for Playwright
+RUN python -m playwright install chromium
+
+# 5) App files
+COPY samastroi_scraper.py .
+COPY onzs_catalog.xlsx /app/onzs_catalog.xlsx
+
+CMD ["python", "samastroi_scraper.py"]
