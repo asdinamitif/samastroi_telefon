@@ -807,19 +807,28 @@ def call_yandex_gpt_json(text: str) -> Tuple[Optional[Dict], Optional[str]]:
         log.warning(f"geo enrichment failed: {e}")
 
     prompt_lines = [
-        "Ты помощник по выявлению самостроя и определению категории ОНзС (муниципалитет МО).",
-        "На основе текста сообщения и доп.данных оцени:",
+        "Ты классификатор самостроя и определитель категории ОНзС (1–12) по Московской области.",
+        "На основе текста сообщения и дополнительных данных (адрес/координаты/кадастр/обогащение) оцени:",
         "1) вероятность релевантности самострою (0-100)",
-        "2) категорию ОНзС (если можно определить)",
-        "3) короткое обоснование.",
+        "2) номер ОНзС (1-12)",
+        "3) название ОНзС",
+        "4) уверенность по ОНзС (0-100)",
+        "5) короткое обоснование.",
         "",
         "Верни СТРОГО JSON без пояснений вне JSON. Ключи:",
-        "probability (число 0-100), comment (строка), onzs_category_name (строка или пусто).",
+        "{",
+        '  "probability": number,',
+        '  "comment": string,',
+        '  "reason": string,',
+        '  "onzs_category": number,',
+        '  "onzs_category_name": string,',
+        '  "onzs_confidence": number',
+        "}",
         "",
         "Текст сообщения:",
         (text or ""),
         "",
-        "Дополнительные данные (если есть):",
+        "Дополнительные данные (geo/rules):",
         json.dumps(geo_info, ensure_ascii=False),
     ]
     prompt = "\n".join(prompt_lines)
@@ -880,6 +889,25 @@ def call_yandex_gpt_json(text: str) -> Tuple[Optional[Dict], Optional[str]]:
     obj["comment"] = "" if cmt is None else str(cmt)[:1500]
 
     cat = obj.get("onzs_category_name")
+    # onzs_category: ensure int 1..12
+    try:
+        oc = int(obj.get("onzs_category", 0) or 0)
+    except Exception:
+        oc = 0
+    if oc < 1 or oc > 12:
+        oc = 0
+    obj["onzs_category"] = oc
+
+    # onzs_confidence: 0..100
+    try:
+        ocf = float(obj.get("onzs_confidence", 0) or 0)
+    except Exception:
+        ocf = 0.0
+    obj["onzs_confidence"] = max(0.0, min(100.0, ocf))
+
+    rsn = obj.get("reason")
+    obj["reason"] = "" if rsn is None else str(rsn)[:1500]
+
     obj["onzs_category_name"] = "" if cat is None else str(cat)[:120]
 
     return obj, None
@@ -900,14 +928,42 @@ def enrich_card_with_yagpt(card: Dict) -> None:
         card["ai"]["error"] = "AI returned no result."
         return
 
+    # Legacy-compatible fields
     card["ai"]["probability"] = float(res.get("probability", 0.0) or 0.0)
     if res.get("comment"):
         card["ai"]["comment"] = str(res.get("comment"))
+    if res.get("reason"):
+        card["ai"]["reason"] = str(res.get("reason"))
 
-    if res.get("onzs_category_name"):
-        card["onzs_category_name"] = res["onzs_category_name"]
+    # Variant B: onzs_category (1..12) + name + confidence
+    oc = res.get("onzs_category")
+    try:
+        oc = int(oc) if oc is not None else 0
+    except Exception:
+        oc = 0
 
+    if 1 <= oc <= 12:
+        card["onzs_category"] = oc
+        # If name missing, restore from catalog
+        name = (res.get("onzs_category_name") or "").strip()
+        if not name:
+            info = ONZS_CATEGORIES.get(oc)
+            name = info["name"] if info else ""
+        if name:
+            card["onzs_category_name"] = name
 
+        # confidence (separate from probability)
+        try:
+            card["onzs_confidence"] = float(res.get("onzs_confidence", 0) or 0)
+        except Exception:
+            card["onzs_confidence"] = 0.0
+        card["onzs_confidence"] = max(0.0, min(100.0, float(card["onzs_confidence"])))
+
+        # source of ONZS determination
+        card["onzs_source"] = "ИИ"
+    else:
+        # If AI didn't give a valid ONZS, do not override heuristic/RGIS
+        pass
 def generate_card_id() -> str: 
     return str(uuid.uuid4())[:12] 
  
@@ -941,6 +997,7 @@ def build_card_text(card: Dict) -> str:
     raw = ai.get("probability_raw")
     bias = ai.get("bias")
     comment = ai.get("comment")
+    reason = ai.get("reason")
     error = ai.get("error")
 
     ai_lines = []
@@ -953,6 +1010,8 @@ def build_card_text(card: Dict) -> str:
             ai_lines.append(f"🤖 Вероятность самостроя (ИИ): {float(prob):.1f}%")
     if comment:
         ai_lines.append(f"💬 Комментарий ИИ: {comment}")
+    if reason:
+        ai_lines.append(f"🧾 Обоснование: {reason}")
 
     base = (
         "🔎 Обнаружено подозрительное сообщение\n"
@@ -961,9 +1020,22 @@ def build_card_text(card: Dict) -> str:
         f"ID поста: {card.get('post_id','—')}\n"
         "🗣 Для обработки: нажмите кнопку ниже или ответьте реплаем на сообщение.\n"
     )
-    if card.get("onzs_category_name"):
-        base += f"🗂 Категория ОНзС: {card['onzs_category_name']}\n"
-    
+    if card.get("onzs_category") or card.get("onzs_category_name"):
+        n = card.get("onzs_category")
+        name = card.get("onzs_category_name", "—")
+        if n:
+            base += f"🗂 Категория ОНзС: {int(n)} — {name}\n"
+        else:
+            base += f"🗂 Категория ОНзС: {name}\n"
+        src_ = card.get("onzs_source")
+        conf_ = card.get("onzs_confidence")
+        if src_:
+            base += f"🧭 Источник определения ОНзС: {src_}\n"
+        if conf_ is not None:
+            try:
+                base += f"🧠 Уверенность по ОНзС: {float(conf_):.0f}%\n"
+            except Exception:
+                pass
     geo_info = card.get("geo_info", {})
     if geo_info:
         base += "\n📍 Гео-информация:\n"
@@ -1304,9 +1376,29 @@ def generate_card(hit: Dict) -> Dict:
     if category_id:
         card["onzs_category"] = category_id
         card["onzs_category_name"] = ONZS_CATEGORIES[category_id]["name"]
+        card["onzs_source"] = "эвристика"
+        card["onzs_confidence"] = 55.0
+
+    # RGIS hook (optional): if geo_info was enriched with rgis_municipality, try map to ONZS
+    if not card.get("onzs_category"):
+        rgis_mun = (card.get("geo_info") or {}).get("rgis_municipality")
+        if rgis_mun:
+            mun_low = str(rgis_mun).lower()
+            for cid, info in ONZS_CATEGORIES.items():
+                # match by official name part or stems
+                if info.get("name", "").lower() in mun_low or any(st in mun_low for st in info.get("stems", [])):
+                    card["onzs_category"] = cid
+                    card["onzs_category_name"] = info["name"]
+                    card["onzs_source"] = "RGIS"
+                    card["onzs_confidence"] = 85.0
+                    break
 
     try:
         enrich_card_with_yagpt(card)
+        # If AI determined ONZS, it sets onzs_source='ИИ' and onzs_confidence.
+        # Ensure ONZS source is always present when ONZS exists.
+        if card.get('onzs_category') and not card.get('onzs_source'):
+            card['onzs_source'] = 'неизвестно'
     except Exception as e:
         log.error(f"enrich_card_with_yagpt error: {e}")
     save_card(card)
