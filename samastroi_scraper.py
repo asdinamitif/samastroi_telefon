@@ -783,102 +783,89 @@ def select_few_shot_examples(text: str, k: int = 3) -> List[Dict]:
     scored.sort(key=lambda x: x[0], reverse=True) 
     return [e for _, e in scored[:k]] 
  
-def call_yandex_gpt_json(text: str) -> Optional[Dict]: 
-    if not YAGPT_API_KEY or not YAGPT_FOLDER_ID: 
-        return None 
- 
-    model_uri = YAGPT_MODEL.format(folder_id=YAGPT_FOLDER_ID) 
- 
-    few = select_few_shot_examples(text, k=3) 
-    few_block = "" 
-    if few: 
-        lines = ["Примеры разметки (для калибровки):"] 
-        for ex in few: 
-            lbl = ex.get("label") 
-            t = re.sub(r"\s+", " ", (ex.get("text") or "")).strip()[:240] 
-            hint = "70-100" if lbl == "work" else ("0-30" if lbl == "wrong" else "40-70") 
-            lines.append(f"- Метка={lbl} (ориентир {hint}). Текст: {t}") 
-        few_block = "\n" + "\n".join(lines) + "\n" 
- 
-    prompt = ( 
-        "Ты помощник инспектора строительного надзора.\n" 
-        "Оцени вероятность, что сообщение относится к незаконному строительству (самострой).\n" 
-        "Верни строго JSON:\n" 
-        "{\n" 
-        '  \"probability\": <0-100>,\n' 
-        '  \"comment\": \"краткий комментарий\"\n' 
-        "}\n" 
-        + few_block + 
-        "\nТекст сообщения:\n" + (text or "") 
-    ) 
- 
-    body = { 
-        "modelUri": model_uri, 
-        "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": 220}, 
-        "messages": [{"role": "user", "text": prompt}], 
-    } 
-    headers = { 
-        "Authorization": f"Api-Key {YAGPT_API_KEY}", 
-        "x-folder-id": YAGPT_FOLDER_ID, 
-        "Content-Type": "application/json", 
-    } 
- 
-    try: 
-        resp = requests.post(YAGPT_ENDPOINT, headers=headers, json=body, timeout=25) 
-        data = resp.json() 
-    except Exception as e: 
-        log.error(f"YandexGPT request error: {e}") 
-        return None 
- 
-    try: 
-        text_out = data["result"]["alternatives"][0]["message"]["text"] 
-    except Exception as e: 
-        log.error(f"YandexGPT response parse error: {e}; data={data}") 
-        return None 
- 
-    out = text_out.strip() 
-    if not out.startswith("{"): 
-        s = out.find("{") 
-        e = out.rfind("}") 
-        if s != -1 and e != -1 and e > s: 
-            out = out[s:e+1] 
-    try: 
-        return json.loads(out) 
-    except Exception as e: 
-        log.error(f"YandexGPT JSON parse error: {e}; text={text_out[:300]}") 
-        return None 
- 
+def call_yandex_gpt_json(text: str) -> Tuple[Optional[Dict], Optional[str]]:
+    if not YAGPT_API_KEY or not YAGPT_FOLDER_ID:
+        return None, "YandexGPT API Key or Folder ID is not configured."
+
+    model_uri = YAGPT_MODEL.format(folder_id=YAGPT_FOLDER_ID)
+
+    # Simplified prompt for the new workflow
+    geo_info = extract_geo_info(text) # Assuming this function exists and is contextually available
+    enriched_text = text
+    if geo_info:
+        enriched_text += f"\n\nДополнительная информация: {json.dumps(geo_info, ensure_ascii=False)}"
+
+    prompt = (
+        "Определи категорию ОНзС для следующего сообщения. "
+        "Верни строго JSON с ключом 'onzs_category_name'.\n\n"
+        "Текст сообщения:\n" + enriched_text
+    )
+
+    body = {
+        "modelUri": model_uri,
+        "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": 220},
+        "messages": [{"role": "user", "text": prompt}],
+    }
+    headers = {
+        "Authorization": f"Api-Key {YAGPT_API_KEY}",
+        "x-folder-id": YAGPT_FOLDER_ID,
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = requests.post(YAGPT_ENDPOINT, headers=headers, json=body, timeout=25)
+        if resp.status_code != 200:
+            return None, f"API Request Failed with status {resp.status_code}: {resp.text}"
+        data = resp.json()
+    except requests.exceptions.RequestException as e:
+        log.error(f"YandexGPT request error: {e}")
+        return None, f"API Request Failed: {e}"
+    except json.JSONDecodeError:
+        log.error(f"YandexGPT JSON decode error. Response: {resp.text}")
+        return None, "Failed to decode API response."
+
+    try:
+        text_out = data["result"]["alternatives"][0]["message"]["text"]
+    except (KeyError, IndexError) as e:
+        log.error(f"YandexGPT response parse error: {e}; data={data}")
+        return None, "Unexpected API response format."
+
+    out = text_out.strip()
+    if not out.startswith("{"):
+        s = out.find("{")
+        e = out.rfind("}")
+        if s != -1 and e != -1 and e > s:
+            out = out[s:e+1]
+    try:
+        return json.loads(out), None
+    except json.JSONDecodeError as e:
+        log.error(f"YandexGPT JSON parse error: {e}; text={text_out[:300]}")
+        return None, "Failed to parse JSON from AI response."
+
 def enrich_card_with_yagpt(card: Dict) -> None:
     t = (card.get("text") or "").strip()
     if not t:
         return
-    res = call_yandex_gpt_json(t)
+    
+    # Pass the full card text to the AI
+    res, err = call_yandex_gpt_json(card.get("text", ""))
+    
+    if err:
+        card.setdefault("ai", {})
+        card["ai"]["error"] = err
+        return
+
     if not res:
         card.setdefault("ai", {})
-        card["ai"]["error"] = "Ошибка при анализе текста"
+        card["ai"]["error"] = "AI returned no result."
         return
-    prob = res.get("probability")
-    comment = (res.get("comment") or "").strip() 
- 
-    prob_f = None 
-    try: 
-        prob_f = float(prob) 
-    except Exception: 
-        prob_f = None 
- 
-    if prob_f is not None: 
-        prob_f = max(0.0, min(100.0, prob_f)) 
-        # calibration bias 
-        bias = get_channel_bias(card.get("channel", "")) 
-        prob_adj = max(0.0, min(100.0, prob_f + bias)) 
-        card.setdefault("ai", {}) 
-        card["ai"]["probability_raw"] = round(prob_f, 1) 
-        card["ai"]["bias"] = bias 
-        card["ai"]["probability"] = round(prob_adj, 1) 
- 
-    if comment: 
-        card.setdefault("ai", {}) 
-        card["ai"]["comment"] = comment[:600] 
+
+    # In the new workflow, AI provides the category name directly
+    if res.get("onzs_category_name"):
+        card["onzs_category_name"] = res["onzs_category_name"]
+    
+    # The legacy probability and comment logic has been removed as the new
+    # workflow relies on the AI to provide the category name directly.
  
  
 def generate_card_id() -> str: 
