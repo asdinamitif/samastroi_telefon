@@ -1368,6 +1368,164 @@ def enrich_geo_info(geo_info: Dict) -> Dict:
     if not YANDEX_GEOCODER_API_KEY:
         return geo_info
 
+
+# --- RGIS (Playwright parsing) ---
+ENABLE_RGIS = str(os.getenv("ENABLE_RGIS", "1")).strip().lower() in ("1", "true", "yes", "on")
+RGIS_TIMEOUT = int(os.getenv("RGIS_TIMEOUT", "35"))  # seconds
+RGIS_MAX_CHARS = int(os.getenv("RGIS_MAX_CHARS", "2500"))
+RGIS_HEADLESS = str(os.getenv("RGIS_HEADLESS", "1")).strip().lower() in ("1", "true", "yes", "on")
+
+def _extract_municipality_from_rgis_text(txt: str) -> Optional[str]:
+    if not txt:
+        return None
+    t = " ".join(str(txt).split())
+    # Try common phrases
+    m = re.search(r"(городской\s+округ\s+[А-Яа-яЁё\-\s]+)", t, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"\b(г\.о\.\s*[А-Яа-яЁё\-\s]+)", t, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Fallback: any 'округ <Name>'
+    m = re.search(r"(округ\s+[А-Яа-яЁё\-]+)", t, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def rgis_fetch_planning_by_cadastre(cadastral_number: str) -> Dict:
+    """
+    Opens https://rgis.mosreg.ru/v3/#/?tab=planning, searches by cadastral number,
+    extracts the visible result panel text. Returns dict with rgis_raw_text, municipality.
+    Requires Playwright + Chromium installed in the container.
+    """
+    out: Dict = {"rgis_raw_text": "", "rgis_municipality": None, "rgis_ok": False, "rgis_error": None}
+    cad = (cadastral_number or "").strip()
+    if not cad:
+        out["rgis_error"] = "empty_cadastral_number"
+        return out
+    if not ENABLE_RGIS:
+        out["rgis_error"] = "rgis_disabled"
+        return out
+
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    except Exception as e:
+        out["rgis_error"] = f"playwright_import_error: {e}"
+        return out
+
+    url = "https://rgis.mosreg.ru/v3/#/?tab=planning"
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=RGIS_HEADLESS, args=["--no-sandbox"])
+            ctx = browser.new_context(locale="ru-RU")
+            page = ctx.new_page()
+            page.set_default_timeout(RGIS_TIMEOUT * 1000)
+
+            page.goto(url, wait_until="domcontentloaded")
+            # Sometimes the app needs a moment to render
+            page.wait_for_timeout(1500)
+
+            # Try several selectors for the cadastral input
+            selectors = [
+                "input[placeholder*='кадастр' i]",
+                "input[placeholder*='кадастров' i]",
+                "input[aria-label*='кадастр' i]",
+                "input[type='text']",
+            ]
+            inp = None
+            for sel in selectors:
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    inp = loc.first
+                    try:
+                        inp.click(timeout=2000)
+                        break
+                    except Exception:
+                        continue
+
+            if inp is None:
+                raise RuntimeError("RGIS input not found")
+
+            # Fill cadastral and search (press Enter + try click search icon)
+            inp.fill("")
+            inp.type(cad, delay=30)
+            try:
+                inp.press("Enter")
+            except Exception:
+                pass
+
+            # Try click a search button/icon near input
+            btn_selectors = [
+                "button:has-text('Поиск')",
+                "button[aria-label*='поиск' i]",
+                "button:has(svg)",
+            ]
+            clicked = False
+            for bsel in btn_selectors:
+                try:
+                    b = page.locator(bsel).first
+                    if b.count() > 0:
+                        b.click(timeout=1500)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+
+            # Wait for any result panel to appear; collect most informative visible text.
+            page.wait_for_timeout(2500)
+
+            candidates = [
+                "div:has-text('Градпроработка')",
+                "div:has-text('Ограничения')",
+                "div:has-text('разрешенного использования')",
+                "aside",
+                "section",
+                "main",
+            ]
+            text_blocks = []
+            for csel in candidates:
+                try:
+                    loc = page.locator(csel)
+                    if loc.count() > 0:
+                        # Take first few matches
+                        for i in range(min(3, loc.count())):
+                            t = loc.nth(i).inner_text(timeout=1500)
+                            t = normalize_text(t)
+                            if t and len(t) >= 40:
+                                text_blocks.append(t)
+                except Exception:
+                    continue
+
+            # Deduplicate and pick the longest (usually the result drawer)
+            uniq = []
+            seen = set()
+            for t in text_blocks:
+                if t in seen:
+                    continue
+                seen.add(t)
+                uniq.append(t)
+            uniq.sort(key=len, reverse=True)
+
+            rgis_txt = (uniq[0] if uniq else "")
+            if rgis_txt:
+                rgis_txt = rgis_txt[:RGIS_MAX_CHARS]
+                out["rgis_raw_text"] = rgis_txt
+                out["rgis_ok"] = True
+                out["rgis_municipality"] = _extract_municipality_from_rgis_text(rgis_txt)
+            else:
+                out["rgis_error"] = "rgis_no_text_found"
+
+            try:
+                ctx.close()
+                browser.close()
+            except Exception:
+                pass
+
+    except Exception as e:
+        out["rgis_error"] = str(e)
+
+    return out
+
     if "address" in geo_info and "coordinates" not in geo_info:
         try:
             url = f"https://geocode-maps.yandex.ru/1.x/?apikey={YANDEX_GEOCODER_API_KEY}&format=json&geocode={geo_info['address']}"
@@ -1416,6 +1574,24 @@ def generate_card(hit: Dict) -> Dict:
         "rgis_municipality": (card.get("geo_info") or {}).get("rgis_municipality"),
         "rgis_raw": (card.get("geo_info") or {}).get("rgis_raw")
     })
+    # If cadastral number exists, query RGIS via Playwright and store raw result for AI/context
+    cad = (card.get("geo_info") or {}).get("cadastral_number")
+    if cad:
+        rg = rgis_fetch_planning_by_cadastre(str(cad))
+        if rg.get("rgis_ok"):
+            card["geo_info"]["rgis_raw"] = rg.get("rgis_raw_text")
+            if rg.get("rgis_municipality"):
+                card["geo_info"]["rgis_municipality"] = rg.get("rgis_municipality")
+            add_onzs_trace(card, "RGIS_SITE", {
+                "ok": True,
+                "municipality": rg.get("rgis_municipality"),
+                "snippet": (rg.get("rgis_raw_text") or "")[:280]
+            })
+        else:
+            add_onzs_trace(card, "RGIS_SITE", {
+                "ok": False,
+                "error": rg.get("rgis_error")
+            })
 
     # New: Categorize if a location is mentioned
     category_id = categorize_by_location(card["text"])
