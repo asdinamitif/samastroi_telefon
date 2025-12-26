@@ -5,6 +5,8 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0
+ENV CHROMIUM_FLAGS="--no-sandbox --disable-dev-shm-usage"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates gnupg \
@@ -18,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libx11-6 libx11-xcb1 libxcb1 libxext6 libxrender1 \
     libxshmfence1 libxss1 libxtst6 \
     fonts-liberation \
+    tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -27,5 +30,7 @@ RUN python -m playwright install chromium
 
 COPY samastroi_scraper.py .
 COPY onzs_catalog.xlsx /app/onzs_catalog.xlsx
+COPY data ./data
 
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "samastroi_scraper.py"]
