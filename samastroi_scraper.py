@@ -921,21 +921,25 @@ def build_card_text(card: Dict) -> str:
     if comment: 
         ai_lines.append(f"💬 Комментарий ИИ: {comment}") 
  
-    base = ( 
-        "🔎 Обнаружено подозрительное сообщение\n" 
-        f"Источник: @{card.get('channel','—')}\n" 
-        f"Дата: {dt}\n" 
-        f"ID поста: {card.get('post_id','—')}\n\n" 
-        f"🔑 Ключевые слова: {kw}\n\n" 
-        "📝 Текст:\n" 
-        f"{card.get('text','')}\n\n" 
-        "📎 Ссылки:\n" 
-        f"{links_str}\n\n" 
-        f"🆔 ID карточки: {card.get('card_id','—')}" 
-    ) 
-    if ai_lines: 
-        base += "\n\n" + "\n".join(ai_lines) 
-    return base 
+    base = (
+        "🔎 Обнаружено подозрительное сообщение\n"
+        f"Источник: @{card.get('channel','—')}\n"
+        f"Дата: {dt}\n"
+        f"ID поста: {card.get('post_id','—')}\n"
+    )
+    if card.get("onzs_category_name"):
+        base += f"🗂 Категория ОНзС: {card['onzs_category_name']}\n"
+    base += (
+        f"\n🔑 Ключевые слова: {kw}\n\n"
+        "📝 Текст:\n"
+        f"{card.get('text','')}\n\n"
+        "📎 Ссылки:\n"
+        f"{links_str}\n\n"
+        f"🆔 ID карточки: {card.get('card_id','—')}"
+    )
+    if ai_lines:
+        base += "\n\n" + "\n".join(ai_lines)
+    return base
  
 def append_history(entry: Dict): 
     entry = dict(entry) 
@@ -1006,17 +1010,61 @@ def send_photo(chat_id: int, file_path: str, caption: str = ""):
         if not r.ok: 
             log.error(f"sendPhoto failed: {r.text}") 
  
-def build_card_keyboard(card_id: str) -> Dict: 
-    return { 
-        "inline_keyboard": [ 
-            [{"text": "✅ В работу", "callback_data": f"card:{card_id}:work"}, 
-             {"text": "❌ Неверно", "callback_data": f"card:{card_id}:wrong"}], 
-            [{"text": "📎 Привязать", "callback_data": f"card:{card_id}:attach"}], 
-        ] 
-    } 
- 
- 
-ADMIN_STATE: Dict[int, str] = {}  # user_id -> pending_action 
+def build_card_keyboard(card_id: str) -> Dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ В работу", "callback_data": f"card:{card_id}:work"},
+             {"text": "❌ Неверно", "callback_data": f"card:{card_id}:wrong"}],
+            [{"text": "📎 Привязать", "callback_data": f"card:{card_id}:attach"}],
+        ]
+    }
+
+def build_status_keyboard(card_id: str) -> Dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "Выявлен", "callback_data": f"status:{card_id}:identified"},
+             {"text": "В работе", "callback_data": f"status:{card_id}:in_progress"}],
+            [{"text": "Устранен", "callback_data": f"status:{card_id}:resolved"},
+             {"text": "Архив", "callback_data": f"status:{card_id}:archived"}],
+        ]
+    }
+
+def build_comment_keyboard(card_id: str) -> Dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "Добавить комментарий", "callback_data": f"comment:{card_id}:add"}],
+            [{"text": "Пропустить", "callback_data": f"comment:{card_id}:skip"}],
+        ]
+    }
+
+
+ADMIN_STATE: Dict[int, str] = {}  # user_id -> pending_action
+
+ONZS_CATEGORIES = {
+    1: {"name": "Одинцовский г.о.", "stems": ["одинцов"]},
+    2: {"name": "Красногорский г.о.", "stems": ["красногор"]},
+    3: {"name": "Истринский г.о.", "stems": ["истринск", "истр"]},
+    4: {"name": "Солнечногорский г.о.", "stems": ["солнечногор"]},
+    5: {"name": "Химкинский г.о.", "stems": ["химкинск", "химк"]},
+    6: {"name": "Мытищинский г.о.", "stems": ["мытищин", "мытищ"]},
+    7: {"name": "Балашихинский г.о.", "stems": ["балашихин", "балаш"]},
+    8: {"name": "Люберецкий г.о.", "stems": ["люберец", "любер"]},
+    9: {"name": "Раменский г.о.", "stems": ["раменск"]},
+    10: {"name": "Домодедовский г.о.", "stems": ["домодедов"]},
+    11: {"name": "Ленинский г.о.", "stems": ["ленинск"]},
+    12: {"name": "Подольский г.о.", "stems": ["подольск", "подол"]},
+}
+
+def categorize_by_location(text: str) -> Optional[int]:
+    """Categorize text by location based on word stems."""
+    text_lower = text.lower()
+    words = set(re.findall(r'\b\w{3,}\b', text_lower))
+    for cat_id, info in ONZS_CATEGORIES.items():
+        for stem in info["stems"]:
+            for word in words:
+                if stem in word:
+                    return cat_id
+    return None
  
 def build_admin_keyboard() -> Dict: 
     thr = get_prob_threshold() 
@@ -1142,25 +1190,32 @@ def scan_once() -> List[Dict]:
             log.error(f"scan channel @{ch} error: {e}") 
     return all_hits 
  
-def generate_card(hit: Dict) -> Dict: 
-    cid = generate_card_id() 
-    card = { 
-        "card_id": cid, 
-        "channel": hit["channel"], 
-        "post_id": hit["post_id"], 
-        "timestamp": hit["timestamp"], 
-        "text": hit["text"], 
-        "keywords": hit["keywords"], 
-        "links": hit.get("links", []), 
-        "status": "new", 
-        "history": [], 
-    } 
-    try: 
-        enrich_card_with_yagpt(card) 
-    except Exception as e: 
-        log.error(f"enrich_card_with_yagpt error: {e}") 
-    save_card(card) 
-    return card 
+def generate_card(hit: Dict) -> Dict:
+    cid = generate_card_id()
+    card = {
+        "card_id": cid,
+        "channel": hit["channel"],
+        "post_id": hit["post_id"],
+        "timestamp": hit["timestamp"],
+        "text": hit["text"],
+        "keywords": hit["keywords"],
+        "links": hit.get("links", []),
+        "status": "new",
+        "history": [],
+    }
+
+    # New: Categorize if a location is mentioned
+    category_id = categorize_by_location(card["text"])
+    if category_id:
+        card["onzs_category"] = category_id
+        card["onzs_category_name"] = ONZS_CATEGORIES[category_id]["name"]
+
+    try:
+        enrich_card_with_yagpt(card)
+    except Exception as e:
+        log.error(f"enrich_card_with_yagpt error: {e}")
+    save_card(card)
+    return card
  
 def send_card_to_group(card: Dict) -> Optional[int]: 
     thr = get_prob_threshold() 
@@ -1192,45 +1247,46 @@ def send_card_to_group(card: Dict) -> Optional[int]:
     append_history({"event": "sent", "card_id": card["card_id"], "chat_id": card["tg"]["chat_id"], "message_id": card["tg"]["message_id"]}) 
     return msg["message_id"] 
  
-def apply_card_action(card_id: str, action: str, from_user: int) -> Tuple[str, bool]: 
-    """ 
-    Returns (message, decided_now). 
-    decided_now=True only for the first admin that made the decision. 
-    """ 
-    existing = decision_exists(card_id) 
-    if existing: 
-        dec, by, ts = existing 
-        dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M") 
-        return (f"Уже обработано: {dec} (админ {by}, {dt})", False) 
- 
-    if action not in ("work", "wrong", "attach"): 
-        return ("Неизвестное действие.", False) 
- 
-    card = load_card(card_id) 
-    if not card: 
-        return ("Карточка не найдена.", False) 
- 
-    wrote = set_decision(card_id, action, from_user) 
-    if not wrote: 
-        return ("Уже обработано другим администратором.", False) 
- 
-    old_status = card.get("status", "new") 
-    if action == "work": 
-        new_status, label, msg = "in_work", "work", "Статус: В РАБОТУ ✅" 
-    elif action == "wrong": 
-        new_status, label, msg = "wrong", "wrong", "Статус: НЕВЕРНО ❌" 
-    else: 
-        new_status, label, msg = "bind", "attach", "Статус: ПРИВЯЗАТЬ 📎" 
- 
-    card["status"] = new_status 
-    card.setdefault("history", []).append({"event": f"set_{new_status}", "from_user": int(from_user), "ts": now_ts()}) 
-    save_card(card) 
- 
-    append_history({"event": "status_change", "card_id": card_id, "from_user": int(from_user), "old_status": old_status, "new_status": new_status}) 
-    log_training_event(card_id, label, card.get("text", ""), card.get("channel", ""), admin_id=int(from_user)) 
-    return (msg, True) 
- 
- 
+def apply_card_action(card_id: str, action: str, from_user: int) -> Tuple[str, bool]:
+    """
+    Returns (message, decided_now).
+    decided_now=True only for the first admin that made the decision.
+    """
+    existing = decision_exists(card_id)
+    if existing:
+        dec, by, ts = existing
+        dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+        return (f"Уже обработано: {dec} (админ {by}, {dt})", False)
+
+    if action not in ("work", "wrong", "attach"):
+        return ("Неизвестное действие.", False)
+
+    card = load_card(card_id)
+    if not card:
+        return ("Карточка не найдена.", False)
+
+    wrote = set_decision(card_id, action, from_user)
+    if not wrote:
+        return ("Уже обработано другим администратором.", False)
+
+    old_status = card.get("status", "new")
+    if action == "work":
+        # The 'work' action now triggers the next step in the flow, handled in handle_callback_query
+        return ("Выберите статус:", True)
+    elif action == "wrong":
+        new_status, label, msg = "wrong", "wrong", "Статус: НЕВЕРНО ❌"
+    else: # attach
+        new_status, label, msg = "bind", "attach", "Статус: ПРИВЯЗАТЬ 📎"
+
+    card["status"] = new_status
+    card.setdefault("history", []).append({"event": f"set_{new_status}", "from_user": int(from_user), "ts": now_ts()})
+    save_card(card)
+
+    append_history({"event": "status_change", "card_id": card_id, "from_user": int(from_user), "old_status": old_status, "new_status": new_status})
+    log_training_event(card_id, label, card.get("text", ""), card.get("channel", ""), admin_id=int(from_user))
+    return (msg, True)
+
+
 def _fetch_train_daily_last(days: int = 30): 
     conn = db() 
     rows = conn.execute("SELECT day, total, work, wrong, attach FROM train_daily ORDER BY day DESC LIMIT ?;", (int(days),)).fetchall() 
@@ -1257,34 +1313,64 @@ def build_kpi_text() -> str:
         f"Доля полезных (в работу+привязать): {acc:.1f}%\n" 
     ) 
  
-def build_report_xlsx() -> str: 
-    out_path = os.path.join(REPORTS_DIR, f"report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx") 
-    wb = Workbook() 
-    ws = wb.active 
-    ws.title = "KPI" 
-    ws.append(["Показатель", "Значение"]) 
-    for line in build_kpi_text().splitlines()[1:]: 
-        if ":" in line: 
-            k, v = line.split(":", 1) 
-            ws.append([k.strip(), v.strip()]) 
- 
-    ws2 = wb.create_sheet("TrainingDaily") 
-    ws2.append(["day", "total", "work", "wrong", "attach"]) 
-    for r in _fetch_train_daily_last(90): 
-        ws2.append(list(r)) 
- 
-    ws3 = wb.create_sheet("ChannelBias") 
-    ws3.append(["channel", "bias_points"]) 
-    w = _get_model_param("weights", {"channels": {}}) 
-    for ch, b in sorted((w.get("channels") or {}).items(), key=lambda x: x[0]): 
-        ws3.append([ch, b]) 
- 
-    for wsx in [ws, ws2, ws3]: 
-        for col in range(1, wsx.max_column + 1): 
-            wsx.column_dimensions[get_column_letter(col)].width = 28 
- 
-    wb.save(out_path) 
-    return out_path 
+def build_report_xlsx() -> str:
+    out_path = os.path.join(REPORTS_DIR, f"report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "KPI"
+    ws.append(["Показатель", "Значение"])
+    for line in build_kpi_text().splitlines()[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            ws.append([k.strip(), v.strip()])
+
+    ws2 = wb.create_sheet("TrainingDaily")
+    ws2.append(["day", "total", "work", "wrong", "attach"])
+    for r in _fetch_train_daily_last(90):
+        ws2.append(list(r))
+
+    ws3 = wb.create_sheet("ChannelBias")
+    ws3.append(["channel", "bias_points"])
+    w = _get_model_param("weights", {"channels": {}})
+    for ch, b in sorted((w.get("channels") or {}).items(), key=lambda x: x[0]):
+        ws3.append([ch, b])
+
+    # New sheet for work report
+    ws4 = wb.create_sheet("WorkReport_ONZS")
+    headers = ["Card ID", "Channel", "Post ID", "Timestamp", "Category", "Status", "Comment", "Last Updated By", "Last Updated Ts"]
+    ws4.append(headers)
+
+    conn = db()
+    rows = conn.execute("""
+        SELECT
+            cs.card_id,
+            cs.onzs_category,
+            cs.status,
+            cs.comment,
+            cs.last_updated_by,
+            cs.last_updated_ts
+        FROM card_status cs
+        ORDER BY cs.last_updated_ts DESC
+    """).fetchall()
+    conn.close()
+
+    for row in rows:
+        card_id, onzs_category, status, comment, updated_by, updated_ts = row
+        card_data = load_card(card_id)
+        if card_data:
+            channel = card_data.get("channel", "")
+            post_id = card_data.get("post_id", "")
+            timestamp = datetime.fromtimestamp(card_data.get("timestamp", 0)).strftime("%Y-%m-%d %H:%M:%S")
+            category_name = ONZS_CATEGORIES.get(onzs_category, {}).get("name", "N/A") if onzs_category else "N/A"
+            updated_ts_str = datetime.fromtimestamp(updated_ts).strftime("%Y-%m-%d %H:%M:%S")
+            ws4.append([card_id, channel, post_id, timestamp, category_name, status, comment, updated_by, updated_ts_str])
+
+    for wsx in [ws, ws2, ws3, ws4]:
+        for col in range(1, wsx.max_column + 1):
+            wsx.column_dimensions[get_column_letter(col)].width = 28
+
+    wb.save(out_path)
+    return out_path
  
 def build_report_pdf() -> str: 
     out_path = os.path.join(REPORTS_DIR, f"report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf") 
@@ -1362,45 +1448,78 @@ def daily_reports_worker():
         except Exception as e: 
             log.exception(f"daily_reports_worker error: {e}") 
  
-UPDATE_OFFSET = get_update_offset() 
+UPDATE_OFFSET = get_update_offset()
+LAST_CONFLICT_ALERT_TS = 0
  
-def handle_callback_query(upd: Dict): 
-    cb = upd.get("callback_query") or {} 
-    cb_id = cb.get("id") 
-    from_user = int((cb.get("from") or {}).get("id", 0)) 
-    data = (cb.get("data") or "").strip() 
-    msg_obj = cb.get("message") or {} 
-    chat_id = (msg_obj.get("chat") or {}).get("id") 
-    message_id = msg_obj.get("message_id") 
- 
-    role = get_role(from_user)  # may be None 
- 
-    # Card actions 
-    if data.startswith("card:"): 
-        if not is_admin(from_user): 
-            answer_callback(cb_id, "Только администраторы могут менять статус.", show_alert=True) 
-            return 
- 
-        try: 
-            _, card_id, action = data.split(":", 2) 
-        except ValueError: 
-            answer_callback(cb_id, "Ошибка формата данных.", show_alert=True) 
-            return 
- 
-        result, decided_now = apply_card_action(card_id, action, from_user) 
- 
-        # Always try to remove keyboard; even if already decided (for cleanliness) 
-        try: 
-            if chat_id is not None and message_id is not None: 
-                edit_reply_markup(chat_id, message_id, reply_markup=None) 
-        except Exception: 
-            pass 
- 
-        answer_callback(cb_id, result, show_alert=False) 
-        return 
- 
-    # Admin panel 
-    if data.startswith("admin:"): 
+def handle_callback_query(upd: Dict):
+    cb = upd.get("callback_query") or {}
+    cb_id = cb.get("id")
+    from_user = int((cb.get("from") or {}).get("id", 0))
+    data = (cb.get("data") or "").strip()
+    msg_obj = cb.get("message") or {}
+    chat_id = (msg_obj.get("chat") or {}).get("id")
+    message_id = msg_obj.get("message_id")
+
+    role = get_role(from_user)
+
+    if data.startswith("card:"):
+        if not is_admin(from_user):
+            answer_callback(cb_id, "Только администраторы могут менять статус.", show_alert=True)
+            return
+        _, card_id, action = data.split(":", 2)
+        card = load_card(card_id)
+
+        if not card:
+            answer_callback(cb_id, "Карточка не найдена.", show_alert=True)
+            return
+
+        result, decided_now = apply_card_action(card_id, action, from_user)
+
+        if decided_now and action == "work":
+            edit_reply_markup(chat_id, message_id, reply_markup=build_status_keyboard(card_id))
+            answer_callback(cb_id, "Выберите статус", show_alert=False)
+        else:
+            if chat_id and message_id:
+                edit_reply_markup(chat_id, message_id, reply_markup=None)
+            answer_callback(cb_id, result, show_alert=False)
+        return
+
+    if data.startswith("status:"):
+        if not is_admin(from_user):
+            answer_callback(cb_id, "Только администраторы могут менять статус.", show_alert=True)
+            return
+        _, card_id, status = data.split(":", 2)
+        card = load_card(card_id)
+        if not card:
+            answer_callback(cb_id, "Карточка не найдена.", show_alert=True)
+            return
+
+        conn = db()
+        conn.execute(
+            "INSERT OR REPLACE INTO card_status (card_id, onzs_category, status, last_updated_ts, last_updated_by) VALUES (?, ?, ?, ?, ?)",
+            (card_id, card.get("onzs_category"), status, now_ts(), from_user)
+        )
+        conn.close()
+        edit_reply_markup(chat_id, message_id, reply_markup=build_comment_keyboard(card_id))
+        answer_callback(cb_id, f"Статус '{status}' установлен.", show_alert=False)
+        return
+
+    if data.startswith("comment:"):
+        if not is_admin(from_user):
+            answer_callback(cb_id, "Только администраторы могут менять статус.", show_alert=True)
+            return
+        _, card_id, action = data.split(":", 2)
+        if action == "add":
+            ADMIN_STATE[from_user] = f"await_comment:{card_id}"
+            send_message(chat_id, "Пожалуйста, введите комментарий для карточки.")
+            answer_callback(cb_id, "Ожидаю ваш комментарий.", show_alert=False)
+        else: # skip
+            edit_reply_markup(chat_id, message_id, reply_markup=None)
+            send_message(chat_id, f"Карточка {card_id} обработана.")
+            answer_callback(cb_id, "Обработка завершена.", show_alert=False)
+        return
+
+    if data.startswith("admin:"):
         if not is_admin(from_user): 
             answer_callback(cb_id, "❌ Нет доступа.", show_alert=True) 
             return 
@@ -1525,56 +1644,85 @@ def handle_message(upd: Dict):
     # commands/text can be in text or caption (media posts) 
     text = ((msg.get("text") or msg.get("caption") or "")).strip() 
  
-    # stateful admin inputs 
-    if is_admin(from_user) and from_user in ADMIN_STATE and not text.startswith("/"): 
-        st = ADMIN_STATE.pop(from_user, "") 
- 
-        if st == "await_threshold": 
-            m = re.findall(r"-?\d+", text) 
-            if not m: 
-                send_message(chat_id, "❌ Не распознал число. Введите 0–100.") 
-                ADMIN_STATE[from_user] = "await_threshold" 
-                return 
-            set_prob_threshold(int(m[0])) 
-            send_message(chat_id, f"✅ Порог установлен: {get_prob_threshold()}%", reply_markup=build_admin_keyboard()) 
-            return 
- 
-        # user role operations 
-        m = re.findall(r"\d+", text) 
-        if not m: 
-            send_message(chat_id, "❌ Не распознал ID. Отправьте число.") 
-            ADMIN_STATE[from_user] = st 
-            return 
-        uid = int(m[0]) 
- 
-        if st == "await_add_admins": 
-            add_admin(uid); send_message(chat_id, f"✅ Администратор добавлен: {uid}", reply_markup=build_admin_keyboard()); return 
-        if st == "await_del_admins": 
-            if uid == from_user: 
-                send_message(chat_id, "❌ Нельзя удалить самого себя через меню. Используйте другого админа."); return 
-            remove_admin(uid); send_message(chat_id, f"🗑 Администратор удалён: {uid}", reply_markup=build_admin_keyboard()); return 
- 
-        if st == "await_add_mods": 
-            add_moderator(uid); send_message(chat_id, f"✅ Модератор добавлен: {uid}", reply_markup=build_admin_keyboard()); return 
-        if st == "await_del_mods": 
-            remove_moderator(uid); send_message(chat_id, f"🗑 Модератор удалён: {uid}", reply_markup=build_admin_keyboard()); return 
- 
-        if st == "await_add_leaders": 
-            add_leadership(uid); send_message(chat_id, f"✅ Добавлено в руководство: {uid}", reply_markup=build_admin_keyboard()); return 
-        if st == "await_del_leaders": 
-            remove_leadership(uid); send_message(chat_id, f"🗑 Удалено из руководства: {uid}", reply_markup=build_admin_keyboard()); return 
- 
-        # unknown state 
-        send_message(chat_id, "⚠️ Неизвестная операция. /admin") 
-        return 
- 
-    if not text.startswith("/"): 
-        return 
- 
-    cmd = text.split()[0].split("@")[0] 
-    log.info(f"[CMD] {cmd} from_user={from_user} chat_id={chat_id}") 
- 
-    if cmd == "/admin": 
+    # stateful admin inputs
+    if is_admin(from_user) and from_user in ADMIN_STATE and not text.startswith("/"):
+        st = ADMIN_STATE.pop(from_user, "")
+
+        if st == "await_threshold":
+            m = re.findall(r"-?\d+", text)
+            if not m:
+                send_message(chat_id, "❌ Не распознал число. Введите 0–100.")
+                ADMIN_STATE[from_user] = "await_threshold"
+                return
+            set_prob_threshold(int(m[0]))
+            send_message(chat_id, f"✅ Порог установлен: {get_prob_threshold()}%")
+            return
+
+        if st.startswith("await_comment:"):
+            try:
+                _, card_id = st.split(":", 1)
+                conn = db()
+                conn.execute(
+                    "UPDATE card_status SET comment = ?, last_updated_ts = ?, last_updated_by = ? WHERE card_id = ?",
+                    (text, now_ts(), from_user, card_id)
+                )
+                conn.close()
+                send_message(chat_id, f"✅ Комментарий для карточки {card_id} добавлен.")
+                # Attempt to remove the keyboard from the original message if possible, though message_id isn't stored.
+                # This part is best-effort. The main confirmation is the message above.
+            except Exception as e:
+                log.error(f"Error adding comment: {e}")
+                send_message(chat_id, "❌ Ошибка при добавлении комментария.")
+            return
+
+        # user role operations
+        m = re.findall(r"\d+", text)
+        if not m:
+            send_message(chat_id, "❌ Не распознал ID. Отправьте число.")
+            ADMIN_STATE[from_user] = st
+            return
+        uid = int(m[0])
+
+        if st == "await_add_admins":
+            add_admin(uid); send_message(chat_id, f"✅ Администратор добавлен: {uid}", reply_markup=build_admin_keyboard()); return
+        if st == "await_del_admins":
+            if uid == from_user:
+                send_message(chat_id, "❌ Нельзя удалить самого себя через меню. Используйте другого админа."); return
+            remove_admin(uid); send_message(chat_id, f"🗑 Администратор удалён: {uid}", reply_markup=build_admin_keyboard()); return
+
+        if st == "await_add_mods":
+            add_moderator(uid); send_message(chat_id, f"✅ Модератор добавлен: {uid}", reply_markup=build_admin_keyboard()); return
+        if st == "await_del_mods":
+            remove_moderator(uid); send_message(chat_id, f"🗑 Модератор удалён: {uid}", reply_markup=build_admin_keyboard()); return
+
+        if st == "await_add_leaders":
+            add_leadership(uid); send_message(chat_id, f"✅ Добавлено в руководство: {uid}", reply_markup=build_admin_keyboard()); return
+        if st == "await_del_leaders":
+            remove_leadership(uid); send_message(chat_id, f"🗑 Удалено из руководства: {uid}", reply_markup=build_admin_keyboard()); return
+
+        # unknown state
+        send_message(chat_id, "⚠️ Неизвестная операция. /admin")
+        return
+
+    if not text.startswith("/"):
+        return
+
+    cmd = text.split()[0].split("@")[0]
+    log.info(f"[CMD] {cmd} from_user={from_user} chat_id={chat_id}")
+
+    if cmd == "/get_work_report":
+        if not (is_admin(from_user) or is_leadership(from_user)):
+            send_message(chat_id, "❌ Нет доступа.")
+            return
+        try:
+            report_path = build_report_xlsx()
+            send_document(chat_id, report_path, caption="📄 Отчет о работе по ОНзС")
+        except Exception as e:
+            log.error(f"Failed to generate work report: {e}")
+            send_message(chat_id, "❌ Не удалось создать отчет.")
+        return
+
+    if cmd == "/admin":
         if not is_admin(from_user): 
             send_message(chat_id, "❌ Команда /admin доступна только администраторам.") 
             return 
@@ -1628,13 +1776,27 @@ def poll_updates_loop():
             if not data: 
                 time.sleep(2); continue 
  
-            if not data.get("ok"): 
-                if data.get("error_code") == 409: 
-                    log.error("getUpdates conflict (409). Updates are being consumed elsewhere (another instance or active webhook) for this BOT_TOKEN. Poller will retry in 60s.\nFix: ensure ONLY ONE running instance for this token and webhook is deleted (deleteWebhook).") 
-                    time.sleep(60) 
-                    continue 
-                log.error(f"getUpdates error: {data}") 
-                time.sleep(3); continue 
+            if not data.get("ok"):
+                if data.get("error_code") == 409:
+                    log.error("getUpdates conflict (409). Another instance is running.")
+                    global LAST_CONFLICT_ALERT_TS
+                    if now_ts() - LAST_CONFLICT_ALERT_TS > 3600: # 1 hour cooldown
+                        alert_msg = (
+                            "🚨 ВНИМАНИЕ: ОБНАРУЖЕН КОНФЛИКТ ЭКЗЕМПЛЯРОВ БОТА (ОШИБКА 409)\n\n"
+                            "Другой процесс или сервер уже использует этот токен Telegram, что мешает обработке обновлений.\n\n"
+                            "• **Причина:** Запущено несколько копий бота с одним и тем же BOT_TOKEN.\n"
+                            "• **Решение:** Остановите все лишние экземпляры. Убедитесь, что бот запущен только на одном сервере."
+                        )
+                        recipients = list(set(list_users_by_role('admin') + list_users_by_role('leadership')))
+                        for uid in recipients:
+                            try:
+                                send_message(uid, alert_msg)
+                            except Exception: pass
+                        LAST_CONFLICT_ALERT_TS = now_ts()
+                    time.sleep(60)
+                    continue
+                log.error(f"getUpdates error: {data}")
+                time.sleep(3); continue
  
             updates = data.get("result", []) or [] 
             if updates: log.info(f"[POLL] received updates={len(updates)} next_offset={UPDATE_OFFSET}") 
