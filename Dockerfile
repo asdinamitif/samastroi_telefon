@@ -5,6 +5,7 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
+# === System dependencies (Chromium + Playwright) ===
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
@@ -38,16 +39,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
+# === Python dependencies ===
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Гарантируем, что playwright установлен (даже если забыли в requirements.txt)
+# === GUARANTEE playwright exists ===
 RUN pip install --no-cache-dir playwright==1.47.0
 
-# Install Playwright browsers
+# === Install Chromium for Playwright ===
 RUN python -m playwright install chromium
 
-COPY samastroi_scraper.py .
-COPY onzs_catalog.xlsx /app/onzs_catalog.xlsx
-
-CMD ["python", "samastroi_scraper.py"]
+# === Project files ===
