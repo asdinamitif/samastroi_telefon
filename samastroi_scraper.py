@@ -1224,6 +1224,35 @@ def extract_geo_info(text: str) -> Dict:
     
     return info
 
+YANDEX_GEOCODER_API_KEY = os.getenv("YANDEX_GEOCODER_API_KEY", "34ec9307-a9b2-4708-9296-4b2d6d6e721b")
+
+def enrich_geo_info(geo_info: Dict) -> Dict:
+    """Enriches geo information using Yandex Geocoder API."""
+    if not YANDEX_GEOCODER_API_KEY:
+        return geo_info
+
+    if "address" in geo_info and "coordinates" not in geo_info:
+        try:
+            url = f"https://geocode-maps.yandex.ru/1.x/?apikey={YANDEX_GEOCODER_API_KEY}&format=json&geocode={geo_info['address']}"
+            r = requests.get(url, timeout=HTTP_TIMEOUT)
+            data = r.json()
+            pos = data["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]["Point"]["pos"]
+            geo_info["coordinates"] = ", ".join(pos.split(" ")[::-1])
+        except Exception as e:
+            log.error(f"Yandex Geocoder (forward) error: {e}")
+
+    elif "coordinates" in geo_info and "address" not in geo_info:
+        try:
+            url = f"https://geocode-maps.yandex.ru/1.x/?apikey={YANDEX_GEOCODER_API_KEY}&format=json&geocode={geo_info['coordinates'].replace(' ', '')}"
+            r = requests.get(url, timeout=HTTP_TIMEOUT)
+            data = r.json()
+            address = data["response"]["GeoObjectCollection"]["featureMember"][0]["GeoObject"]["metaDataProperty"]["GeocoderMetaData"]["text"]
+            geo_info["address"] = address
+        except Exception as e:
+            log.error(f"Yandex Geocoder (reverse) error: {e}")
+            
+    return geo_info
+
 def generate_card(hit: Dict) -> Dict:
     cid = generate_card_id()
     card = {
@@ -1238,8 +1267,9 @@ def generate_card(hit: Dict) -> Dict:
         "history": [],
     }
 
-    # Extract and add geo info
-    card["geo_info"] = extract_geo_info(card["text"])
+    # Extract and enrich geo info
+    geo_info = extract_geo_info(card["text"])
+    card["geo_info"] = enrich_geo_info(geo_info)
 
     # New: Categorize if a location is mentioned
     category_id = categorize_by_location(card["text"])
