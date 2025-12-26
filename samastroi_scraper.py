@@ -249,11 +249,12 @@ def load_keywords_list() -> List[str]:
 CHANNEL_LIST = load_channel_list() 
 KEYWORDS = load_keywords_list() 
  
-# Extra high-signal patterns (work even without keywords) 
-CADASTRE_RE = re.compile(r"\b\d{2}:\d{2}:\d{6,8}:\d+\b") 
-COORD_RE = re.compile(r"\b\d{2}\.\d{3,}\s*,\s*\d{2}\.\d{3,}\b") 
- 
-# CHANNEL_LIST is loaded via load_channel_list() above 
+# Extra high-signal patterns (work even without keywords)
+CADASTRE_RE = re.compile(r"\b\d{2}:\d{2}:\d{6,8}:\d+\b")
+COORD_RE = re.compile(r"\b\d{2}\.\d{3,}\s*,\s*\d{2}\.\d{3,}\b")
+ADDRESS_RE = re.compile(r'\b(ул\.?|улица|проспект|пр-т\.?|площадь|пл\.?|переулок|пер\.?|шоссе|ш\.?)\s+([\w\s-]+?)\s+(д\.?|дом)\s+(\d+([\w\/]*))', re.IGNORECASE)
+
+# CHANNEL_LIST is loaded via load_channel_list() above
 # KEYWORDS are loaded via load_keywords_list() above 
 KEYWORDS_LOWER = [k.lower() for k in KEYWORDS] 
  
@@ -934,6 +935,17 @@ def build_card_text(card: Dict) -> str:
     )
     if card.get("onzs_category_name"):
         base += f"🗂 Категория ОНзС: {card['onzs_category_name']}\n"
+    
+    geo_info = card.get("geo_info", {})
+    if geo_info:
+        base += "\n📍 Гео-информация:\n"
+        if "address" in geo_info:
+            base += f"  - Адрес: {geo_info['address']}\n"
+        if "coordinates" in geo_info:
+            base += f"  - Координаты: {geo_info['coordinates']}\n"
+        if "cadastral_number" in geo_info:
+            base += f"  - Кадастровый номер: {geo_info['cadastral_number']}\n"
+
     base += (
         f"\n🔑 Ключевые слова: {kw}\n\n"
         "📝 Текст:\n"
@@ -1027,10 +1039,10 @@ def build_card_keyboard(card_id: str) -> Dict:
 def build_status_keyboard(card_id: str) -> Dict:
     return {
         "inline_keyboard": [
-            [{"text": "Выявлен", "callback_data": f"status:{card_id}:identified"},
-             {"text": "В работе", "callback_data": f"status:{card_id}:in_progress"}],
-            [{"text": "Устранен", "callback_data": f"status:{card_id}:resolved"},
-             {"text": "Архив", "callback_data": f"status:{card_id}:archived"}],
+            [{"text": "На контроле у ОМС", "callback_data": f"status:{card_id}:oms_control"},
+             {"text": "Направлен запрос в ОМС", "callback_data": f"status:{card_id}:oms_request"}],
+            [{"text": "Дело в суде", "callback_data": f"status:{card_id}:court_case"},
+             {"text": "Направлено уведомление", "callback_data": f"status:{card_id}:notification_sent"}],
         ]
     }
 
@@ -1195,6 +1207,23 @@ def scan_once() -> List[Dict]:
             log.error(f"scan channel @{ch} error: {e}") 
     return all_hits 
  
+def extract_geo_info(text: str) -> Dict:
+    """Extracts geographic information from text using regex."""
+    info = {}
+    cadastre = CADASTRE_RE.search(text)
+    if cadastre:
+        info["cadastral_number"] = cadastre.group(0)
+    
+    coords = COORD_RE.search(text)
+    if coords:
+        info["coordinates"] = coords.group(0)
+
+    address = ADDRESS_RE.search(text)
+    if address:
+        info["address"] = address.group(0)
+    
+    return info
+
 def generate_card(hit: Dict) -> Dict:
     cid = generate_card_id()
     card = {
@@ -1208,6 +1237,9 @@ def generate_card(hit: Dict) -> Dict:
         "status": "new",
         "history": [],
     }
+
+    # Extract and add geo info
+    card["geo_info"] = extract_geo_info(card["text"])
 
     # New: Categorize if a location is mentioned
     category_id = categorize_by_location(card["text"])
