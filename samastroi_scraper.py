@@ -847,14 +847,16 @@ def call_yandex_gpt_json(text: str) -> Optional[Dict]:
         log.error(f"YandexGPT JSON parse error: {e}; text={text_out[:300]}") 
         return None 
  
-def enrich_card_with_yagpt(card: Dict) -> None: 
-    t = (card.get("text") or "").strip() 
-    if not t: 
-        return 
-    res = call_yandex_gpt_json(t) 
-    if not res: 
-        return 
-    prob = res.get("probability") 
+def enrich_card_with_yagpt(card: Dict) -> None:
+    t = (card.get("text") or "").strip()
+    if not t:
+        return
+    res = call_yandex_gpt_json(t)
+    if not res:
+        card.setdefault("ai", {})
+        card["ai"]["error"] = "Ошибка при анализе текста"
+        return
+    prob = res.get("probability")
     comment = (res.get("comment") or "").strip() 
  
     prob_f = None 
@@ -907,20 +909,23 @@ def build_card_text(card: Dict) -> str:
     links_str = "\n".join(links) if links else "нет ссылок" 
  
     ai = card.get("ai") or {} 
-    prob = ai.get("probability") 
-    raw = ai.get("probability_raw") 
-    bias = ai.get("bias") 
-    comment = ai.get("comment") 
- 
-    ai_lines = [] 
-    if prob is not None: 
-        if raw is not None and bias is not None: 
-            ai_lines.append(f"🤖 Вероятность самостроя (ИИ): {prob:.1f}% (raw {raw:.1f}%, bias {bias:+.1f})") 
-        else: 
-            ai_lines.append(f"🤖 Вероятность самостроя (ИИ): {float(prob):.1f}%") 
-    if comment: 
-        ai_lines.append(f"💬 Комментарий ИИ: {comment}") 
- 
+    prob = ai.get("probability")
+    raw = ai.get("probability_raw")
+    bias = ai.get("bias")
+    comment = ai.get("comment")
+    error = ai.get("error")
+
+    ai_lines = []
+    if error:
+        ai_lines.append(f"🤖 {error}")
+    elif prob is not None:
+        if raw is not None and bias is not None:
+            ai_lines.append(f"🤖 Вероятность самостроя (ИИ): {prob:.1f}% (raw {raw:.1f}%, bias {bias:+.1f})")
+        else:
+            ai_lines.append(f"🤖 Вероятность самостроя (ИИ): {float(prob):.1f}%")
+    if comment:
+        ai_lines.append(f"💬 Комментарий ИИ: {comment}")
+
     base = (
         "🔎 Обнаружено подозрительное сообщение\n"
         f"Источник: @{card.get('channel','—')}\n"
