@@ -21,20 +21,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-
-# ===== DIAGNOSTICS START =====
-RUN echo "===== REQUIREMENTS.TXT USED BY RAILWAY ====="
-RUN pwd
-RUN ls -la
-RUN cat requirements.txt
-RUN echo "============================================"
-# ===== DIAGNOSTICS END =====
-
 RUN pip install --no-cache-dir -r requirements.txt
+
 RUN python -m playwright install chromium
 
 COPY samastroi_scraper.py .
 COPY onzs_catalog.xlsx /app/onzs_catalog.xlsx
-COPY data ./data
 
 CMD ["python", "samastroi_scraper.py"]
