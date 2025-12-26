@@ -784,26 +784,49 @@ def select_few_shot_examples(text: str, k: int = 3) -> List[Dict]:
     return [e for _, e in scored[:k]] 
  
 def call_yandex_gpt_json(text: str) -> Tuple[Optional[Dict], Optional[str]]:
+    """
+    Calls YandexGPT and expects STRICT JSON in the assistant text.
+
+    Legacy-compatible contract (Variant A):
+      {
+        "probability": 0-100,
+        "comment": "краткое обоснование",
+        "onzs_category_name": "..."   // опционально
+      }
+    """
     if not YAGPT_API_KEY or not YAGPT_FOLDER_ID:
         return None, "YandexGPT API Key or Folder ID is not configured."
 
     model_uri = YAGPT_MODEL.format(folder_id=YAGPT_FOLDER_ID)
 
-    # Simplified prompt for the new workflow
-    geo_info = extract_geo_info(text) # Assuming this function exists and is contextually available
-    enriched_text = text
-    if geo_info:
-        enriched_text += f"\n\nДополнительная информация: {json.dumps(geo_info, ensure_ascii=False)}"
+    # geo enrichment for better grounding (best-effort)
+    geo_info: Dict = {}
+    try:
+        geo_info = enrich_geo_info(extract_geo_info(text or ""))
+    except Exception as e:
+        log.warning(f"geo enrichment failed: {e}")
 
-    prompt = (
-        "Определи категорию ОНзС для следующего сообщения. "
-        "Верни строго JSON с ключом 'onzs_category_name'.\n\n"
-        "Текст сообщения:\n" + enriched_text
-    )
+    prompt_lines = [
+        "Ты помощник по выявлению самостроя и определению категории ОНзС (муниципалитет МО).",
+        "На основе текста сообщения и доп.данных оцени:",
+        "1) вероятность релевантности самострою (0-100)",
+        "2) категорию ОНзС (если можно определить)",
+        "3) короткое обоснование.",
+        "",
+        "Верни СТРОГО JSON без пояснений вне JSON. Ключи:",
+        "probability (число 0-100), comment (строка), onzs_category_name (строка или пусто).",
+        "",
+        "Текст сообщения:",
+        (text or ""),
+        "",
+        "Дополнительные данные (если есть):",
+        json.dumps(geo_info, ensure_ascii=False),
+    ]
+    prompt = "\n".join(prompt_lines)
 
     body = {
         "modelUri": model_uri,
-        "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": 220},
+        "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": 260},
         "messages": [{"role": "user", "text": prompt}],
     }
     headers = {
@@ -821,7 +844,7 @@ def call_yandex_gpt_json(text: str) -> Tuple[Optional[Dict], Optional[str]]:
         log.error(f"YandexGPT request error: {e}")
         return None, f"API Request Failed: {e}"
     except json.JSONDecodeError:
-        log.error(f"YandexGPT JSON decode error. Response: {resp.text}")
+        log.error(f"YandexGPT JSON decode error. Response: {getattr(resp,'text','')}")
         return None, "Failed to decode API response."
 
     try:
@@ -830,44 +853,61 @@ def call_yandex_gpt_json(text: str) -> Tuple[Optional[Dict], Optional[str]]:
         log.error(f"YandexGPT response parse error: {e}; data={data}")
         return None, "Unexpected API response format."
 
-    out = text_out.strip()
+    out = (text_out or "").strip()
+
+    # attempt to extract JSON object from surrounding text
     if not out.startswith("{"):
         s = out.find("{")
         e = out.rfind("}")
         if s != -1 and e != -1 and e > s:
-            out = out[s:e+1]
+            out = out[s:e + 1]
+
     try:
-        return json.loads(out), None
+        obj = json.loads(out)
     except json.JSONDecodeError as e:
         log.error(f"YandexGPT JSON parse error: {e}; text={text_out[:300]}")
         return None, "Failed to parse JSON from AI response."
+
+    # basic validation/sanitization
+    try:
+        p = float(obj.get("probability", 0))
+        p = max(0.0, min(100.0, p))
+        obj["probability"] = p
+    except Exception:
+        obj["probability"] = 0.0
+
+    cmt = obj.get("comment")
+    obj["comment"] = "" if cmt is None else str(cmt)[:1500]
+
+    cat = obj.get("onzs_category_name")
+    obj["onzs_category_name"] = "" if cat is None else str(cat)[:120]
+
+    return obj, None
+
 
 def enrich_card_with_yagpt(card: Dict) -> None:
     t = (card.get("text") or "").strip()
     if not t:
         return
-    
-    # Pass the full card text to the AI
+
     res, err = call_yandex_gpt_json(card.get("text", ""))
-    
+
+    card.setdefault("ai", {})
     if err:
-        card.setdefault("ai", {})
         card["ai"]["error"] = err
         return
-
     if not res:
-        card.setdefault("ai", {})
         card["ai"]["error"] = "AI returned no result."
         return
 
-    # In the new workflow, AI provides the category name directly
+    card["ai"]["probability"] = float(res.get("probability", 0.0) or 0.0)
+    if res.get("comment"):
+        card["ai"]["comment"] = str(res.get("comment"))
+
     if res.get("onzs_category_name"):
         card["onzs_category_name"] = res["onzs_category_name"]
-    
-    # The legacy probability and comment logic has been removed as the new
-    # workflow relies on the AI to provide the category name directly.
- 
- 
+
+
 def generate_card_id() -> str: 
     return str(uuid.uuid4())[:12] 
  
@@ -919,6 +959,7 @@ def build_card_text(card: Dict) -> str:
         f"Источник: @{card.get('channel','—')}\n"
         f"Дата: {dt}\n"
         f"ID поста: {card.get('post_id','—')}\n"
+        "🗣 Для обработки: нажмите кнопку ниже или ответьте реплаем на сообщение.\n"
     )
     if card.get("onzs_category_name"):
         base += f"🗂 Категория ОНзС: {card['onzs_category_name']}\n"
@@ -1554,6 +1595,27 @@ def handle_callback_query(upd: Dict):
             (card_id, card.get("onzs_category"), status, now_ts(), from_user)
         )
         conn.close()
+
+        # Finalize "work" training only after selecting the concrete status (Variant A option 3)
+        try:
+            old_status = card.get("status", "new")
+            card["status"] = "work"
+            card.setdefault("history", []).append({"event": "final_status_selected", "status": status, "from_user": int(from_user), "ts": now_ts()})
+            save_card(card)
+
+            append_history({
+                "event": "final_status_selected",
+                "card_id": card_id,
+                "from_user": int(from_user),
+                "old_status": old_status,
+                "new_status": "work",
+                "status_code": status,
+            })
+
+            log_training_event(card_id, "work", card.get("text", ""), card.get("channel", ""), admin_id=int(from_user))
+        except Exception as e:
+            log.error(f"finalize work status failed: {e}")
+
         edit_reply_markup(chat_id, message_id, reply_markup=build_comment_keyboard(card_id))
         answer_callback(cb_id, f"Статус '{status}' установлен.", show_alert=False)
         return
