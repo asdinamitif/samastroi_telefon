@@ -5,13 +5,11 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# --- System deps for Playwright/Chromium ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     ca-certificates \
     gnupg \
-    # Playwright/Chromium runtime deps (минимально достаточный набор для slim)
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
@@ -43,8 +41,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers (Chromium)
-# Важно: playwright должен быть в requirements.txt
+# Гарантируем, что playwright установлен (даже если забыли в requirements.txt)
+RUN pip install --no-cache-dir playwright==1.47.0
+
+# Install Playwright browsers
 RUN python -m playwright install chromium
 
 COPY samastroi_scraper.py .
