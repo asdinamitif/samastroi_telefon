@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
@@ -6,12 +6,13 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PLAYWRIGHT_BROWSERS_PATH=0
 
+# Minimal deps for Chromium runtime on Debian bookworm slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
+    ca-certificates \
     curl \
     wget \
-    ca-certificates \
     gnupg \
+    # Chromium deps
     libnss3 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
@@ -33,13 +34,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     libdrm2 \
     libexpat1 \
+    # fonts (important for rendering / non-empty text sometimes)
     fonts-liberation \
+    fonts-unifont \
+    fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN python -m playwright install --with-deps chromium
+# IMPORTANT: no --with-deps (we already installed deps above)
+RUN python -m playwright install chromium
 
 COPY samastroi_scraper.py /app/samastroi_scraper.py
 COPY onzs_catalog.xlsx /app/onzs_catalog.xlsx
