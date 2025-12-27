@@ -5,14 +5,12 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# System deps for Playwright Chromium on Debian slim (Railway-friendly)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     wget \
     ca-certificates \
     gnupg \
-    # Chromium runtime deps
     libnss3 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
@@ -37,16 +35,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps first (better caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Playwright browsers (Chromium). This is the key step.
-# If playwright is not in requirements.txt, add: playwright==1.49.0
 RUN python -m playwright install --with-deps chromium
 
-# App files
-COPY samastroi_scraper_rgis.py /app/samastroi_scraper.py
+COPY samastroi_scraper.py /app/samastroi_scraper.py
 COPY onzs_catalog.xlsx /app/onzs_catalog.xlsx
 
 CMD ["python", "samastroi_scraper.py"]
