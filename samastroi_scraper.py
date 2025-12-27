@@ -322,6 +322,14 @@ def init_db():
         ); 
     """) 
  
+    
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rgis_cache (
+            cadastral TEXT PRIMARY KEY,
+            result_json TEXT NOT NULL,
+            fetched_ts INTEGER NOT NULL
+        );
+    """)
     # seed roles if empty 
     cnt = int(conn.execute("SELECT COUNT(*) FROM user_roles;").fetchone()[0] or 0) 
     if cnt == 0: 
@@ -462,6 +470,202 @@ def append_jsonl(path: str, obj: Dict):
     with open(path, "a", encoding="utf-8") as f: 
         f.write(json.dumps(obj, ensure_ascii=False) + "\n") 
  
+
+def rgis_cache_get(cadastral: str, ttl_hours: int = None) -> Optional[Dict]:
+    cadastral = (cadastral or "").strip()
+    if not cadastral:
+        return None
+    if ttl_hours is None:
+        ttl_hours = RGIS_CACHE_TTL_HOURS
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT result_json, fetched_ts FROM rgis_cache WHERE cadastral=?;",
+            (cadastral,)
+        ).fetchone()
+        if not row:
+            return None
+        result_json, fetched_ts = row
+        if now_ts() - int(fetched_ts) > int(ttl_hours) * 3600:
+            return None
+        obj = json.loads(result_json)
+        if isinstance(obj, dict):
+            obj["cache"] = True
+        return obj
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+def rgis_cache_put(cadastral: str, result: Dict) -> None:
+    cadastral = (cadastral or "").strip()
+    if not cadastral:
+        return
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO rgis_cache(cadastral, result_json, fetched_ts) VALUES (?,?,?);",
+            (cadastral, json.dumps(result, ensure_ascii=False), now_ts())
+        )
+    finally:
+        conn.close()
+
+def rgis_lookup_playwright(cadastral: str, timeout_ms: int = 25000) -> Dict:
+    """
+    Реальный парсинг RGIS (planning) через Playwright (Chromium):
+      - открывает https://rgis.mosreg.ru/v3/#/?tab=planning
+      - вводит кадастровый номер и запускает поиск
+      - пытается считать текст боковой панели/карточки результата
+    """
+    cadastral = (cadastral or "").strip()
+    if not cadastral:
+        return {"ok": False, "error": "empty cadastral"}
+
+    cached = rgis_cache_get(cadastral)
+    if cached:
+        return cached
+
+    url = "https://rgis.mosreg.ru/v3/#/?tab=planning"
+    result: Dict = {
+        "ok": False,
+        "cadastral": cadastral,
+        "url": url,
+        "cache": False,
+        "fetched_ts": now_ts(),
+    }
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        result["error"] = f"Playwright is not installed/available: {e}"
+        rgis_cache_put(cadastral, result)
+        return result
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        context = browser.new_context(viewport={"width": 1400, "height": 900})
+        page = context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+
+            for sel in [
+                "button:has-text('Принять')",
+                "button:has-text('Согласен')",
+                "button:has-text('OK')",
+                "button:has-text('Понятно')",
+            ]:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=800):
+                        loc.click(timeout=800)
+                        break
+                except Exception:
+                    pass
+
+            search_locators = [
+                "input[placeholder*='Поиск' i]",
+                "input[placeholder*='кадастр' i]",
+                "input[placeholder*='кадастров' i]",
+                "input[type='search']",
+                "input",
+            ]
+            search_input = None
+            for sel in search_locators:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=1500):
+                        loc.click(timeout=800)
+                        search_input = loc
+                        break
+                except Exception:
+                    continue
+
+            if not search_input:
+                result["error"] = "search input not found"
+                rgis_cache_put(cadastral, result)
+                return result
+
+            try:
+                search_input.fill("")
+                search_input.type(cadastral, delay=20)
+            except Exception:
+                try:
+                    search_input.fill(cadastral)
+                except Exception as e:
+                    result["error"] = f"cannot type cadastral: {e}"
+                    rgis_cache_put(cadastral, result)
+                    return result
+
+            clicked = False
+            for sel in [
+                "button:has-text('Найти')",
+                "button:has-text('Поиск')",
+                "button[aria-label*='Поиск' i]",
+                "button[title*='Поиск' i]",
+            ]:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=1200):
+                        loc.click(timeout=1200)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                try:
+                    page.keyboard.press("Enter")
+                except Exception:
+                    pass
+
+            page.wait_for_timeout(1200)
+            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+
+            panel_text = ""
+            used_sel = None
+            for sel in [
+                "[class*='sidebar' i]",
+                "[class*='drawer' i]",
+                "[class*='panel' i]",
+                "main",
+                "body",
+            ]:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=1500):
+                        txt = (loc.inner_text(timeout=2000) or "").strip()
+                        if len(txt) > 120:
+                            panel_text = txt
+                            used_sel = sel
+                            break
+                except Exception:
+                    continue
+
+            if panel_text:
+                result["ok"] = True
+                result["panel_selector"] = used_sel
+                result["panel_text"] = panel_text[:12000]
+            else:
+                result["error"] = "no meaningful panel text after search"
+
+            rgis_cache_put(cadastral, result)
+            return result
+        except Exception as e:
+            result["error"] = f"rgis_lookup_playwright exception: {e}"
+            rgis_cache_put(cadastral, result)
+            return result
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 def add_onzs_trace(card: Dict, step: str, data: Dict) -> None:
     """Append ONZS trace step into card['onzs_trace'] preserving order."""
@@ -931,8 +1135,37 @@ def enrich_card_with_yagpt(card: Dict) -> None:
     if not t:
         return
 
-    res, err = call_yandex_gpt_json(card.get("text", ""))
+    geo_info = card.get("geo_info") or {}
 
+
+    rgis_text = ((card.get("rgis") or {}).get("panel_text") or (geo_info.get("rgis_text") if isinstance(geo_info, dict) else "") or "")
+
+
+    enriched_text = card.get("text", "")
+
+
+    if geo_info:
+
+
+        try:
+
+
+            enriched_text += "\n\n[ГЕО]\n" + json.dumps(geo_info, ensure_ascii=False)
+
+
+        except Exception:
+
+
+            pass
+
+
+    if rgis_text:
+
+
+        enriched_text += "\n\n[RGIS]\n" + rgis_text[:6000]
+
+
+    res, err = call_yandex_gpt_json(enriched_text)
     card.setdefault("ai", {})
     if err:
         card["ai"]["error"] = err
@@ -1362,6 +1595,8 @@ def extract_geo_info(text: str) -> Dict:
     return info
 
 YANDEX_GEOCODER_API_KEY = os.getenv("YANDEX_GEOCODER_API_KEY", "34ec9307-a9b2-4708-9296-4b2d6d6e721b")
+ENABLE_RGIS_LOOKUP = str(os.getenv("ENABLE_RGIS_LOOKUP", "1")).strip().lower() in ("1","true","yes","on")
+RGIS_CACHE_TTL_HOURS = int(os.getenv("RGIS_CACHE_TTL_HOURS", "24"))
 
 def enrich_geo_info(geo_info: Dict) -> Dict:
     """Enriches geo information using Yandex Geocoder API."""
@@ -1566,6 +1801,17 @@ def generate_card(hit: Dict) -> Dict:
     # Extract and enrich geo info
     geo_info = extract_geo_info(card["text"])
     card["geo_info"] = enrich_geo_info(geo_info)
+    # --- RGIS (Playwright): lookup planning info by cadastral number ---
+    if ENABLE_RGIS_LOOKUP:
+        cadastral = (card.get("geo_info") or {}).get("cadastral_number")
+        if cadastral:
+            try:
+                rgis_res = rgis_lookup_playwright(cadastral)
+                card["rgis"] = rgis_res
+                if isinstance(rgis_res, dict) and rgis_res.get("ok") and rgis_res.get("panel_text"):
+                    card["geo_info"]["rgis_text"] = (rgis_res.get("panel_text") or "")[:6000]
+            except Exception as e:
+                card["rgis"] = {"ok": False, "error": str(e), "cadastral": cadastral}
     # RGIS stage (trace): if you later enrich geo_info from RGIS, log it here
     add_onzs_trace(card, "RGIS", {
         "cadastral_number": (card.get("geo_info") or {}).get("cadastral_number"),
