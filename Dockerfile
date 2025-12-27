@@ -39,10 +39,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Установка Chromium для Playwright
 RUN python -m playwright install --with-deps chromium
 
-# ✅ КОПИРУЕМ РЕАЛЬНО СУЩЕСТВУЮЩИЙ ФАЙЛ
 COPY samastroi_scraper.py /app/samastroi_scraper.py
 COPY onzs_catalog.xlsx /app/onzs_catalog.xlsx
 
