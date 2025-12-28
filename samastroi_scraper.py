@@ -564,6 +564,24 @@ def parse_tg_datetime(dt_str: str) -> int:
         return now_ts() 
  
  
+def _get_int_param(key: str, default: int = 0) -> int:
+    obj = _get_model_param(key, {"value": default})
+    try:
+        return int(obj.get("value", default))
+    except Exception:
+        return default
+
+def _set_int_param(key: str, value: int) -> None:
+    _set_model_param(key, {"value": int(value)})
+
+def should_send_409_alert(cooldown_sec: int = 12 * 3600) -> bool:
+    """DB-backed cooldown to avoid spamming admins on repeated 409."""
+    last_ts = _get_int_param("last_409_alert_ts", 0)
+    now = now_ts()
+    if last_ts and (now - last_ts) < int(cooldown_sec):
+        return False
+    _set_int_param("last_409_alert_ts", now)
+    return True
 def _get_model_param(key: str, default_obj: Dict) -> Dict: 
     conn = db() 
     row = conn.execute("SELECT value_json FROM model_params WHERE key=?;", (key,)).fetchone() 
@@ -2318,44 +2336,30 @@ def poll_updates_loop():
                 time.sleep(2); continue 
  
             if not data.get("ok"):
-                if data.get("error_code") == 409:
-                    log.error("getUpdates conflict (409). Another instance is running or webhook is enabled.")
-                    # Shared, cross-replica cooldown via DB (prevents spam if Railway accidentally runs >1 replica).
-                    try:
-                        mp = _get_model_param("last_conflict", {"ts": 0})
-                        last_ts = int(mp.get("ts") or 0)
-                    except Exception:
-                        last_ts = 0
-
-                    # cooldown: 12 hours
-                    if now_ts() - last_ts > 12 * 3600:
-                        alert_msg = (
-                            "🚨 ВНИМАНИЕ: ОБНАРУЖЕН КОНФЛИКТ ЭКЗЕМПЛЯРОВ БОТА (ОШИБКА 409)\n\n"
-                            "Другой процесс/сервер уже использует этот BOT_TOKEN, из-за чего кнопки и команды не работают.\n\n"
-                            "Причины (типовые):\n"
-                            "• запущено 2+ деплоя/реплики Railway с одним BOT_TOKEN;\n"
-                            "• параллельно работает другой бот/скрипт (локально/на другом сервере) с тем же BOT_TOKEN;\n"
-                            "• включён webhook у этого токена.\n\n"
-                            "Что сделать: оставить только ОДИН активный экземпляр и выполнить deleteWebhook.\n"
-                            "Railway: Settings → Replicas = 1, и убедиться, что нет второго проекта с тем же BOT_TOKEN.\n"
-                        )
-                        recipients = list(set(list_users_by_role("admin") + list_users_by_role("leadership")))
-                        for uid in recipients:
-                            try:
-                                send_message(uid, alert_msg)
-                            except Exception:
-                                pass
-                        try:
-                            _set_model_param("last_conflict", {"ts": now_ts(), "note": "409 conflict"})
-                        except Exception:
-                            pass
-
-                    # Stop poller to avoid endless 409 spam; scraper continues to run.
-                    log.error("Stopping updates poller due to 409 conflict. Scraper continues in background.")
-                    return
-
-                log.error(f"getUpdates error: {data}")
-                time.sleep(3); continue
+                
+if data.get("error_code") == 409:
+    log.error("getUpdates conflict (409). Another instance is running.")
+    # Notify admins/leadership at most once per 12 hours (DB cooldown)
+    if should_send_409_alert(cooldown_sec=12 * 3600):
+        alert_msg = (
+            "🚨 ВНИМАНИЕ: ОБНАРУЖЕН КОНФЛИКТ ЭКЗЕМПЛЯРОВ БОТА (ОШИБКА 409)\n\n"
+            "Другой процесс/сервер уже использует этот BOT_TOKEN, из-за чего кнопки и команды не работают.\n\n"
+            "Причины (типовые):\n"
+            "• запущено 2+ деплоя/реплики Railway с одним BOT_TOKEN;\n"
+            "• параллельно работает другой бот/скрипт (локально/на другом сервере) с тем же BOT_TOKEN;\n"
+            "• включён webhook у этого токена.\n\n"
+            "Что сделать: оставить только ОДИН активный экземпляр и выполнить deleteWebhook.\n"
+            "Railway: Settings → Replicas = 1, и убедиться, что нет второго проекта с тем же BOT_TOKEN."
+        )
+        recipients = list(set(list_users_by_role("admin") + list_users_by_role("leadership")))
+        for uid in recipients:
+            try:
+                send_message(uid, alert_msg)
+            except Exception:
+                pass
+    # Hard stop this instance so only one poller survives.
+    time.sleep(2)
+    os._exit(0)
  
             updates = data.get("result", []) or [] 
             if updates: log.info(f"[POLL] received updates={len(updates)} next_offset={UPDATE_OFFSET}") 
