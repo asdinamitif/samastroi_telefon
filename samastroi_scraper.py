@@ -132,6 +132,14 @@ DEFAULT_CHANNELS = [
 GROUPS_FILE = os.getenv("GROUPS_FILE", "").strip() 
 KEYWORDS_FILE = os.getenv("KEYWORDS_FILE", "").strip() 
  
+
+# --- Channel blacklist (forced exclusion) ---
+BLACKLIST_CHANNELS = {
+    "@gsnmo_bou",
+    "t.me/gsnmo_bou",
+    "gsnmo_bou",
+}
+
 def _read_lines_file(path: str) -> List[str]: 
     try: 
         with open(path, "r", encoding="utf-8") as f: 
@@ -247,6 +255,26 @@ def load_keywords_list() -> List[str]:
     ] 
  
 CHANNEL_LIST = load_channel_list() 
+
+def normalize_channel(ch: str) -> str:
+    ch = (ch or "").strip()
+    if not ch:
+        return ch
+    if ch.startswith("https://t.me/"):
+        ch = "@" + ch.split("https://t.me/", 1)[1]
+    if ch.startswith("t.me/"):
+        ch = "@" + ch.split("t.me/", 1)[1]
+    if not ch.startswith("@"):
+        ch = "@" + ch
+    return ch.lower()
+
+# Apply blacklist (defensive: works even if ENV is misconfigured)
+_before = len(CHANNEL_LIST)
+_bl = {normalize_channel(b) for b in BLACKLIST_CHANNELS}
+CHANNEL_LIST = [ch for ch in CHANNEL_LIST if normalize_channel(ch) not in _bl]
+_after = len(CHANNEL_LIST)
+log.info(f"[CFG] Blacklist applied. Channels before={_before}, after={_after}")
+
 KEYWORDS = load_keywords_list() 
  
 # Extra high-signal patterns (work even without keywords)
@@ -1535,6 +1563,10 @@ def extract_posts(html: str) -> List[Dict]:
     return posts 
  
 def process_channel(channel_username: str) -> List[Dict]: 
+    # Forced blacklist (e.g., to exclude official channels)
+    if normalize_channel(channel_username) in {normalize_channel(b) for b in BLACKLIST_CHANNELS}:
+        log.info(f"[SKIP] Channel blacklisted: {channel_username}")
+        return []
     url = f"https://t.me/s/{channel_username}" 
     html = fetch_channel_page(url) 
     if not html: 
