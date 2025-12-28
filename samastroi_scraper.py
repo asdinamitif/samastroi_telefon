@@ -59,14 +59,9 @@ TRAINING_DATASET = os.path.join(DATA_DIR, "training_dataset.jsonl")
 HISTORY_CARDS = os.path.join(DATA_DIR, "history_cards.jsonl") 
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json") 
 DB_PATH = os.path.join(DATA_DIR, "scraper.db") 
-LOCK_PATH = os.path.join(DATA_DIR, ".poller.lock")
-
-# Instance identity (for distributed locking / debugging)
-INSTANCE_ID = os.getenv("INSTANCE_ID", "") or "73b0b99c"
-BOT_LOCK_KEY = "poller"
-BOT_LOCK_TTL = int(os.getenv("BOT_LOCK_TTL", "180"))  # seconds
-BOT_LOCK_RENEW_EVERY = max(10, int(BOT_LOCK_TTL * 0.5))
-
+LOCK_PATH = os.path.join(DATA_DIR, ".poller.lock") 
+ 
+ 
 def _seed_config_files() -> None: 
     """Seed /data/groups.txt and /data/keywords.txt from repo files if present. 
  
@@ -366,16 +361,7 @@ def init_db():
             key TEXT PRIMARY KEY, 
             value_json TEXT NOT NULL 
         ); 
-    """)
-
-    conn.execute(""" 
-        CREATE TABLE IF NOT EXISTS bot_lock ( 
-            key TEXT PRIMARY KEY, 
-            holder TEXT NOT NULL, 
-            expires_ts INTEGER NOT NULL 
-        ); 
     """) 
- 
  
     # seed roles if empty 
     cnt = int(conn.execute("SELECT COUNT(*) FROM user_roles;").fetchone()[0] or 0) 
@@ -489,110 +475,28 @@ def remove_admin(user_id: int): remove_role(int(user_id))
 def remove_moderator(user_id: int): remove_role(int(user_id)) 
 def remove_leadership(user_id: int): remove_role(int(user_id)) 
  
-
-def acquire_lock_or_exit() -> None:
-    """
-    Hard single-instance guard for Railway.
-
-    Why 409 can still happen:
-    - more than one replica/container is running with the same BOT_TOKEN
-    - another service (or local run) is polling getUpdates
-    - a webhook is still configured
-
-    This implementation uses BOTH:
-    1) a DB-based lease lock (survives restarts, supports stale takeover)
-    2) a volume file lock as a secondary safety net
-
-    If lock cannot be acquired, the process exits immediately.
-    """
-    # --- DB lease lock ---
-    conn = db()
-    try:
-        now = now_ts()
-        expires = now + BOT_LOCK_TTL
-        conn.execute("BEGIN IMMEDIATE;")
-        row = conn.execute("SELECT holder, expires_ts FROM bot_lock WHERE key=?;", (BOT_LOCK_KEY,)).fetchone()
-        if row:
-            holder, exp = row[0], int(row[1] or 0)
-            if exp > now and holder != INSTANCE_ID:
-                conn.execute("COMMIT;")
-                log.error(f"[LOCK] Another instance holds DB lock: holder={holder} expires_in={exp-now}s. Exiting.")
-                raise SystemExit(0)
-            # stale or same holder -> takeover/renew
-            conn.execute("UPDATE bot_lock SET holder=?, expires_ts=? WHERE key=?;", (INSTANCE_ID, expires, BOT_LOCK_KEY))
-        else:
-            conn.execute("INSERT INTO bot_lock(key, holder, expires_ts) VALUES(?,?,?);", (BOT_LOCK_KEY, INSTANCE_ID, expires))
-        conn.execute("COMMIT;")
-    except SystemExit:
-        raise
-    except Exception as e:
-        try:
-            conn.execute("ROLLBACK;")
-        except Exception:
-            pass
-        log.exception(f"[LOCK] DB lock error: {e}")
-        raise
-    finally:
-        conn.close()
-
-    # --- Volume file lock (secondary) ---
-    try:
-        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(f"{INSTANCE_ID}\n{now_ts()}\n")
-        log.info(f"[LOCK] Lock acquired (DB+FILE). instance={INSTANCE_ID} path={LOCK_PATH}")
-    except FileExistsError:
-        log.error("[LOCK] Another instance holds FILE lock. Exiting.")
-        raise SystemExit(0)
-
-    # --- Keep-alive thread to renew DB lease ---
-    def _renew():
-        while True:
-            try:
-                c = db()
-                try:
-                    now = now_ts()
-                    c.execute("BEGIN IMMEDIATE;")
-                    row = c.execute("SELECT holder FROM bot_lock WHERE key=?;", (BOT_LOCK_KEY,)).fetchone()
-                    holder = row[0] if row else None
-                    if holder != INSTANCE_ID:
-                        c.execute("COMMIT;")
-                        log.error(f"[LOCK] Lost DB lock to holder={holder}. Exiting to avoid 409.")
-                        os._exit(0)
-                    c.execute("UPDATE bot_lock SET expires_ts=? WHERE key=? AND holder=?;", (now + BOT_LOCK_TTL, BOT_LOCK_KEY, INSTANCE_ID))
-                    c.execute("COMMIT;")
-                finally:
-                    c.close()
-            except Exception as e:
-                log.warning(f"[LOCK] renew failed: {e}")
-            time.sleep(BOT_LOCK_RENEW_EVERY)
-
-    threading.Thread(target=_renew, daemon=True).start()
-
-
-def release_lock():
-    # Release file lock
-    try:
-        if os.path.exists(LOCK_PATH):
-            os.remove(LOCK_PATH)
-            log.info("[LOCK] File lock released.")
-    except Exception:
-        pass
-    # Release DB lock (best-effort)
-    try:
-        conn = db()
-        try:
-            conn.execute("DELETE FROM bot_lock WHERE key=? AND holder=?;", (BOT_LOCK_KEY, INSTANCE_ID))
-        finally:
-            conn.close()
-    except Exception:
-        pass
-
-def now_ts() -> int: 
-    return int(time.time()) 
+def acquire_lock_or_exit() -> None: 
+    """ 
+    Prevent multiple instances from running getUpdates poller on Railway volume. 
+    """ 
+    try: 
+        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY) 
+        with os.fdopen(fd, "w", encoding="utf-8") as f: 
+            f.write(str(os.getpid())) 
+        log.info(f"Lock acquired: {LOCK_PATH}") 
+    except FileExistsError: 
+        log.error("Another instance holds poller lock. Exiting (prevents 409 getUpdates conflict).") 
+        raise SystemExit(0) 
  
-
-() -> int: 
+def release_lock(): 
+    try: 
+        if os.path.exists(LOCK_PATH): 
+            os.remove(LOCK_PATH) 
+            log.info("Lock released.") 
+    except Exception: 
+        pass 
+ 
+def now_ts() -> int: 
     return int(time.time()) 
  
 def append_jsonl(path: str, obj: Dict): 
@@ -2426,24 +2330,14 @@ def poll_updates_loop():
                     # cooldown: 12 hours
                     if now_ts() - last_ts > 12 * 3600:
                         alert_msg = (
-                            "🚨 ВНИМАНИЕ: ОБНАРУЖЕН КОНФЛИКТ ЭКЗЕМПЛЯРОВ БОТА (ОШИБКА 409)
-
-"
-                            "Другой процесс/сервер уже использует этот BOT_TOKEN, из-за чего кнопки и команды не работают.
-
-"
-                            "Причины (типовые):
-"
-                            "• запущено 2+ деплоя/реплики Railway с одним BOT_TOKEN;
-"
-                            "• параллельно работает другой бот/скрипт (локально/на другом сервере) с тем же BOT_TOKEN;
-"
-                            "• включён webhook у этого токена.
-
-"
-                            "Что сделать: оставить только ОДИН активный экземпляр и выполнить deleteWebhook.
-"
-                            "Railway: Settings → Replicas = 1, и убедиться что нет второго проекта с тем же BOT_TOKEN."
+                            "🚨 ВНИМАНИЕ: ОБНАРУЖЕН КОНФЛИКТ ЭКЗЕМПЛЯРОВ БОТА (ОШИБКА 409)\n\n"
+                            "Другой процесс/сервер уже использует этот BOT_TOKEN, из-за чего кнопки и команды не работают.\n\n"
+                            "Причины (типовые):\n"
+                            "• запущено 2+ деплоя/реплики Railway с одним BOT_TOKEN;\n"
+                            "• параллельно работает другой бот/скрипт (локально/на другом сервере) с тем же BOT_TOKEN;\n"
+                            "• включён webhook у этого токена.\n\n"
+                            "Что сделать: оставить только ОДИН активный экземпляр и выполнить deleteWebhook.\n"
+                            "Railway: Settings → Replicas = 1, и убедиться, что нет второго проекта с тем же BOT_TOKEN.\n"
                         )
                         recipients = list(set(list_users_by_role("admin") + list_users_by_role("leadership")))
                         for uid in recipients:
