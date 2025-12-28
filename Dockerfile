@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Код и данные
 COPY samastroi_scraper.py /app/samastroi_scraper.py
+COPY samastroi_extensions.py /app/samastroi_extensions.py
 COPY onzs_catalog.xlsx /app/onzs_catalog.xlsx
 COPY data /app/data
 
