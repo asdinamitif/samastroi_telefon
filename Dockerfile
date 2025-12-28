@@ -44,7 +44,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -m playwright install chromium
 
 # Код
-COPY samastroi_scraper_no_attach.py /app/samastroi_scraper.py
+COPY samastroi_scraper.py /app/samastroi_scraper.py
 COPY onzs_catalog.xlsx /app/onzs_catalog.xlsx
 
 CMD ["python", "samastroi_scraper.py"]
