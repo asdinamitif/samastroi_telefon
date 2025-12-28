@@ -1,7 +1,21 @@
-playwright==1.49.0
+# --- HTTP / парсинг ---
 requests>=2.31.0
 beautifulsoup4>=4.12.0
-lxml
-matplotlib
-openpyxl
-reportlab
+lxml>=5.0.0
+
+# --- Гео и математика ---
+geopy>=2.4.0
+
+# --- Excel / отчёты ---
+openpyxl>=3.1.2
+pandas>=2.1.0
+
+# --- PDF / графики ---
+reportlab>=4.0.0
+matplotlib>=3.8.0
+
+# --- Word (служебные записки) ---
+python-docx>=1.1.0
+
+# --- Утилиты ---
+python-dateutil>=2.9.0
