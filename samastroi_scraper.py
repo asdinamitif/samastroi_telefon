@@ -2338,6 +2338,7 @@ def poll_updates_loop():
             if not data.get("ok"):
                 
 if data.get("error_code") == 409:
+            pass  # safety no-op to satisfy indentation
     log.error("getUpdates conflict (409). Another instance is running.")
     # Notify admins/leadership at most once per 12 hours (DB cooldown)
     if should_send_409_alert(cooldown_sec=12 * 3600):
