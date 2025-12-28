@@ -1,15 +1,16 @@
 FROM python:3.11-slim-bookworm
 
-WORKDIR /app
-
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PLAYWRIGHT_BROWSERS_PATH=0
 
+WORKDIR /app
+
+# Системные зависимости для Playwright (Chromium)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
     curl \
     wget \
+    ca-certificates \
     gnupg \
     libnss3 \
     libatk1.0-0 \
@@ -33,16 +34,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libdrm2 \
     libexpat1 \
     fonts-liberation \
-    fonts-unifont \
-    fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
+# Python зависимости
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Установка Chromium для Playwright
 RUN python -m playwright install chromium
 
-COPY samastroi_scraper.py /app/samastroi_scraper.py
+# Код
+COPY samastroi_scraper_no_attach.py /app/samastroi_scraper.py
 COPY onzs_catalog.xlsx /app/onzs_catalog.xlsx
 
 CMD ["python", "samastroi_scraper.py"]
