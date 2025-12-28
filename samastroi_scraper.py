@@ -1153,6 +1153,35 @@ def enrich_card_with_yagpt(card: Dict) -> None:
     if not t:
         return
 
+    # Pass enriched text to the AI
+    res, err = call_yandex_gpt_json(card.get("text", ""))
+
+    card.setdefault("ai", {})
+    if err:
+        card["ai"]["error"] = err
+        return
+    if not res or not isinstance(res, dict):
+        card["ai"]["error"] = "AI returned no result."
+        return
+
+    # Normalize fields
+    if "onzs_category_name" in res and res.get("onzs_category_name"):
+        card["onzs_category_name"] = str(res["onzs_category_name"]).strip()
+
+    # Probability and comment are kept as requested (legacy-compatible)
+    try:
+        if res.get("probability") is not None:
+            card["ai"]["probability"] = float(res.get("probability"))
+    except Exception:
+        pass
+
+    if res.get("comment"):
+        card["ai"]["comment"] = str(res.get("comment")).strip()
+
+    if res.get("justification"):
+        card["ai"]["justification"] = str(res.get("justification")).strip()
+
+
     geo_info = card.get("geo_info") or {}
 
 
@@ -1273,6 +1302,12 @@ def build_card_text(card: Dict) -> str:
     error = ai.get("error")
 
     ai_lines = []
+    onzs_ai = card.get("onzs_category_name")
+    just = ai.get("justification")
+    if onzs_ai:
+        ai_lines.append(f"🗂 Категория ОНзС от ИИ: {onzs_ai}")
+    if just:
+        ai_lines.append(f"🧠 Обоснование: {just}")
     if error:
         ai_lines.append(f"🤖 {error}")
     elif prob is not None:
@@ -1796,6 +1831,70 @@ def rgis_fetch_planning_by_cadastre(cadastral_number: str) -> Dict:
             
     return geo_info
 
+
+# --- Cadastre lookup fallback (no Playwright) ---
+# Uses public PKK (Rosreestr) endpoints when available. If the endpoint changes,
+# the scraper will just skip enrichment without failing the whole card.
+def lookup_cadastre_pkk(cn: str) -> Dict:
+    """
+    Try to resolve cadastral number to an address and basic attributes via PKK (Rosreestr).
+    Returns dict with keys: address, raw (optional).
+    """
+    cn = (cn or "").strip()
+    if not cn:
+        return {}
+    try:
+        # search object by text
+        s_url = "https://pkk.rosreestr.ru/api/features/1"
+        r = requests.get(s_url, params={"text": cn}, timeout=HTTP_TIMEOUT)
+        if not r.ok:
+            return {}
+        js = r.json()
+        feats = (js or {}).get("features") or []
+        if not feats:
+            return {}
+        fid = feats[0].get("attrs", {}).get("id") or feats[0].get("id")
+        if not fid:
+            return {}
+        d_url = f"https://pkk.rosreestr.ru/api/features/1/{fid}"
+        r2 = requests.get(d_url, timeout=HTTP_TIMEOUT)
+        if not r2.ok:
+            return {}
+        js2 = r2.json() or {}
+        attrs = (js2.get("feature") or {}).get("attrs") or {}
+        # different schemas exist; best-effort
+        addr = attrs.get("address") or attrs.get("readable_address") or attrs.get("location") or ""
+        out = {}
+        if addr:
+            out["address"] = str(addr).strip()
+        out["pkk_raw"] = attrs
+        return out
+    except Exception as e:
+        log.error(f"PKK cadastre lookup error: {e}")
+        return {}
+
+def enrich_geo_info_fallback(geo_info: Dict) -> Dict:
+    """
+    Fallback enrichment without Playwright:
+    - If cadastre exists and address is missing -> try PKK to get address.
+    - If we got address -> forward geocode to coords.
+    """
+    if not isinstance(geo_info, dict):
+        return {}
+    cn = geo_info.get("cadastral_number")
+    if cn and not geo_info.get("address"):
+        pkk = lookup_cadastre_pkk(cn)
+        if pkk.get("address"):
+            geo_info["address"] = pkk["address"]
+        geo_info.setdefault("sources", {})
+        geo_info["sources"]["pkk"] = True if pkk else False
+
+    # Reuse existing Yandex geocoder enrichment for coords/address
+    try:
+        geo_info = enrich_geo_info(geo_info)
+    except Exception:
+        pass
+    return geo_info
 def generate_card(hit: Dict) -> Dict:
     cid = generate_card_id()
     card = {
@@ -1813,7 +1912,7 @@ def generate_card(hit: Dict) -> Dict:
 
     # Extract and enrich geo info
     geo_info = extract_geo_info(card["text"])
-    card["geo_info"] = enrich_geo_info(geo_info)
+    card["geo_info"] = enrich_geo_info_fallback(geo_info)
     # --- RGIS (Playwright): lookup planning info by cadastral number ---
     if ENABLE_RGIS_LOOKUP:
         cadastral = (card.get("geo_info") or {}).get("cadastral_number")
@@ -2489,23 +2588,27 @@ def poll_updates_loop():
  
             if not data.get("ok"):
                 if data.get("error_code") == 409:
-                    log.error("getUpdates conflict (409). Another instance is running.")
-                    global LAST_CONFLICT_ALERT_TS
-                    if now_ts() - LAST_CONFLICT_ALERT_TS > 3600: # 1 hour cooldown
-                        alert_msg = (
-                            "🚨 ВНИМАНИЕ: ОБНАРУЖЕН КОНФЛИКТ ЭКЗЕМПЛЯРОВ БОТА (ОШИБКА 409)\n\n"
-                            "Другой процесс или сервер уже использует этот токен Telegram, что мешает обработке обновлений.\n\n"
-                            "• **Причина:** Запущено несколько копий бота с одним и тем же BOT_TOKEN.\n"
-                            "• **Решение:** Остановите все лишние экземпляры. Убедитесь, что бот запущен только на одном сервере."
-                        )
-                        recipients = list(set(list_users_by_role('admin') + list_users_by_role('leadership')))
-                        for uid in recipients:
-                            try:
-                                send_message(uid, alert_msg)
-                            except Exception: pass
-                        LAST_CONFLICT_ALERT_TS = now_ts()
-                    time.sleep(60)
-                    continue
+    log.error("getUpdates conflict (409). Another instance is running.")
+    global LAST_CONFLICT_ALERT_TS
+    # Send at most once per hour, then exit to avoid duplicate instances spamming Telegram.
+    if now_ts() - LAST_CONFLICT_ALERT_TS > 3600:
+        alert_msg = (
+            "🚨 ВНИМАНИЕ: ОБНАРУЖЕН КОНФЛИКТ ЭКЗЕМПЛЯРОВ БОТА (ОШИБКА 409)\n\n"
+            "Другой процесс/сервер уже использует этот токен Telegram, что мешает обработке обновлений.\n\n"
+            "Причина: запущено несколько копий бота с одним и тем же BOT_TOKEN или включён webhook.\n"
+            "Решение: оставьте только ОДИН сервис/контейнер; отключите webhook (deleteWebhook).\n\n"
+            "Этот экземпляр сейчас завершится, чтобы не мешать рабочему."
+        )
+        recipients = list(set(list_users_by_role("admin") + list_users_by_role("leadership")))
+        for uid in recipients:
+            try:
+                send_message(uid, alert_msg)
+            except Exception:
+                pass
+        LAST_CONFLICT_ALERT_TS = now_ts()
+    # Exit so that the "winning" instance can continue serving updates.
+    raise SystemExit(0)
+
                 log.error(f"getUpdates error: {data}")
                 time.sleep(3); continue
  
