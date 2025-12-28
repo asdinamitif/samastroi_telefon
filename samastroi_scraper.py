@@ -791,7 +791,7 @@ def update_channel_bias(channel: str, label: str) -> None:
     cur = float(ch.get(channel, 0.0) or 0.0) 
  
     step = 1.5  # points per decision 
-    if label in ("work", "attach"): 
+    if label == "work": 
         cur += step 
     elif label == "wrong": 
         cur -= step 
@@ -854,10 +854,7 @@ def update_train_daily(label: str):
         if label == "work": 
             work += 1 
         elif label == "wrong": 
-            wrong += 1 
-        elif label == "attach": 
-            attach += 1 
-        conn.execute( 
+            wrong += 1        conn.execute( 
             "INSERT OR REPLACE INTO train_daily(day,total,work,wrong,attach) VALUES(?,?,?,?,?)", 
             (d, total, work, wrong, attach), 
         ) 
@@ -889,9 +886,7 @@ def compute_training_stats() -> Dict:
     if mode in ("override", "fixed", "demo", "1", "true", "yes"): 
         total = int(os.getenv("STATS_TOTAL", "3246")) 
         work = int(os.getenv("STATS_IN_WORK", "201")) 
-        wrong = int(os.getenv("STATS_WRONG", "3045")) 
-        attach = int(os.getenv("STATS_ATTACH", "0")) 
-        target = int(os.getenv("STATS_TARGET", "5000")) 
+        wrong = int(os.getenv("STATS_WRONG", "3045"))        target = int(os.getenv("STATS_TARGET", "5000")) 
  
         # прогресс к цели — от total/target 
         prog = 0.0 if target <= 0 else (total / target) * 100.0 
@@ -915,8 +910,7 @@ def compute_training_stats() -> Dict:
             "total": total, 
             "work": work, 
             "wrong": wrong, 
-            "attach": attach, 
-            "progress": prog_s, 
+                        "progress": prog_s, 
             "confidence": conf_s, 
             "last_ts": last_ts, 
             "last_str": last_str, 
@@ -930,10 +924,7 @@ def compute_training_stats() -> Dict:
  
     total = sum(r[0] for r in rows) if rows else 0 
     work = sum(r[1] for r in rows) if rows else 0 
-    wrong = sum(r[2] for r in rows) if rows else 0 
-    attach = sum(r[3] for r in rows) if rows else 0 
- 
-    last_ts = None 
+    wrong = sum(r[2] for r in rows) if rows else 0    last_ts = None 
     try: 
         with open(TRAINING_DATASET, "rb") as f: 
             f.seek(0, os.SEEK_END) 
@@ -960,8 +951,7 @@ def compute_training_stats() -> Dict:
         "total": total,
         "work": work,
         "wrong": wrong,
-        "attach": attach,
-        "progress": round(prog, 2),
+                "progress": round(prog, 2),
         "confidence": round(conf, 2),
         "last_ts": last_ts,
         "target": TARGET_DATASET_SIZE,
@@ -1425,15 +1415,6 @@ def send_photo(chat_id: int, file_path: str, caption: str = ""):
         if not r.ok: 
             log.error(f"sendPhoto failed: {r.text}") 
  
-def build_card_keyboard(card_id: str) -> Dict:
-    return {
-        "inline_keyboard": [
-            [{"text": "✅ В работу", "callback_data": f"card:{card_id}:work"},
-             {"text": "❌ Неверно", "callback_data": f"card:{card_id}:wrong"}],
-            [{"text": "📎 Привязать", "callback_data": f"card:{card_id}:attach"}],
-        ]
-    }
-
 def build_status_keyboard(card_id: str) -> Dict:
     return {
         "inline_keyboard": [
@@ -1963,7 +1944,7 @@ def apply_card_action(card_id: str, action: str, from_user: int) -> Tuple[str, b
         dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
         return (f"Уже обработано: {dec} (админ {by}, {dt})", False)
 
-    if action not in ("work", "wrong", "attach"):
+    if action not in ("work", "wrong"):
         return ("Неизвестное действие.", False)
 
     card = load_card(card_id)
@@ -1980,9 +1961,6 @@ def apply_card_action(card_id: str, action: str, from_user: int) -> Tuple[str, b
         return ("Выберите статус:", True)
     elif action == "wrong":
         new_status, label, msg = "wrong", "wrong", "Статус: НЕВЕРНО ❌"
-    else: # attach
-        new_status, label, msg = "bind", "attach", "Статус: ПРИВЯЗАТЬ 📎"
-
     card["status"] = new_status
     card.setdefault("history", []).append({"event": f"set_{new_status}", "from_user": int(from_user), "ts": now_ts()})
     save_card(card)
@@ -2004,9 +1982,7 @@ def build_kpi_text() -> str:
         return "📊 KPI: данных обучения пока нет." 
     total = sum(int(r[1]) for r in rows) 
     work = sum(int(r[2]) for r in rows) 
-    wrong = sum(int(r[3]) for r in rows) 
-    attach = sum(int(r[4]) for r in rows) 
-    acc = ((work + attach) / total * 100.0) if total > 0 else 0.0 
+    wrong = sum(int(r[3]) for r in rows)    acc = (work / total * 100.0) if total > 0 else 0.0 
     last_day = rows[-1][0] 
     return ( 
         "📊 KPI (самострой-контроль)\n" 
@@ -2014,8 +1990,7 @@ def build_kpi_text() -> str:
         f"Всего решений: {total}\n" 
         f"В работу: {work}\n" 
         f"Неверно: {wrong}\n" 
-        f"Привязать: {attach}\n" 
-        f"Доля полезных (в работу+привязать): {acc:.1f}%\n" 
+                f"Доля полезных (в работу+привязать): {acc:.1f}%\n" 
     ) 
  
 def build_report_xlsx() -> str:
@@ -2030,9 +2005,9 @@ def build_report_xlsx() -> str:
             ws.append([k.strip(), v.strip()])
 
     ws2 = wb.create_sheet("TrainingDaily")
-    ws2.append(["day", "total", "work", "wrong", "attach"])
+    ws2.append(["day", "total", "work", "wrong"])
     for r in _fetch_train_daily_last(90):
-        ws2.append(list(r))
+        ws2.append(list(r)[:4])
 
     ws3 = wb.create_sheet("ChannelBias")
     ws3.append(["channel", "bias_points"])
@@ -2103,14 +2078,10 @@ def build_trainplot_png(days: int = 60) -> str:
     days_list = [r[0] for r in rows] 
     total = [int(r[1]) for r in rows] 
     work = [int(r[2]) for r in rows] 
-    wrong = [int(r[3]) for r in rows] 
-    attach = [int(r[4]) for r in rows] 
- 
-    plt.plot(days_list, total, label="total") 
+    wrong = [int(r[3]) for r in rows]    plt.plot(days_list, total, label="total") 
     plt.plot(days_list, work, label="work") 
     plt.plot(days_list, wrong, label="wrong") 
-    plt.plot(days_list, attach, label="attach") 
-    plt.xticks(rotation=45, ha="right") 
+plt.xticks(rotation=45, ha="right") 
     plt.legend() 
     plt.tight_layout() 
     plt.savefig(out_path, dpi=150, bbox_inches="tight") 
@@ -2172,6 +2143,13 @@ def handle_callback_query(upd: Dict):
             answer_callback(cb_id, "Только администраторы могут менять статус.", show_alert=True)
             return
         _, card_id, action = data.split(":", 2)
+
+        # Backward compatibility: old messages may still have "attach" button
+        if action == "attach":
+            if chat_id and message_id:
+                edit_reply_markup(chat_id, message_id, reply_markup=None)
+            answer_callback(cb_id, "Кнопка «Привязать» отключена. Используйте «В работу» или «Неверно».", show_alert=True)
+            return
         card = load_card(card_id)
 
         if not card:
@@ -2235,6 +2213,13 @@ def handle_callback_query(upd: Dict):
             answer_callback(cb_id, "Только администраторы могут менять статус.", show_alert=True)
             return
         _, card_id, action = data.split(":", 2)
+
+        # Backward compatibility: old messages may still have "attach" button
+        if action == "attach":
+            if chat_id and message_id:
+                edit_reply_markup(chat_id, message_id, reply_markup=None)
+            answer_callback(cb_id, "Кнопка «Привязать» отключена. Используйте «В работу» или «Неверно».", show_alert=True)
+            return
         if action == "add":
             ADMIN_STATE[from_user] = f"await_comment:{card_id}"
             send_message(chat_id, "Пожалуйста, введите комментарий для карточки.")
