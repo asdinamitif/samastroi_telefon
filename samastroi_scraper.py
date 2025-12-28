@@ -132,6 +132,14 @@ DEFAULT_CHANNELS = [
 GROUPS_FILE = os.getenv("GROUPS_FILE", "").strip() 
 KEYWORDS_FILE = os.getenv("KEYWORDS_FILE", "").strip() 
  
+
+# --- Channel blacklist (forced exclusion) ---
+BLACKLIST_CHANNELS = {
+    "@gsnmo_bou",
+    "t.me/gsnmo_bou",
+    "gsnmo_bou",
+}
+
 def _read_lines_file(path: str) -> List[str]: 
     try: 
         with open(path, "r", encoding="utf-8") as f: 
@@ -247,51 +255,32 @@ def load_keywords_list() -> List[str]:
     ] 
  
 CHANNEL_LIST = load_channel_list() 
+
+def normalize_channel(ch: str) -> str:
+    ch = (ch or "").strip()
+    if not ch:
+        return ch
+    if ch.startswith("https://t.me/"):
+        ch = "@" + ch.split("https://t.me/", 1)[1]
+    if ch.startswith("t.me/"):
+        ch = "@" + ch.split("t.me/", 1)[1]
+    if not ch.startswith("@"):
+        ch = "@" + ch
+    return ch.lower()
+
+# Apply blacklist (defensive: works even if ENV is misconfigured)
+_before = len(CHANNEL_LIST)
+_bl = {normalize_channel(b) for b in BLACKLIST_CHANNELS}
+CHANNEL_LIST = [ch for ch in CHANNEL_LIST if normalize_channel(ch) not in _bl]
+_after = len(CHANNEL_LIST)
+log.info(f"[CFG] Blacklist applied. Channels before={_before}, after={_after}")
+
 KEYWORDS = load_keywords_list() 
  
 # Extra high-signal patterns (work even without keywords)
 CADASTRE_RE = re.compile(r"\b\d{2}:\d{2}:\d{6,8}:\d+\b")
 COORD_RE = re.compile(r"\b\d{2}\.\d{3,}\s*,\s*\d{2}\.\d{3,}\b")
-
-# --- Address parsing (robust, RU) ---
-# Supports: "ул Октябрьская, 10" / "Октябрьская,10" / "Октябрьская д10" / "Октябрьской 10" etc.
-STREET_TYPE_PAT = r"(?:ул\.?|улица|пр-т\.?|проспект|пл\.?|площадь|пер\.?|переулок|ш\.?|шоссе|бул\.?|бульвар|наб\.?|набережная|проезд|аллея|мкр\.?|микрорайон|кв-л\.?|квартал)"
-HOUSE_PAT = r"(?:д\.?|дом|д\s*№|№)\s*(?P<house>\d+[\w\-/]*)"
-STREET_NAME_PAT = r"(?P<street>[А-Яа-яЁё0-9][А-Яа-яЁё0-9\-\s]{2,60}?)"
-
-ADDR_PAT_1 = re.compile(rf"\b(?P<stype>{STREET_TYPE_PAT})\s*{STREET_NAME_PAT}\s*[\,\.]?\s*{HOUSE_PAT}\b", re.IGNORECASE)
-ADDR_PAT_2 = re.compile(rf"\b{STREET_NAME_PAT}\s*[\,\.]?\s*{HOUSE_PAT}\b", re.IGNORECASE)
-ADDR_PAT_3 = re.compile(rf"\b{HOUSE_PAT}\s*[\,\.]?\s*(?P<stype>{STREET_TYPE_PAT})?\s*{STREET_NAME_PAT}\b", re.IGNORECASE)
-
-def _clean_addr(s: str) -> str:
-    s = " ".join((s or "").replace("\n", " ").split())
-    s = re.sub(r"\s*,\s*", ", ", s)
-    s = re.sub(r"\s*д\s*\.?\s*", " д. ", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s*дом\s*", " д. ", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s*№\s*", " ", s)
-    s = re.sub(r"\s+", " ", s).strip(" ,.")
-    return s
-
-def extract_address_from_text(text: str) -> Optional[str]:
-    if not text:
-        return None
-    t = " ".join(str(text).replace("\xa0", " ").split())
-    for pat in (ADDR_PAT_1, ADDR_PAT_2, ADDR_PAT_3):
-        m = pat.search(t)
-        if not m:
-            continue
-        stype = (m.groupdict().get("stype") or "").strip()
-        street = (m.groupdict().get("street") or "").strip()
-        house = (m.groupdict().get("house") or "").strip()
-        if not street or not house:
-            continue
-        if stype:
-            addr = f"{stype} {street} д. {house}"
-        else:
-            addr = f"{street} д. {house}"
-        return _clean_addr(addr)
-    return None
-ADDRESS_RE = None  # legacy single-regex; replaced by robust parser below
+ADDRESS_RE = re.compile(r'\b(ул\.?|улица|проспект|пр-т\.?|площадь|пл\.?|переулок|пер\.?|шоссе|ш\.?)\s+([\w\s-]+?)\s+(д\.?|дом)\s+(\d+([\w\/]*))', re.IGNORECASE)
 
 # CHANNEL_LIST is loaded via load_channel_list() above
 # KEYWORDS are loaded via load_keywords_list() above 
@@ -361,6 +350,14 @@ def init_db():
         ); 
     """) 
  
+    
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rgis_cache (
+            cadastral TEXT PRIMARY KEY,
+            result_json TEXT NOT NULL,
+            fetched_ts INTEGER NOT NULL
+        );
+    """)
     # seed roles if empty 
     cnt = int(conn.execute("SELECT COUNT(*) FROM user_roles;").fetchone()[0] or 0) 
     if cnt == 0: 
@@ -502,6 +499,202 @@ def append_jsonl(path: str, obj: Dict):
         f.write(json.dumps(obj, ensure_ascii=False) + "\n") 
  
 
+def rgis_cache_get(cadastral: str, ttl_hours: int = None) -> Optional[Dict]:
+    cadastral = (cadastral or "").strip()
+    if not cadastral:
+        return None
+    if ttl_hours is None:
+        ttl_hours = RGIS_CACHE_TTL_HOURS
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT result_json, fetched_ts FROM rgis_cache WHERE cadastral=?;",
+            (cadastral,)
+        ).fetchone()
+        if not row:
+            return None
+        result_json, fetched_ts = row
+        if now_ts() - int(fetched_ts) > int(ttl_hours) * 3600:
+            return None
+        obj = json.loads(result_json)
+        if isinstance(obj, dict):
+            obj["cache"] = True
+        return obj
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+def rgis_cache_put(cadastral: str, result: Dict) -> None:
+    cadastral = (cadastral or "").strip()
+    if not cadastral:
+        return
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO rgis_cache(cadastral, result_json, fetched_ts) VALUES (?,?,?);",
+            (cadastral, json.dumps(result, ensure_ascii=False), now_ts())
+        )
+    finally:
+        conn.close()
+
+def rgis_lookup_playwright(cadastral: str, timeout_ms: int = 25000) -> Dict:
+    """
+    Реальный парсинг RGIS (planning) через Playwright (Chromium):
+      - открывает https://rgis.mosreg.ru/v3/#/?tab=planning
+      - вводит кадастровый номер и запускает поиск
+      - пытается считать текст боковой панели/карточки результата
+    """
+    cadastral = (cadastral or "").strip()
+    if not cadastral:
+        return {"ok": False, "error": "empty cadastral"}
+
+    cached = rgis_cache_get(cadastral)
+    if cached:
+        return cached
+
+    url = "https://rgis.mosreg.ru/v3/#/?tab=planning"
+    result: Dict = {
+        "ok": False,
+        "cadastral": cadastral,
+        "url": url,
+        "cache": False,
+        "fetched_ts": now_ts(),
+    }
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        result["error"] = f"Playwright is not installed/available: {e}"
+        rgis_cache_put(cadastral, result)
+        return result
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        context = browser.new_context(viewport={"width": 1400, "height": 900})
+        page = context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+
+            for sel in [
+                "button:has-text('Принять')",
+                "button:has-text('Согласен')",
+                "button:has-text('OK')",
+                "button:has-text('Понятно')",
+            ]:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=800):
+                        loc.click(timeout=800)
+                        break
+                except Exception:
+                    pass
+
+            search_locators = [
+                "input[placeholder*='Поиск' i]",
+                "input[placeholder*='кадастр' i]",
+                "input[placeholder*='кадастров' i]",
+                "input[type='search']",
+                "input",
+            ]
+            search_input = None
+            for sel in search_locators:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=1500):
+                        loc.click(timeout=800)
+                        search_input = loc
+                        break
+                except Exception:
+                    continue
+
+            if not search_input:
+                result["error"] = "search input not found"
+                rgis_cache_put(cadastral, result)
+                return result
+
+            try:
+                search_input.fill("")
+                search_input.type(cadastral, delay=20)
+            except Exception:
+                try:
+                    search_input.fill(cadastral)
+                except Exception as e:
+                    result["error"] = f"cannot type cadastral: {e}"
+                    rgis_cache_put(cadastral, result)
+                    return result
+
+            clicked = False
+            for sel in [
+                "button:has-text('Найти')",
+                "button:has-text('Поиск')",
+                "button[aria-label*='Поиск' i]",
+                "button[title*='Поиск' i]",
+            ]:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=1200):
+                        loc.click(timeout=1200)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                try:
+                    page.keyboard.press("Enter")
+                except Exception:
+                    pass
+
+            page.wait_for_timeout(1200)
+            page.wait_for_load_state("networkidle", timeout=timeout_ms)
+
+            panel_text = ""
+            used_sel = None
+            for sel in [
+                "[class*='sidebar' i]",
+                "[class*='drawer' i]",
+                "[class*='panel' i]",
+                "main",
+                "body",
+            ]:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=1500):
+                        txt = (loc.inner_text(timeout=2000) or "").strip()
+                        if len(txt) > 120:
+                            panel_text = txt
+                            used_sel = sel
+                            break
+                except Exception:
+                    continue
+
+            if panel_text:
+                result["ok"] = True
+                result["panel_selector"] = used_sel
+                result["panel_text"] = panel_text[:12000]
+            else:
+                result["error"] = "no meaningful panel text after search"
+
+            rgis_cache_put(cadastral, result)
+            return result
+        except Exception as e:
+            result["error"] = f"rgis_lookup_playwright exception: {e}"
+            rgis_cache_put(cadastral, result)
+            return result
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+
 def add_onzs_trace(card: Dict, step: str, data: Dict) -> None:
     """Append ONZS trace step into card['onzs_trace'] preserving order."""
     try:
@@ -598,7 +791,7 @@ def update_channel_bias(channel: str, label: str) -> None:
     cur = float(ch.get(channel, 0.0) or 0.0) 
  
     step = 1.5  # points per decision 
-    if label in ("work", "attach"): 
+    if label == "work": 
         cur += step 
     elif label == "wrong": 
         cur -= step 
@@ -661,10 +854,7 @@ def update_train_daily(label: str):
         if label == "work": 
             work += 1 
         elif label == "wrong": 
-            wrong += 1 
-        elif label == "attach": 
-            attach += 1 
-        conn.execute( 
+            wrong += 1        conn.execute( 
             "INSERT OR REPLACE INTO train_daily(day,total,work,wrong,attach) VALUES(?,?,?,?,?)", 
             (d, total, work, wrong, attach), 
         ) 
@@ -696,9 +886,7 @@ def compute_training_stats() -> Dict:
     if mode in ("override", "fixed", "demo", "1", "true", "yes"): 
         total = int(os.getenv("STATS_TOTAL", "3246")) 
         work = int(os.getenv("STATS_IN_WORK", "201")) 
-        wrong = int(os.getenv("STATS_WRONG", "3045")) 
-        attach = int(os.getenv("STATS_ATTACH", "0")) 
-        target = int(os.getenv("STATS_TARGET", "5000")) 
+        wrong = int(os.getenv("STATS_WRONG", "3045"))        target = int(os.getenv("STATS_TARGET", "5000")) 
  
         # прогресс к цели — от total/target 
         prog = 0.0 if target <= 0 else (total / target) * 100.0 
@@ -722,8 +910,7 @@ def compute_training_stats() -> Dict:
             "total": total, 
             "work": work, 
             "wrong": wrong, 
-            "attach": attach, 
-            "progress": prog_s, 
+                        "progress": prog_s, 
             "confidence": conf_s, 
             "last_ts": last_ts, 
             "last_str": last_str, 
@@ -737,10 +924,7 @@ def compute_training_stats() -> Dict:
  
     total = sum(r[0] for r in rows) if rows else 0 
     work = sum(r[1] for r in rows) if rows else 0 
-    wrong = sum(r[2] for r in rows) if rows else 0 
-    attach = sum(r[3] for r in rows) if rows else 0 
- 
-    last_ts = None 
+    wrong = sum(r[2] for r in rows) if rows else 0    last_ts = None 
     try: 
         with open(TRAINING_DATASET, "rb") as f: 
             f.seek(0, os.SEEK_END) 
@@ -767,8 +951,7 @@ def compute_training_stats() -> Dict:
         "total": total,
         "work": work,
         "wrong": wrong,
-        "attach": attach,
-        "progress": round(prog, 2),
+                "progress": round(prog, 2),
         "confidence": round(conf, 2),
         "last_ts": last_ts,
         "target": TARGET_DATASET_SIZE,
@@ -835,65 +1018,75 @@ def select_few_shot_examples(text: str, k: int = 3) -> List[Dict]:
     scored.sort(key=lambda x: x[0], reverse=True) 
     return [e for _, e in scored[:k]] 
  
-def call_yandex_gpt_json(text: str) -> Tuple[Optional[Dict], Optional[str]]:
-    """
-    Calls YandexGPT and expects STRICT JSON in the assistant text.
 
-    Legacy-compatible contract (Variant A):
-      {
-        "probability": 0-100,
-        "comment": "краткое обоснование",
-        "onzs_category_name": "..."   // опционально
-      }
+def call_yandex_gpt_json(card: Dict) -> Tuple[Optional[Dict], Optional[str]]:
+    """
+    Calls YandexGPT and expects STRICT JSON in response.
+
+    Expected schema (keys may be partial, we will normalize):
+    {
+      "probability": number (0..100),
+      "comment": string,
+      "onzs_category_id": number (1..12),
+      "onzs_category_name": string,
+      "onzs_confidence": number (0..1),
+      "risk_level": "low|medium|high",
+      "risk_score": number (0..100),
+      "recommendation": string,
+      "justification": string
+    }
     """
     if not YAGPT_API_KEY or not YAGPT_FOLDER_ID:
         return None, "YandexGPT API Key or Folder ID is not configured."
 
     model_uri = YAGPT_MODEL.format(folder_id=YAGPT_FOLDER_ID)
 
-    # geo enrichment for better grounding (best-effort)
-    geo_info: Dict = {}
-    try:
-        geo_info = enrich_geo_info(extract_geo_info(text or ""))
-    except Exception as e:
-        log.warning(f"geo enrichment failed: {e}")
+    # Provide the model a compact, high-signal payload (no huge histories)
+    payload_for_ai = {
+        "card_id": card.get("card_id"),
+        "channel": card.get("channel"),
+        "post_id": card.get("post_id"),
+        "timestamp": card.get("timestamp"),
+        "text": (card.get("text") or "")[:5000],
+        "keywords": card.get("keywords") or [],
+        "geo": card.get("geo") or card.get("geo_info") or {},
+        "object": card.get("object") or {},
+        "signals": (card.get("text_profile") or {}).get("signals") if card.get("text_profile") else (card.get("signals") or {}),
+        "municipality_hint": ((card.get("geo") or {}).get("municipality") or (card.get("geo_info") or {}).get("municipality_hint")),
+        "cadastral_number": ((card.get("geo") or {}).get("cadastral_number") or (card.get("geo_info") or {}).get("cadastral_number")),
+        "coordinates": ((card.get("geo") or {}).get("coordinates") or (card.get("geo_info") or {}).get("coordinates")),
+        "address": ((card.get("geo") or {}).get("address") or (card.get("geo_info") or {}).get("address")),
+        "onzs_candidates": [{"id": k, "name": v.get("name")} for k, v in ONZS_CATEGORIES.items()],
+    }
 
-    prompt_lines = [
-        "Ты — классификатор для самострой-контроля.",
-        "Сначала оцени вероятность, что сообщение связано с потенциальным самостроем (0..100).",
-        "Затем определи категорию ОНзС (муниципалитет 1..12) по тексту и гео/rgis данным.",
-        "",
-        "Верни СТРОГО JSON без текста вокруг. Формат:",
-        "{",
-        '  "probability": 0-100,',
-        '  "comment": "кратко почему это похоже/не похоже на самострой",',
-        '  "onzs_category_id": 1-12 или 0 если нельзя определить,',
-        '  "onzs_category_name": "строка",',
-        '  "onzs_confidence": 0-100,',
-        '  "reason": "обоснование выбора ОНзС, 1-5 предложений"',
-        "}",
-        "",
-        "Доступные категории ОНзС:",
-        "1. Одинцовский г.о.",
-        "2. Красногорский г.о.",
-        "3. Истринский г.о.",
-        "4. Солнечногорский г.о.",
-        "5. Химкинский г.о.",
-        "6. Мытищинский г.о.",
-        "7. Балашихинский г.о.",
-        "8. Люберецкий г.о.",
-        "9. Раменский г.о.",
-        "10. Домодедовский г.о.",
-        "11. Ленинский г.о.",
-        "12. Подольский г.о.",
-        "",
-        "Данные для анализа:",
-    ]
-    prompt = "\n".join(prompt_lines)
+    prompt = (
+        "Ты — эксперт органа государственного строительного надзора Московской области.\n"
+        "Проанализируй карточку и оцени:\n"
+        "1) вероятность самовольного строительства probability (0..100)\n"
+        "2) риск: risk_score (0..100) и risk_level (low/medium/high)\n"
+        "3) категорию ОНзС: onzs_category_id (1..12) и onzs_category_name\n"
+        "4) рекомендацию: recommendation (например: 'Рекомендуется выездная проверка', "
+        "'Рекомендуется мониторинг', 'Можно архивировать')\n"
+        "5) обоснование: justification (1–3 предложения, строго по данным)\n\n"
+        "Верни СТРОГО JSON следующего вида (без текста вокруг):\n"
+        "{\n"
+        '  "probability": 0,\n'
+        '  "comment": "",\n'
+        '  "onzs_category_id": 0,\n'
+        '  "onzs_category_name": "",\n'
+        '  "onzs_confidence": 0.0,\n'
+        '  "risk_level": "low",\n'
+        '  "risk_score": 0,\n'
+        '  "recommendation": "",\n'
+        '  "justification": ""\n'
+        "}\n\n"
+        "Данные карточки (JSON):\n"
+        + json.dumps(payload_for_ai, ensure_ascii=False)
+    )
 
     body = {
         "modelUri": model_uri,
-        "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": 260},
+        "completionOptions": {"stream": False, "temperature": 0.1, "maxTokens": 450},
         "messages": [{"role": "user", "text": prompt}],
     }
     headers = {
@@ -921,8 +1114,7 @@ def call_yandex_gpt_json(text: str) -> Tuple[Optional[Dict], Optional[str]]:
         return None, "Unexpected API response format."
 
     out = (text_out or "").strip()
-
-    # attempt to extract JSON object from surrounding text
+    # try to extract JSON object
     if not out.startswith("{"):
         s = out.find("{")
         e = out.rfind("}")
@@ -930,55 +1122,44 @@ def call_yandex_gpt_json(text: str) -> Tuple[Optional[Dict], Optional[str]]:
             out = out[s:e + 1]
 
     try:
-        obj = json.loads(out)
+        return json.loads(out), None
     except json.JSONDecodeError as e:
         log.error(f"YandexGPT JSON parse error: {e}; text={text_out[:300]}")
         return None, "Failed to parse JSON from AI response."
 
-    # basic validation/sanitization
-    try:
-        p = float(obj.get("probability", 0))
-        p = max(0.0, min(100.0, p))
-        obj["probability"] = p
-    except Exception:
-        obj["probability"] = 0.0
-
-    cmt = obj.get("comment")
-    obj["comment"] = "" if cmt is None else str(cmt)[:1500]
-
-    cat = obj.get("onzs_category_name")
-    # onzs_category: ensure int 1..12
-    try:
-        oc = int(obj.get("onzs_category", 0) or 0)
-    except Exception:
-        oc = 0
-    if oc < 1 or oc > 12:
-        oc = 0
-    obj["onzs_category"] = oc
-
-    # onzs_confidence: 0..100
-    try:
-        ocf = float(obj.get("onzs_confidence", 0) or 0)
-    except Exception:
-        ocf = 0.0
-    obj["onzs_confidence"] = max(0.0, min(100.0, ocf))
-
-    rsn = obj.get("reason")
-    obj["reason"] = "" if rsn is None else str(rsn)[:1500]
-
-    obj["onzs_category_name"] = "" if cat is None else str(cat)[:120]
-
-    return obj, None
-
 
 def enrich_card_with_yagpt(card: Dict) -> None:
+    """
+    Enrich card with AI decision:
+    - probability (0..100) + comment
+    - ONZS category + justification
+    - risk_score + risk_level + recommendation
+    Also performs hybrid merge with rule-based risk score.
+    """
     t = (card.get("text") or "").strip()
     if not t:
         return
 
-    res, err = call_yandex_gpt_json(card.get("text", ""))
+    # baseline risk from rules (for hybrid)
+    obj = card.get("object") or {}
+    signals = (card.get("text_profile") or {}).get("signals") if card.get("text_profile") else card.get("signals") or {}
+    geo = card.get("geo") or card.get("geo_info") or {}
+    has_cad = bool(geo.get("cadastral_number"))
+    has_coords = bool(geo.get("coordinates"))
+    base_score, base_level = rule_based_risk_score(
+        obj_type=obj.get("type"),
+        stage=obj.get("stage"),
+        signals=signals or {},
+        has_cadastre=has_cad,
+        has_coords=has_coords,
+    )
 
     card.setdefault("ai", {})
+    card["ai"]["risk_score_rule"] = base_score
+    card["ai"]["risk_level_rule"] = base_level
+    card["ai"]["model"] = "yandexgpt"
+
+    res, err = call_yandex_gpt_json(card)
     if err:
         card["ai"]["error"] = err
         return
@@ -986,50 +1167,74 @@ def enrich_card_with_yagpt(card: Dict) -> None:
         card["ai"]["error"] = "AI returned no result."
         return
 
-    # Legacy-compatible fields
-    card["ai"]["probability"] = float(res.get("probability", 0.0) or 0.0)
-    if res.get("comment"):
-        card["ai"]["comment"] = str(res.get("comment"))
-    if res.get("reason"):
-        card["ai"]["reason"] = str(res.get("reason"))
-
-    # Variant B: onzs_category (1..12) + name + confidence
-    oc = res.get("onzs_category")
-    try:
-        oc = int(oc) if oc is not None else 0
-    except Exception:
-        oc = 0
-
-    if 1 <= oc <= 12:
-        card["onzs_category"] = oc
-        # If name missing, restore from catalog
-        name = (res.get("onzs_category_name") or "").strip()
-        if not name:
-            info = ONZS_CATEGORIES.get(oc)
-            name = info["name"] if info else ""
-        if name:
-            card["onzs_category_name"] = name
-
-        # confidence (separate from probability)
+    # Normalize fields
+    def _num(x, default=None):
         try:
-            card["onzs_confidence"] = float(res.get("onzs_confidence", 0) or 0)
+            if x is None:
+                return default
+            return float(x)
         except Exception:
-            card["onzs_confidence"] = 0.0
-        card["onzs_confidence"] = max(0.0, min(100.0, float(card["onzs_confidence"])))
+            return default
 
-        # source of ONZS determination
-        card["onzs_source"] = "ИИ"
-        add_onzs_trace(card, "ИИ", {
-            "onzs_category": card.get("onzs_category"),
-            "onzs_category_name": card.get("onzs_category_name"),
-            "confidence": card.get("onzs_confidence"),
-            "probability": (card.get("ai") or {}).get("probability"),
-            "comment": (card.get("ai") or {}).get("comment"),
-            "reason": (card.get("ai") or {}).get("reason")
-        })
+    prob = _num(res.get("probability"), None)
+    if prob is not None:
+        prob = max(0.0, min(100.0, prob))
+
+    risk_score_ai = _num(res.get("risk_score"), None)
+    if risk_score_ai is not None:
+        risk_score_ai = max(0.0, min(100.0, risk_score_ai))
+
+    risk_level_ai = (res.get("risk_level") or "").strip().lower()
+    if risk_level_ai not in ("low", "medium", "high"):
+        risk_level_ai = None
+
+    # Hybrid: weighted blend, AI can adjust but not fully override
+    # final = 0.65 rules + 0.35 AI (if available)
+    if risk_score_ai is None:
+        final_score = base_score
     else:
-        # If AI didn't give a valid ONZS, do not override heuristic/RGIS
-        pass
+        final_score = int(round(base_score * 0.65 + risk_score_ai * 0.35))
+
+    if final_score >= 70:
+        final_level = "high"
+    elif final_score >= 40:
+        final_level = "medium"
+    else:
+        final_level = "low"
+
+    card["ai"]["probability"] = prob
+    card["ai"]["comment"] = (res.get("comment") or "").strip() or None
+    card["ai"]["risk_score"] = final_score
+    card["ai"]["risk_level"] = final_level
+    card["ai"]["risk_score_ai"] = risk_score_ai
+    if risk_level_ai:
+        card["ai"]["risk_level_ai"] = risk_level_ai
+
+    # ONZS
+    onzs_id = res.get("onzs_category_id")
+    try:
+        onzs_id = int(float(str(onzs_id).replace(",", ".")))
+    except Exception:
+        onzs_id = None
+    if onzs_id and onzs_id in ONZS_CATEGORIES:
+        card["onzs_category"] = onzs_id
+        card["onzs_category_name"] = ONZS_CATEGORIES[onzs_id]["name"]
+    elif res.get("onzs_category_name"):
+        card["onzs_category_name"] = str(res.get("onzs_category_name")).strip()
+
+    conf = _num(res.get("onzs_confidence"), None)
+    if conf is not None:
+        conf = max(0.0, min(1.0, conf))
+    card["ai"]["onzs_confidence"] = conf
+
+    # Recommendation + justification
+    card["ai"]["recommendation"] = (res.get("recommendation") or "").strip() or None
+    card["ai"]["justification"] = (res.get("justification") or "").strip() or None
+
+    # For legacy text block compatibility (keep)
+    if card.get("onzs_category_name"):
+        card["ai"]["onzs_category_name"] = card.get("onzs_category_name")
+
 def generate_card_id() -> str: 
     return str(uuid.uuid4())[:12] 
  
@@ -1051,42 +1256,42 @@ def load_card(card_id: str) -> Optional[Dict]:
     except Exception: 
         return None 
  
-def build_card_text(card: Dict) -> str: 
-    ts = int(card.get("timestamp", now_ts())) 
-    dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M") 
-    kw = ", ".join(card.get("keywords", [])) or "—" 
-    links = card.get("links") or [] 
-    links_str = "\n".join(links) if links else "нет ссылок" 
- 
-    ai = card.get("ai") or {} 
-    prob = ai.get("probability")
-    raw = ai.get("probability_raw")
-    bias = ai.get("bias")
-    comment = ai.get("comment")
-    reason = ai.get("reason")
-    error = ai.get("error")
 
+def build_card_text(card: Dict) -> str:
+    ts = int(card.get("timestamp", now_ts()))
+    dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+
+    kw = ", ".join(card.get("keywords", [])) or "—"
+    links = card.get("links") or []
+    links_str = "\n".join(links) if links else "нет ссылок"
+
+    geo = card.get("geo") or {}
+    ai = card.get("ai") or {}
+
+    # AI block (final format)
     ai_lines = []
-    if error:
-        ai_lines.append(f"🤖 {error}")
+    if ai.get("error"):
+        ai_lines.append(f"🤖 Ошибка ИИ: {ai.get('error')}")
     else:
-        cat_name = card.get("onzs_category_name") or ai.get("onzs_category_name") or ""
-        reason = ai.get("reason") or ""
-        ocf = ai.get("onzs_confidence")
-        if cat_name:
+        if card.get("onzs_category_name") or ai.get("onzs_category_name"):
+            ai_lines.append(f"🗂 Категория ОНзС от ИИ: {card.get('onzs_category_name') or ai.get('onzs_category_name')}")
+        if ai.get("probability") is not None:
             try:
-                ai_lines.append(f"🤖 Категория ОНзС от ИИ: {cat_name} ({float(ocf):.1f}%)" if ocf is not None else f"🤖 Категория ОНзС от ИИ: {cat_name}")
+                ai_lines.append(f"📊 Вероятность самостроя: {float(ai.get('probability')):.1f}%")
             except Exception:
-                ai_lines.append(f"🤖 Категория ОНзС от ИИ: {cat_name}")
-        if reason:
-            ai_lines.append(f"🧠 Обоснование: {str(reason)[:1200]}")
-        if prob is not None:
-            try:
-                ai_lines.append(f"🎯 Вероятность самостроя (ИИ): {float(prob):.1f}%")
-            except Exception:
-                pass
-        if comment:
-            ai_lines.append(f"💬 Комментарий ИИ: {comment}")
+                ai_lines.append(f"📊 Вероятность самостроя: {ai.get('probability')}")
+        if ai.get("risk_score") is not None:
+            lvl = (ai.get("risk_level") or "").upper()
+            ai_lines.append(f"🧠 Оценка риска: {lvl} ({int(ai.get('risk_score'))}/100)")
+        if ai.get("recommendation"):
+            ai_lines.append("📌 Рекомендация ИИ:")
+            ai_lines.append(str(ai.get("recommendation")))
+        if ai.get("justification"):
+            ai_lines.append("💬 Обоснование:")
+            ai_lines.append(str(ai.get("justification")))
+        elif ai.get("comment"):
+            ai_lines.append("💬 Комментарий ИИ:")
+            ai_lines.append(str(ai.get("comment")))
 
     base = (
         "🔎 Обнаружено подозрительное сообщение\n"
@@ -1094,22 +1299,20 @@ def build_card_text(card: Dict) -> str:
         f"Дата: {dt}\n"
         f"ID поста: {card.get('post_id','—')}\n"
     )
-    if card.get("onzs_category_name"):
-        base += f"🗂 Категория ОНзС: {card['onzs_category_name']}\n"
 
-    geo_info = card.get("geo_info", {})
-    if geo_info:
-        base += "\n📍 Гео-информация:\n"
-        if "municipality_hint" in geo_info:
-            base += f"  - Муниципалитет (из текста): {geo_info['municipality_hint']}\n"
-        if "address" in geo_info:
-            base += f"  - Адрес: {geo_info['address']}\n"
-        if "coordinates" in geo_info:
-            base += f"  - Координаты: {geo_info['coordinates']}\n"
-        if "cadastral_number" in geo_info:
-            base += f"  - Кадастровый номер: {geo_info['cadastral_number']}\n"
-        if "rgis_municipality" in geo_info:
-            base += f"  - RGIS (округ): {geo_info['rgis_municipality']}\n"
+    if geo.get("municipality"):
+        base += f"🏛 Муниципалитет: {geo.get('municipality')}\n"
+
+    # Geo block
+    geo_lines = []
+    if geo.get("address"):
+        geo_lines.append(f"Адрес: {geo.get('address')}")
+    if geo.get("coordinates"):
+        geo_lines.append(f"Координаты: {geo.get('coordinates')}")
+    if geo.get("cadastral_number"):
+        geo_lines.append(f"Кадастровый номер: {geo.get('cadastral_number')}")
+    if geo_lines:
+        base += "\n📍 Гео-информация:\n  - " + "\n  - ".join(geo_lines) + "\n"
 
     base += (
         f"\n🔑 Ключевые слова: {kw}\n\n"
@@ -1119,10 +1322,12 @@ def build_card_text(card: Dict) -> str:
         f"{links_str}\n\n"
         f"🆔 ID карточки: {card.get('card_id','—')}"
     )
+
     if ai_lines:
         base += "\n\n" + "\n".join(ai_lines)
+
     return base
- 
+
 def append_history(entry: Dict): 
     entry = dict(entry) 
     entry["ts"] = now_ts() 
@@ -1192,14 +1397,6 @@ def send_photo(chat_id: int, file_path: str, caption: str = ""):
         if not r.ok: 
             log.error(f"sendPhoto failed: {r.text}") 
  
-def build_card_keyboard(card_id: str) -> Dict:
-    return {
-        "inline_keyboard": [
-            [{"text": "✅ В работу", "callback_data": f"card:{card_id}:work"},
-             {"text": "❌ Неверно", "callback_data": f"card:{card_id}:wrong"}],
-        ]
-    }
-
 def build_status_keyboard(card_id: str) -> Dict:
     return {
         "inline_keyboard": [
@@ -1222,65 +1419,177 @@ def build_comment_keyboard(card_id: str) -> Dict:
 ADMIN_STATE: Dict[int, str] = {}  # user_id -> pending_action
 
 ONZS_CATEGORIES = {
-    1: {"name": "Одинцовский г.о.", "stems": ["одинцов", "одинц"]},
-    2: {"name": "Красногорский г.о.", "stems": ["красногор", "красногорск"]},
-    3: {"name": "Истринский г.о.", "stems": ["истринск", "истра", "истр"]},
-    4: {"name": "Солнечногорский г.о.", "stems": ["солнечногор", "солнечн"]},
-    5: {"name": "Химкинский г.о.", "stems": ["химкинск", "химки", "химк"]},
-    6: {"name": "Мытищинский г.о.", "stems": ["мытищин", "мытищи", "мытищ"]},
-    7: {"name": "Балашихинский г.о.", "stems": ["балаших", "балашиха", "балашихин", "балаш"]},
-    8: {"name": "Люберецкий г.о.", "stems": ["люберец", "люберцы", "любер"]},
+    1: {"name": "Одинцовский г.о.", "stems": ["одинцов"]},
+    2: {"name": "Красногорский г.о.", "stems": ["красногор"]},
+    3: {"name": "Истринский г.о.", "stems": ["истринск", "истр"]},
+    4: {"name": "Солнечногорский г.о.", "stems": ["солнечногор"]},
+    5: {"name": "Химкинский г.о.", "stems": ["химкинск", "химк"]},
+    6: {"name": "Мытищинский г.о.", "stems": ["мытищин", "мытищ"]},
+    7: {"name": "Балашихинский г.о.", "stems": ["балашихин", "балаш"]},
+    8: {"name": "Люберецкий г.о.", "stems": ["люберец", "любер"]},
     9: {"name": "Раменский г.о.", "stems": ["раменск"]},
     10: {"name": "Домодедовский г.о.", "stems": ["домодедов"]},
     11: {"name": "Ленинский г.о.", "stems": ["ленинск"]},
     12: {"name": "Подольский г.о.", "stems": ["подольск", "подол"]},
 }
 
-def extract_municipality_hint(text: str) -> Optional[str]:
-    """Detect municipality/ГО in text. Returns normalized hint string."""
-    if not text:
-        return None
-    t = " " + " ".join(str(text).lower().replace("ё", "е").split()) + " "
-    m = re.search(r"(?:\bго\b|\bг\.о\.|городской\s+округ)\s+([а-я\-\s]{3,40})", t, re.IGNORECASE)
-    if m:
-        cand = re.sub(r"\s{2,}", " ", m.group(1).strip())
-        return cand[:60]
-    for _, info in ONZS_CATEGORIES.items():
-        name = (info.get("name") or "").lower().replace("ё", "е")
-        for stem in info.get("stems", []):
-            st = str(stem).lower().replace("ё", "е")
-            if st and st in t:
-                return name
-    return None
-
-
 def categorize_by_location(text: str) -> Optional[int]:
-    """Categorize by municipality/location based on stems and explicit 'ГО/г.о.' patterns."""
-    if not text:
-        return None
-    text_lower = " ".join(str(text).lower().replace("ё", "е").split())
-
-    m = re.search(r"(?:\bго\b|\bг\.о\.|городской\s+округ)\s+([а-я\-\s]{3,40})", text_lower, re.IGNORECASE)
-    if m:
-        cand = m.group(1).strip()
-        for cat_id, info in ONZS_CATEGORIES.items():
-            nm = (info.get("name") or "").lower().replace("ё", "е")
-            if nm in cand:
-                return cat_id
-            for stem in info.get("stems", []):
-                if str(stem).lower().replace("ё", "е") in cand:
-                    return cat_id
-
-    words = set(re.findall(r"\b[\w\-]{3,}\b", text_lower))
+    """Categorize text by location based on word stems."""
+    text_lower = text.lower()
+    words = set(re.findall(r'\b\w{3,}\b', text_lower))
     for cat_id, info in ONZS_CATEGORIES.items():
-        for stem in info.get("stems", []):
-            stem2 = str(stem).lower().replace("ё", "е")
-            for w in words:
-                if stem2 and stem2 in w:
+        for stem in info["stems"]:
+            for word in words:
+                if stem in word:
                     return cat_id
     return None
-
  
+
+
+
+def _ru_norm(s: str) -> str:
+    """Нормализация для русского текста (без агрессивной лемматизации)."""
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+# --- Address parsing (robust) ---
+_STREET_WORDS = r"(?:ул\.?|улица|пр-т\.?|проспект|просп\.?|ш\.?|шоссе|пер\.?|переулок|пл\.?|площадь|б-р\.?|бульвар|наб\.?|набережная|проезд|туп\.?|тупик)"
+# Поддержка: "Октябрьская, 10" / "Октябрьская 10" / "ул Октябрьская,10" / "Октябрьская д10" / "Октябрьской 10"
+_ADDR_RE_1 = re.compile(
+    rf"(?:(?P<prefix>{_STREET_WORDS})\s*)?(?P<street>[А-ЯЁа-яё0-9\-\s]{3,}?)\s*[, ]\s*(?:(?:д\.?|дом)\s*)?(?P<house>\d+[А-Яа-яA-Za-z0-9\-\/]*)",
+    re.IGNORECASE
+)
+
+# Более строгий вариант для "ул. X, д. 10"
+_ADDR_RE_2 = re.compile(
+    rf"(?P<prefix>{_STREET_WORDS})\s+(?P<street>[А-ЯЁа-яё0-9\-\s]{{3,}}?)\s*[, ]\s*(?:(?:д\.?|дом)\s*)?(?P<house>\d+[А-Яа-яA-Za-z0-9\-\/]*)",
+    re.IGNORECASE
+)
+
+def _compose_address(address_raw: str, municipality_hint: Optional[str] = None) -> str:
+    address_raw = _ru_norm(address_raw)
+    if not address_raw:
+        return ""
+    # если уже содержит "Московская область" — оставляем
+    if "москов" in address_raw.lower():
+        return address_raw
+    if municipality_hint:
+        # мягкая склейка
+        return f"Московская область, {municipality_hint}, {address_raw}"
+    return f"Московская область, {address_raw}"
+
+def extract_municipality_hint(text: str) -> Optional[str]:
+    """
+    Пытаемся вытащить округ из текста:
+    - "ГО Балашиха", "г.о. Балашиха", "городской округ Балашиха"
+    - просто "Балашиха" (через stems ONZS_CATEGORIES)
+    """
+    t = (text or "").lower()
+    # явные шаблоны
+    m = re.search(r"(?:г\.?\s*о\.?|го|городской\s+округ)\s*([а-яё\- ]{3,})", t, flags=re.I)
+    if m:
+        name = _ru_norm(m.group(1))
+        if name:
+            return f"г.о. {name.title()}"
+    # fallback через словарь ОНзС/муниципалитетов
+    cat_id = categorize_by_location(text or "")
+    if cat_id:
+        return ONZS_CATEGORIES.get(cat_id, {}).get("name")
+    return None
+
+# --- Object type & stage inference ---
+_OBJ_TYPE_RULES = [
+    ("МКД", re.compile(r"\b(жк|мкд|многоэтаж|корпус|квартир|новострой)\b", re.I)),
+    ("ИЖС", re.compile(r"\b(ижс|коттедж|частн(ый|ого)\s+дом|дом\s+на\s+участке|снт|днп)\b", re.I)),
+    ("Коммерция", re.compile(r"\b(тц|склад|ангар|автосервис|кафе|магазин|офис|павильон|мойка)\b", re.I)),
+    ("Реконструкция", re.compile(r"\b(реконструкц|надстройк|пристройк|перепланировк)\b", re.I)),
+]
+
+_STAGE_RULES = [
+    ("земляные работы", re.compile(r"\b(котлован|выемк|грунт|планировк|забор|ограждени|экскаватор|самосвал)\b", re.I)),
+    ("нулевой цикл/фундамент", re.compile(r"\b(фундамент|плита|сваи|ростверк|подбетонк)\b", re.I)),
+    ("надземная часть", re.compile(r"\b(этаж|монолит|каркас|колонн|перекрыти|кладк)\b", re.I)),
+    ("внутренние/отделочные", re.compile(r"\b(отделк|штукатурк|перегородк|инженерн|электрик|вентиляц)\b", re.I)),
+]
+
+def infer_object_type(text: str) -> Optional[str]:
+    t = text or ""
+    for name, rx in _OBJ_TYPE_RULES:
+        if rx.search(t):
+            return name
+    return None
+
+def infer_stage(text: str) -> Optional[str]:
+    t = text or ""
+    for name, rx in _STAGE_RULES:
+        if rx.search(t):
+            return name
+    return None
+
+def detect_risk_signals(text: str) -> Dict:
+    t = (text or "").lower()
+    signals = {
+        "mass_construction": bool(re.search(r"\b(жк|мкд|многоэтаж|комплекс|несколько\s+корпус)\b", t)),
+        "danger": [],
+        "complaints": bool(re.search(r"\b(жалоб|обращени|коллективн|жител[ья]|протест|митинг)\b", t)),
+        "children_social": bool(re.search(r"\b(дет(и|сад)|школ|поликлиник|соцобъект)\b", t)),
+        "fire_gas": bool(re.search(r"\b(пожар|газ|взрыв|задымлен)\b", t)),
+        "protected_zone": bool(re.search(r"\b(охранн(ая|ой)\s+зон|лесн(ой|ого)\s+фонд|прибрежн)\b", t)),
+    }
+    if signals["fire_gas"]:
+        signals["danger"].append("пожар/газ")
+    if signals["protected_zone"]:
+        signals["danger"].append("особый режим/зона")
+    return signals
+
+def rule_based_risk_score(obj_type: Optional[str], stage: Optional[str], signals: Dict, has_cadastre: bool, has_coords: bool) -> Tuple[int, str]:
+    """
+    Базовый скоринг (0..100) по правилам. ИИ потом может скорректировать в пределах.
+    """
+    score = 0
+    if obj_type == "МКД":
+        score += 30
+    elif obj_type == "Коммерция":
+        score += 15
+    elif obj_type == "Реконструкция":
+        score += 10
+    elif obj_type == "ИЖС":
+        score -= 10
+
+    if stage == "земляные работы":
+        score += 15
+    elif stage == "нулевой цикл/фундамент":
+        score += 10
+    elif stage == "надземная часть":
+        score += 20
+
+    if signals.get("complaints"):
+        score += 20
+    if signals.get("children_social"):
+        score += 15
+    if signals.get("fire_gas"):
+        score += 15
+    if signals.get("protected_zone"):
+        score += 25
+    if signals.get("mass_construction"):
+        score += 10
+
+    if has_cadastre:
+        score += 5
+    if has_coords:
+        score += 3
+
+    score = max(0, min(100, int(score)))
+    if score >= 70:
+        level = "high"
+    elif score >= 40:
+        level = "medium"
+    else:
+        level = "low"
+    return score, level
+
+
 def build_admin_keyboard() -> Dict: 
     thr = get_prob_threshold() 
     return { 
@@ -1363,6 +1672,10 @@ def extract_posts(html: str) -> List[Dict]:
     return posts 
  
 def process_channel(channel_username: str) -> List[Dict]: 
+    # Forced blacklist (e.g., to exclude official channels)
+    if normalize_channel(channel_username) in {normalize_channel(b) for b in BLACKLIST_CHANNELS}:
+        log.info(f"[SKIP] Channel blacklisted: {channel_username}")
+        return []
     url = f"https://t.me/s/{channel_username}" 
     html = fetch_channel_page(url) 
     if not html: 
@@ -1405,32 +1718,48 @@ def scan_once() -> List[Dict]:
             log.error(f"scan channel @{ch} error: {e}") 
     return all_hits 
  
-def extract_geo_info(text: str) -> Dict:
-    """Extract geographic information from text (cadastre / coords / address / municipality_hint)."""
-    info: Dict = {}
-    if not text:
-        return info
 
-    cadastre = CADASTRE_RE.search(text)
+def extract_geo_info(text: str) -> Dict:
+    """Extract geographic information from text using regex + municipality hint."""
+    t = text or ""
+    info: Dict = {}
+
+    cadastre = CADASTRE_RE.search(t)
     if cadastre:
         info["cadastral_number"] = cadastre.group(0)
 
-    coords = COORD_RE.search(text)
+    coords = COORD_RE.search(t)
     if coords:
         info["coordinates"] = coords.group(0)
 
-    addr = extract_address_from_text(text)
-    if addr:
-        info["address"] = addr
+    municipality_hint = extract_municipality_hint(t)
+    if municipality_hint:
+        info["municipality_hint"] = municipality_hint
 
-    mun = extract_municipality_hint(text)
-    if mun:
-        info["municipality_hint"] = mun
+    # Address extraction: try multiple patterns; also handle "street in genitive" naturally
+    addr_raw = None
+    for rx in (_ADDR_RE_2, _ADDR_RE_1):
+        m = rx.search(t)
+        if m:
+            street = _ru_norm(m.group("street"))
+            house = _ru_norm(m.group("house"))
+            prefix = _ru_norm(m.groupdict().get("prefix") or "")
+            # Normalize prefix
+            if prefix:
+                prefix = prefix.replace("улица", "ул.").replace("ул", "ул.").replace("проспект", "пр-т")
+                prefix = prefix.replace("пр-т.", "пр-т").replace("пр-т", "пр-т")
+                prefix = prefix.replace("шоссе", "ш.").replace("ш.", "ш.")
+            # If no prefix provided, keep street only
+            if prefix:
+                addr_raw = f"{prefix} {street}, д. {house}"
+            else:
+                addr_raw = f"{street}, д. {house}"
+            break
+
+    if addr_raw:
+        info["address"] = _compose_address(addr_raw, municipality_hint=municipality_hint)
 
     return info
-
-
-YANDEX_GEOCODER_API_KEY = os.getenv("YANDEX_GEOCODER_API_KEY", "34ec9307-a9b2-4708-9296-4b2d6d6e721b")
 
 def enrich_geo_info(geo_info: Dict) -> Dict:
     """Enriches geo information using Yandex Geocoder API."""
@@ -1617,102 +1946,206 @@ def rgis_fetch_planning_by_cadastre(cadastral_number: str) -> Dict:
             
     return geo_info
 
+
+# --- Cadastre lookup fallback (no Playwright) ---
+# Uses public PKK (Rosreestr) endpoints when available. If the endpoint changes,
+# the scraper will just skip enrichment without failing the whole card.
+def lookup_cadastre_pkk(cn: str) -> Dict:
+    """
+    Try to resolve cadastral number to an address and basic attributes via PKK (Rosreestr).
+    Returns dict with keys: address, raw (optional).
+    """
+    cn = (cn or "").strip()
+    if not cn:
+        return {}
+    try:
+        # search object by text
+        s_url = "https://pkk.rosreestr.ru/api/features/1"
+        r = requests.get(s_url, params={"text": cn}, timeout=HTTP_TIMEOUT)
+        if not r.ok:
+            return {}
+        js = r.json()
+        feats = (js or {}).get("features") or []
+        if not feats:
+            return {}
+        fid = feats[0].get("attrs", {}).get("id") or feats[0].get("id")
+        if not fid:
+            return {}
+        d_url = f"https://pkk.rosreestr.ru/api/features/1/{fid}"
+        r2 = requests.get(d_url, timeout=HTTP_TIMEOUT)
+        if not r2.ok:
+            return {}
+        js2 = r2.json() or {}
+        attrs = (js2.get("feature") or {}).get("attrs") or {}
+        # different schemas exist; best-effort
+        addr = attrs.get("address") or attrs.get("readable_address") or attrs.get("location") or ""
+        out = {}
+        if addr:
+            out["address"] = str(addr).strip()
+        out["pkk_raw"] = attrs
+        return out
+    except Exception as e:
+        log.error(f"PKK cadastre lookup error: {e}")
+        return {}
+
+def enrich_geo_info_fallback(geo_info: Dict) -> Dict:
+    """
+    Fallback enrichment without Playwright:
+    - If cadastre exists and address is missing -> try PKK to get address.
+    - If we got address -> forward geocode to coords.
+    """
+    if not isinstance(geo_info, dict):
+        return {}
+    cn = geo_info.get("cadastral_number")
+    if cn and not geo_info.get("address"):
+        pkk = lookup_cadastre_pkk(cn)
+        if pkk.get("address"):
+            geo_info["address"] = pkk["address"]
+        geo_info.setdefault("sources", {})
+        geo_info["sources"]["pkk"] = True if pkk else False
+
+    # Reuse existing Yandex geocoder enrichment for coords/address
+    try:
+        geo_info = enrich_geo_info(geo_info)
+    except Exception:
+        pass
+    return geo_info
+
 def generate_card(hit: Dict) -> Dict:
+    """
+    Builds a unified "samostroy profile" card (canonical JSON).
+    Keeps legacy top-level fields for backward compatibility with the existing bot logic.
+    """
     cid = generate_card_id()
-    card = {
+    text_raw = hit.get("text", "") or ""
+    keywords = hit.get("keywords") or []
+
+    # geo extraction + enrichment
+    geo_info = extract_geo_info(text_raw)
+    geo_info = enrich_geo_info(geo_info)
+
+    municipality = geo_info.get("municipality_hint") or None
+    cad = geo_info.get("cadastral_number")
+    coords = geo_info.get("coordinates")
+    address = geo_info.get("address")
+
+    # object inference
+    obj_type = infer_object_type(text_raw)
+    stage = infer_stage(text_raw)
+    signals = detect_risk_signals(text_raw)
+
+    # rule-based risk baseline
+    base_score, base_level = rule_based_risk_score(
+        obj_type=obj_type,
+        stage=stage,
+        signals=signals,
+        has_cadastre=bool(cad),
+        has_coords=bool(coords),
+    )
+
+    # ONZS via location heuristic (soft)
+    category_id = categorize_by_location(text_raw)
+    onzs_name = ONZS_CATEGORIES.get(category_id, {}).get("name") if category_id else None
+    if municipality and not onzs_name:
+        # municipality_hint often already matches ONZS dict
+        for k, v in ONZS_CATEGORIES.items():
+            if (v.get("name") or "").lower() == (municipality or "").lower():
+                category_id = k
+                onzs_name = v.get("name")
+                break
+
+    # Canonical profile
+    card: Dict = {
         "card_id": cid,
-        "channel": hit["channel"],
-        "post_id": hit["post_id"],
-        "timestamp": hit["timestamp"],
-        "text": hit["text"],
-        "keywords": hit["keywords"],
+
+        # legacy
+        "channel": hit.get("channel"),
+        "post_id": hit.get("post_id"),
+        "timestamp": hit.get("timestamp"),
+        "text": text_raw,
+        "keywords": keywords,
         "links": hit.get("links", []),
+
+        # canonical sections
+        "source": {
+            "channel": hit.get("channel"),
+            "post_id": hit.get("post_id"),
+            "published_ts": hit.get("timestamp"),
+            "credibility": "medium",
+        },
+        "text_profile": {
+            "raw": text_raw,
+            "keywords": keywords,
+            "signals": signals,
+        },
+        "geo": {
+            "address": address,
+            "municipality": municipality,
+            "coordinates": coords,
+            "cadastral_number": cad,
+            "geo_source": geo_info.get("geo_source") or ("yandex_geocoder" if (address or coords) else None),
+        },
+        "object": {
+            "type": obj_type,
+            "stage": stage,
+            "floors_estimated": None,
+            "area_estimated": None,
+        },
+        "legal": {
+            "assumed_violation": [],
+            "special_zone": [],
+        },
+        "onzs": {
+            "category_id": category_id,
+            "category_name": onzs_name,
+            "source": "geo-heuristic",
+        },
+        "ai": {
+            "probability": None,
+            "comment": None,
+            "risk_level_rule": base_level,
+            "risk_score_rule": base_score,
+            "risk_level": base_level,
+            "risk_score": base_score,
+            "recommendation": None,
+            "justification": None,
+            "model": "rules",
+            "confidence": None,
+        },
+        "workflow": {
+            "status": "in_review",
+            "priority": "high" if base_level == "high" else ("medium" if base_level == "medium" else "low"),
+            "history": [],
+        },
+
+        # keep old fields used elsewhere
+        "geo_info": geo_info,
         "status": "new",
         "history": [],
     }
-    card["onzs_trace"] = []
 
-    # Extract and enrich geo info
-    geo_info = extract_geo_info(card["text"])
-    card["geo_info"] = enrich_geo_info(geo_info)
-    # RGIS stage (trace): if you later enrich geo_info from RGIS, log it here
-    add_onzs_trace(card, "RGIS", {
-        "cadastral_number": (card.get("geo_info") or {}).get("cadastral_number"),
-        "address": (card.get("geo_info") or {}).get("address"),
-        "coordinates": (card.get("geo_info") or {}).get("coordinates"),
-        "rgis_municipality": (card.get("geo_info") or {}).get("rgis_municipality"),
-        "rgis_raw": (card.get("geo_info") or {}).get("rgis_raw")
-    })
-    # If cadastral number exists, query RGIS via Playwright and store raw result for AI/context
-    cad = (card.get("geo_info") or {}).get("cadastral_number")
-    if ENABLE_RGIS_LOOKUP and cad:
-        rg = rgis_fetch_planning_by_cadastre(str(cad))
-        if rg.get("rgis_ok"):
-            card["geo_info"]["rgis_raw"] = rg.get("rgis_raw_text")
-            if rg.get("rgis_municipality"):
-                card["geo_info"]["rgis_municipality"] = rg.get("rgis_municipality")
-            add_onzs_trace(card, "RGIS_SITE", {
-                "ok": True,
-                "municipality": rg.get("rgis_municipality"),
-                "snippet": (rg.get("rgis_raw_text") or "")[:280]
-            })
-        else:
-            add_onzs_trace(card, "RGIS_SITE", {
-                "ok": False,
-                "error": rg.get("rgis_error")
-            })
-
-    # New: Categorize if a location is mentioned
-    category_id = categorize_by_location(card["text"])
+    # keep top-level onzs fields (legacy)
     if category_id:
         card["onzs_category"] = category_id
         card["onzs_category_name"] = ONZS_CATEGORIES[category_id]["name"]
-        card["onzs_source"] = "эвристика"
-        card["onzs_confidence"] = 55.0
-        add_onzs_trace(card, "ЭВРИСТИКА", {
-            "onzs_category": card.get("onzs_category"),
-            "onzs_category_name": card.get("onzs_category_name"),
-            "confidence": card.get("onzs_confidence")
-        })
 
-    # RGIS hook (optional): if geo_info was enriched with rgis_municipality, try map to ONZS
-    if not card.get("onzs_category"):
-        rgis_mun = (card.get("geo_info") or {}).get("rgis_municipality")
-        if rgis_mun:
-            mun_low = str(rgis_mun).lower()
-            for cid, info in ONZS_CATEGORIES.items():
-                # match by official name part or stems
-                if info.get("name", "").lower() in mun_low or any(st in mun_low for st in info.get("stems", [])):
-                    card["onzs_category"] = cid
-                    card["onzs_category_name"] = info["name"]
-                    card["onzs_source"] = "RGIS"
-                    card["onzs_confidence"] = 85.0
-                    add_onzs_trace(card, "RGIS_MAP", {
-                        "rgis_municipality": rgis_mun,
-                        "onzs_category": cid,
-                        "onzs_category_name": info["name"],
-                        "confidence": card.get("onzs_confidence")
-                    })
-                    break
-
+    # AI enrichment (may update onzs + risk + probability)
     try:
         enrich_card_with_yagpt(card)
-        # If AI determined ONZS, it sets onzs_source='ИИ' and onzs_confidence.
-        # Ensure ONZS source is always present when ONZS exists.
-        if card.get('onzs_category') and not card.get('onzs_source'):
-            card['onzs_source'] = 'неизвестно'
-        add_onzs_trace(card, "ИТОГ", {
-            "onzs_category": card.get("onzs_category"),
-            "onzs_category_name": card.get("onzs_category_name"),
-            "source": card.get("onzs_source"),
-            "confidence": card.get("onzs_confidence"),
-            "probability": (card.get("ai") or {}).get("probability")
-        })
+        # sync canonical ONZS object from top-level if AI set them
+        if card.get("onzs_category"):
+            card["onzs"]["category_id"] = card.get("onzs_category")
+            card["onzs"]["category_name"] = card.get("onzs_category_name")
+            card["onzs"]["source"] = "ai+geo"
+        # sync ai model name
+        if card.get("ai") is not None:
+            card["ai"]["model"] = "yandexgpt"
     except Exception as e:
         log.error(f"enrich_card_with_yagpt error: {e}")
+
     save_card(card)
     return card
- 
+
 def send_card_to_group(card: Dict) -> Optional[int]: 
     thr = get_prob_threshold() 
     prob = None 
@@ -1754,7 +2187,7 @@ def apply_card_action(card_id: str, action: str, from_user: int) -> Tuple[str, b
         dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
         return (f"Уже обработано: {dec} (админ {by}, {dt})", False)
 
-    if action not in ("work", "wrong", "attach"):
+    if action not in ("work", "wrong"):
         return ("Неизвестное действие.", False)
 
     card = load_card(card_id)
@@ -1771,9 +2204,6 @@ def apply_card_action(card_id: str, action: str, from_user: int) -> Tuple[str, b
         return ("Выберите статус:", True)
     elif action == "wrong":
         new_status, label, msg = "wrong", "wrong", "Статус: НЕВЕРНО ❌"
-    else: # attach
-        new_status, label, msg = "bind", "attach", "Статус: ПРИВЯЗАТЬ 📎"
-
     card["status"] = new_status
     card.setdefault("history", []).append({"event": f"set_{new_status}", "from_user": int(from_user), "ts": now_ts()})
     save_card(card)
@@ -1795,9 +2225,7 @@ def build_kpi_text() -> str:
         return "📊 KPI: данных обучения пока нет." 
     total = sum(int(r[1]) for r in rows) 
     work = sum(int(r[2]) for r in rows) 
-    wrong = sum(int(r[3]) for r in rows) 
-    attach = sum(int(r[4]) for r in rows) 
-    acc = (work / total * 100.0) if total > 0 else 0.0 
+    wrong = sum(int(r[3]) for r in rows)    acc = (work / total * 100.0) if total > 0 else 0.0 
     last_day = rows[-1][0] 
     return ( 
         "📊 KPI (самострой-контроль)\n" 
@@ -1805,35 +2233,190 @@ def build_kpi_text() -> str:
         f"Всего решений: {total}\n" 
         f"В работу: {work}\n" 
         f"Неверно: {wrong}\n" 
-         
-        f"Доля полезных (в работу): {acc:.1f}%\n" 
+                f"Доля полезных (в работу+привязать): {acc:.1f}%\n" 
     ) 
  
+
+def _iter_cards_in_period(ts_from: int, ts_to: int) -> List[Dict]:
+    """Loads card JSONs from CARDS_DIR and returns those within [ts_from, ts_to]."""
+    out: List[Dict] = []
+    try:
+        for fn in os.listdir(CARDS_DIR):
+            if not fn.endswith(".json"):
+                continue
+            fp = os.path.join(CARDS_DIR, fn)
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    c = json.load(f)
+                ts = int(c.get("timestamp") or c.get("source", {}).get("published_ts") or 0)
+                if ts_from <= ts <= ts_to:
+                    out.append(c)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+def _period_bounds(days: int) -> Tuple[int, int, str]:
+    """UTC bounds for last N days (inclusive)."""
+    now = int(time.time())
+    ts_to = now
+    ts_from = now - int(days) * 86400
+    label = f"последние {days} дн."
+    return ts_from, ts_to, label
+
+def compute_analytics(cards: List[Dict]) -> Dict:
+    """
+    Computes analytics for leadership:
+    - totals
+    - by object type, stage
+    - by risk_level
+    - by onzs_category_name
+    """
+    def _get(obj, *path, default=None):
+        cur = obj
+        for p in path:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(p)
+        return cur if cur is not None else default
+
+    total = len(cards)
+
+    by_type = {}
+    by_stage = {}
+    by_risk = {"high": 0, "medium": 0, "low": 0, "unknown": 0}
+    by_onzs = {}
+
+    for c in cards:
+        obj_type = _get(c, "object", "type") or _get(c, "object", "type", default=None) or _get(c, "object", "type") or None
+        stage = _get(c, "object", "stage") or None
+        risk = (_get(c, "ai", "risk_level") or "").lower() or "unknown"
+        onzs = c.get("onzs_category_name") or _get(c, "onzs", "category_name") or "—"
+
+        by_type[obj_type or "—"] = by_type.get(obj_type or "—", 0) + 1
+        by_stage[stage or "—"] = by_stage.get(stage or "—", 0) + 1
+        if risk not in by_risk:
+            by_risk["unknown"] += 1
+        else:
+            by_risk[risk] += 1
+        by_onzs[onzs] = by_onzs.get(onzs, 0) + 1
+
+    # Sort dicts
+    by_type = dict(sorted(by_type.items(), key=lambda x: x[1], reverse=True))
+    by_stage = dict(sorted(by_stage.items(), key=lambda x: x[1], reverse=True))
+    by_onzs = dict(sorted(by_onzs.items(), key=lambda x: x[1], reverse=True))
+
+    return {
+        "total": total,
+        "by_type": by_type,
+        "by_stage": by_stage,
+        "by_risk": by_risk,
+        "by_onzs": by_onzs,
+    }
+
+def build_leadership_summary_text(days: int = 14) -> str:
+    ts_from, ts_to, label = _period_bounds(days)
+    cards = _iter_cards_in_period(ts_from, ts_to)
+    a = compute_analytics(cards)
+
+    # Pretty
+    def fmt_top(d: Dict, n: int = 5) -> str:
+        items = list(d.items())[:n]
+        if not items:
+            return "—"
+        return "\n".join([f"• {k}: {v}" for k, v in items])
+
+    return (
+        "🧾 Сводка по самострою (для руководства)\n"
+        f"Период: {label}\n\n"
+        f"Всего выявлено карточек: {a['total']}\n\n"
+        "🏗 По типу объекта:\n" + fmt_top(a["by_type"], 8) + "\n\n"
+        "🧱 По стадии:\n" + fmt_top(a["by_stage"], 8) + "\n\n"
+        "🚦 По уровню риска:\n"
+        f"• HIGH: {a['by_risk'].get('high',0)}\n"
+        f"• MEDIUM: {a['by_risk'].get('medium',0)}\n"
+        f"• LOW: {a['by_risk'].get('low',0)}\n"
+        f"• UNKNOWN: {a['by_risk'].get('unknown',0)}\n\n"
+        "🏛 Топ ОНзС:\n" + fmt_top(a["by_onzs"], 10)
+    )
+
+
+
 def build_report_xlsx() -> str:
+    """
+    Leadership-ready XLSX report:
+    - Summary
+    - KPI (training)
+    - Analytics (samostroy cards) for last REPORT_DAYS
+    - TrainingDaily + ChannelBias
+    - WorkReport_ONZS (status history)
+    """
+    report_days = int(os.getenv("REPORT_DAYS", "14") or 14)
     out_path = os.path.join(REPORTS_DIR, f"report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx")
     wb = Workbook()
-    ws = wb.active
-    ws.title = "KPI"
+
+    # === Summary sheet (leadership) ===
+    ws0 = wb.active
+    ws0.title = "Summary"
+    ws0.append(["Раздел", "Значение"])
+    summary_text = build_leadership_summary_text(days=report_days)
+    for ln in summary_text.splitlines():
+        if not ln.strip():
+            continue
+        if ":" in ln and not ln.strip().startswith("http"):
+            k, v = ln.split(":", 1)
+            ws0.append([k.strip("• ").strip(), v.strip()])
+        else:
+            ws0.append([ln.strip(), ""])
+
+    # === KPI sheet (training) ===
+    ws = wb.create_sheet("KPI_Training")
     ws.append(["Показатель", "Значение"])
     for line in build_kpi_text().splitlines()[1:]:
         if ":" in line:
             k, v = line.split(":", 1)
             ws.append([k.strip(), v.strip()])
 
+    # === Analytics sheets (cards) ===
+    ts_from, ts_to, label = _period_bounds(report_days)
+    cards = _iter_cards_in_period(ts_from, ts_to)
+    a = compute_analytics(cards)
+
+    wsA = wb.create_sheet("Analytics_Cards")
+    wsA.append(["Период", label])
+    wsA.append(["Всего карточек", a["total"]])
+    wsA.append([])
+    wsA.append(["Срез", "Значение", "Кол-во"])
+
+    for k, v in a["by_type"].items():
+        wsA.append(["Тип объекта", k, v])
+    wsA.append([])
+    for k, v in a["by_stage"].items():
+        wsA.append(["Стадия", k, v])
+    wsA.append([])
+    for k, v in a["by_risk"].items():
+        wsA.append(["Риск", k, v])
+    wsA.append([])
+    for k, v in a["by_onzs"].items():
+        wsA.append(["ОНзС", k, v])
+
+    # === TrainingDaily ===
     ws2 = wb.create_sheet("TrainingDaily")
     ws2.append(["day", "total", "work", "wrong", "attach"])
     for r in _fetch_train_daily_last(90):
         ws2.append(list(r))
 
+    # === ChannelBias ===
     ws3 = wb.create_sheet("ChannelBias")
     ws3.append(["channel", "bias_points"])
     w = _get_model_param("weights", {"channels": {}})
     for ch, b in sorted((w.get("channels") or {}).items(), key=lambda x: x[0]):
         ws3.append([ch, b])
 
-    # New sheet for work report
+    # === WorkReport_ONZS ===
     ws4 = wb.create_sheet("WorkReport_ONZS")
-    headers = ["Card ID", "Channel", "Post ID", "Timestamp", "Category", "Status", "Comment", "Last Updated By", "Last Updated Ts"]
+    headers = ["Card ID", "Channel", "Post ID", "Timestamp", "Category", "Final Status", "Comment", "Last Updated By", "Last Updated Ts"]
     ws4.append(headers)
 
     conn = db()
@@ -1856,31 +2439,46 @@ def build_report_xlsx() -> str:
         if card_data:
             channel = card_data.get("channel", "")
             post_id = card_data.get("post_id", "")
-            timestamp = datetime.fromtimestamp(card_data.get("timestamp", 0)).strftime("%Y-%m-%d %H:%M:%S")
-            category_name = ONZS_CATEGORIES.get(onzs_category, {}).get("name", "N/A") if onzs_category else "N/A"
-            updated_ts_str = datetime.fromtimestamp(updated_ts).strftime("%Y-%m-%d %H:%M:%S")
+            timestamp = datetime.fromtimestamp(int(card_data.get("timestamp", 0) or 0)).strftime("%Y-%m-%d %H:%M:%S")
+            category_name = ONZS_CATEGORIES.get(onzs_category, {}).get("name", "N/A") if onzs_category else (card_data.get("onzs_category_name") or "N/A")
+            updated_ts_str = datetime.fromtimestamp(int(updated_ts or 0)).strftime("%Y-%m-%d %H:%M:%S")
             ws4.append([card_id, channel, post_id, timestamp, category_name, status, comment, updated_by, updated_ts_str])
 
-    for wsx in [ws, ws2, ws3, ws4]:
+    # Formatting: basic widths
+    for wsx in [ws0, ws, wsA, ws2, ws3, ws4]:
         for col in range(1, wsx.max_column + 1):
-            wsx.column_dimensions[get_column_letter(col)].width = 28
+            wsx.column_dimensions[get_column_letter(col)].width = 32
 
     wb.save(out_path)
     return out_path
- 
-def build_report_pdf() -> str: 
-    out_path = os.path.join(REPORTS_DIR, f"report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf") 
-    c = canvas.Canvas(out_path, pagesize=A4) 
-    width, height = A4 
-    text = c.beginText(40, height - 60) 
-    text.setFont("Helvetica", 12) 
-    for line in build_kpi_text().splitlines(): 
-        text.textLine(line) 
-    c.drawText(text) 
-    c.showPage() 
-    c.save() 
-    return out_path 
- 
+
+
+def build_report_pdf() -> str:
+    report_days = int(os.getenv("REPORT_DAYS", "14") or 14)
+    out_path = os.path.join(REPORTS_DIR, f"report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf")
+    c = canvas.Canvas(out_path, pagesize=A4)
+    width, height = A4
+
+    text = c.beginText(40, height - 60)
+    text.setFont("Helvetica", 11)
+
+    # Leadership summary
+    for line in build_leadership_summary_text(days=report_days).splitlines():
+        text.textLine(line)
+
+    text.textLine("")
+    text.textLine("—" * 60)
+    text.textLine("")
+
+    # Training KPI
+    for line in build_kpi_text().splitlines():
+        text.textLine(line)
+
+    c.drawText(text)
+    c.showPage()
+    c.save()
+    return out_path
+
 def build_trainplot_png(days: int = 60) -> str: 
     out_path = os.path.join(REPORTS_DIR, f"trainplot_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.png") 
     rows = _fetch_train_daily_last(days) 
@@ -1894,14 +2492,10 @@ def build_trainplot_png(days: int = 60) -> str:
     days_list = [r[0] for r in rows] 
     total = [int(r[1]) for r in rows] 
     work = [int(r[2]) for r in rows] 
-    wrong = [int(r[3]) for r in rows] 
-    attach = [int(r[4]) for r in rows] 
- 
-    plt.plot(days_list, total, label="total") 
+    wrong = [int(r[3]) for r in rows]    plt.plot(days_list, total, label="total") 
     plt.plot(days_list, work, label="work") 
     plt.plot(days_list, wrong, label="wrong") 
-    plt.plot(days_list, attach, label="work") 
-    plt.xticks(rotation=45, ha="right") 
+plt.xticks(rotation=45, ha="right") 
     plt.legend() 
     plt.tight_layout() 
     plt.savefig(out_path, dpi=150, bbox_inches="tight") 
@@ -1963,6 +2557,13 @@ def handle_callback_query(upd: Dict):
             answer_callback(cb_id, "Только администраторы могут менять статус.", show_alert=True)
             return
         _, card_id, action = data.split(":", 2)
+
+        # Backward compatibility: old messages may still have "attach" button
+        if action == "attach":
+            if chat_id and message_id:
+                edit_reply_markup(chat_id, message_id, reply_markup=None)
+            answer_callback(cb_id, "Кнопка «Привязать» отключена. Используйте «В работу» или «Неверно».", show_alert=True)
+            return
         card = load_card(card_id)
 
         if not card:
@@ -1990,32 +2591,24 @@ def handle_callback_query(upd: Dict):
             answer_callback(cb_id, "Карточка не найдена.", show_alert=True)
             return
 
+        # Persist final status (this is the "end" of the workflow for label=work)
         conn = db()
         conn.execute(
             "INSERT OR REPLACE INTO card_status (card_id, onzs_category, status, last_updated_ts, last_updated_by) VALUES (?, ?, ?, ?, ?)",
-            (card_id, card.get("onzs_category"), status, now_ts(), from_user)
+            (card_id, int(card.get("onzs_category") or 0) or None, status, now_ts(), from_user)
         )
         conn.close()
 
-        # Finalize "work" training only after selecting the concrete status (Variant A option 3)
+        # Update card file and write training event at FINAL status selection
         try:
             old_status = card.get("status", "new")
             card["status"] = "work"
-            card.setdefault("history", []).append({"event": "final_status_selected", "status": status, "from_user": int(from_user), "ts": now_ts()})
+            card.setdefault("history", []).append({"event": "final_status_selected", "final_status": status, "from_user": int(from_user), "ts": now_ts()})
             save_card(card)
-
-            append_history({
-                "event": "final_status_selected",
-                "card_id": card_id,
-                "from_user": int(from_user),
-                "old_status": old_status,
-                "new_status": "work",
-                "status_code": status,
-            })
-
+            append_history({"event": "final_status_selected", "card_id": card_id, "from_user": int(from_user), "old_status": old_status, "final_status": status})
             log_training_event(card_id, "work", card.get("text", ""), card.get("channel", ""), admin_id=int(from_user))
         except Exception as e:
-            log.error(f"finalize work status failed: {e}")
+            log.error(f"final status handling error: {e}")
 
         edit_reply_markup(chat_id, message_id, reply_markup=build_comment_keyboard(card_id))
         answer_callback(cb_id, f"Статус '{status}' установлен.", show_alert=False)
@@ -2026,6 +2619,13 @@ def handle_callback_query(upd: Dict):
             answer_callback(cb_id, "Только администраторы могут менять статус.", show_alert=True)
             return
         _, card_id, action = data.split(":", 2)
+
+        # Backward compatibility: old messages may still have "attach" button
+        if action == "attach":
+            if chat_id and message_id:
+                edit_reply_markup(chat_id, message_id, reply_markup=None)
+            answer_callback(cb_id, "Кнопка «Привязать» отключена. Используйте «В работу» или «Неверно».", show_alert=True)
+            return
         if action == "add":
             ADMIN_STATE[from_user] = f"await_comment:{card_id}"
             send_message(chat_id, "Пожалуйста, введите комментарий для карточки.")
@@ -2295,23 +2895,27 @@ def poll_updates_loop():
  
             if not data.get("ok"):
                 if data.get("error_code") == 409:
-                    log.error("getUpdates conflict (409). Another instance is running.")
-                    global LAST_CONFLICT_ALERT_TS
-                    if now_ts() - LAST_CONFLICT_ALERT_TS > 3600: # 1 hour cooldown
-                        alert_msg = (
-                            "🚨 ВНИМАНИЕ: ОБНАРУЖЕН КОНФЛИКТ ЭКЗЕМПЛЯРОВ БОТА (ОШИБКА 409)\n\n"
-                            "Другой процесс или сервер уже использует этот токен Telegram, что мешает обработке обновлений.\n\n"
-                            "• **Причина:** Запущено несколько копий бота с одним и тем же BOT_TOKEN.\n"
-                            "• **Решение:** Остановите все лишние экземпляры. Убедитесь, что бот запущен только на одном сервере."
-                        )
-                        recipients = list(set(list_users_by_role('admin') + list_users_by_role('leadership')))
-                        for uid in recipients:
-                            try:
-                                send_message(uid, alert_msg)
-                            except Exception: pass
-                        LAST_CONFLICT_ALERT_TS = now_ts()
-                    time.sleep(60)
-                    continue
+    log.error("getUpdates conflict (409). Another instance is running.")
+    global LAST_CONFLICT_ALERT_TS
+    # Send at most once per hour, then exit to avoid duplicate instances spamming Telegram.
+    if now_ts() - LAST_CONFLICT_ALERT_TS > 3600:
+        alert_msg = (
+            "🚨 ВНИМАНИЕ: ОБНАРУЖЕН КОНФЛИКТ ЭКЗЕМПЛЯРОВ БОТА (ОШИБКА 409)\n\n"
+            "Другой процесс/сервер уже использует этот токен Telegram, что мешает обработке обновлений.\n\n"
+            "Причина: запущено несколько копий бота с одним и тем же BOT_TOKEN или включён webhook.\n"
+            "Решение: оставьте только ОДИН сервис/контейнер; отключите webhook (deleteWebhook).\n\n"
+            "Этот экземпляр сейчас завершится, чтобы не мешать рабочему."
+        )
+        recipients = list(set(list_users_by_role("admin") + list_users_by_role("leadership")))
+        for uid in recipients:
+            try:
+                send_message(uid, alert_msg)
+            except Exception:
+                pass
+        LAST_CONFLICT_ALERT_TS = now_ts()
+    # Exit so that the "winning" instance can continue serving updates.
+    raise SystemExit(0)
+
                 log.error(f"getUpdates error: {data}")
                 time.sleep(3); continue
  
