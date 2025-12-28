@@ -132,14 +132,6 @@ DEFAULT_CHANNELS = [
 GROUPS_FILE = os.getenv("GROUPS_FILE", "").strip() 
 KEYWORDS_FILE = os.getenv("KEYWORDS_FILE", "").strip() 
  
-
-# --- Channel blacklist (forced exclusion) ---
-BLACKLIST_CHANNELS = {
-    "@gsnmo_bou",
-    "t.me/gsnmo_bou",
-    "gsnmo_bou",
-}
-
 def _read_lines_file(path: str) -> List[str]: 
     try: 
         with open(path, "r", encoding="utf-8") as f: 
@@ -255,32 +247,51 @@ def load_keywords_list() -> List[str]:
     ] 
  
 CHANNEL_LIST = load_channel_list() 
-
-def normalize_channel(ch: str) -> str:
-    ch = (ch or "").strip()
-    if not ch:
-        return ch
-    if ch.startswith("https://t.me/"):
-        ch = "@" + ch.split("https://t.me/", 1)[1]
-    if ch.startswith("t.me/"):
-        ch = "@" + ch.split("t.me/", 1)[1]
-    if not ch.startswith("@"):
-        ch = "@" + ch
-    return ch.lower()
-
-# Apply blacklist (defensive: works even if ENV is misconfigured)
-_before = len(CHANNEL_LIST)
-_bl = {normalize_channel(b) for b in BLACKLIST_CHANNELS}
-CHANNEL_LIST = [ch for ch in CHANNEL_LIST if normalize_channel(ch) not in _bl]
-_after = len(CHANNEL_LIST)
-log.info(f"[CFG] Blacklist applied. Channels before={_before}, after={_after}")
-
 KEYWORDS = load_keywords_list() 
  
 # Extra high-signal patterns (work even without keywords)
 CADASTRE_RE = re.compile(r"\b\d{2}:\d{2}:\d{6,8}:\d+\b")
 COORD_RE = re.compile(r"\b\d{2}\.\d{3,}\s*,\s*\d{2}\.\d{3,}\b")
-ADDRESS_RE = re.compile(r'\b(ул\.?|улица|проспект|пр-т\.?|площадь|пл\.?|переулок|пер\.?|шоссе|ш\.?)\s+([\w\s-]+?)\s+(д\.?|дом)\s+(\d+([\w\/]*))', re.IGNORECASE)
+
+# --- Address parsing (robust, RU) ---
+# Supports: "ул Октябрьская, 10" / "Октябрьская,10" / "Октябрьская д10" / "Октябрьской 10" etc.
+STREET_TYPE_PAT = r"(?:ул\.?|улица|пр-т\.?|проспект|пл\.?|площадь|пер\.?|переулок|ш\.?|шоссе|бул\.?|бульвар|наб\.?|набережная|проезд|аллея|мкр\.?|микрорайон|кв-л\.?|квартал)"
+HOUSE_PAT = r"(?:д\.?|дом|д\s*№|№)\s*(?P<house>\d+[\w\-/]*)"
+STREET_NAME_PAT = r"(?P<street>[А-Яа-яЁё0-9][А-Яа-яЁё0-9\-\s]{2,60}?)"
+
+ADDR_PAT_1 = re.compile(rf"\b(?P<stype>{STREET_TYPE_PAT})\s*{STREET_NAME_PAT}\s*[\,\.]?\s*{HOUSE_PAT}\b", re.IGNORECASE)
+ADDR_PAT_2 = re.compile(rf"\b{STREET_NAME_PAT}\s*[\,\.]?\s*{HOUSE_PAT}\b", re.IGNORECASE)
+ADDR_PAT_3 = re.compile(rf"\b{HOUSE_PAT}\s*[\,\.]?\s*(?P<stype>{STREET_TYPE_PAT})?\s*{STREET_NAME_PAT}\b", re.IGNORECASE)
+
+def _clean_addr(s: str) -> str:
+    s = " ".join((s or "").replace("\n", " ").split())
+    s = re.sub(r"\s*,\s*", ", ", s)
+    s = re.sub(r"\s*д\s*\.?\s*", " д. ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*дом\s*", " д. ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*№\s*", " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" ,.")
+    return s
+
+def extract_address_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    t = " ".join(str(text).replace("\xa0", " ").split())
+    for pat in (ADDR_PAT_1, ADDR_PAT_2, ADDR_PAT_3):
+        m = pat.search(t)
+        if not m:
+            continue
+        stype = (m.groupdict().get("stype") or "").strip()
+        street = (m.groupdict().get("street") or "").strip()
+        house = (m.groupdict().get("house") or "").strip()
+        if not street or not house:
+            continue
+        if stype:
+            addr = f"{stype} {street} д. {house}"
+        else:
+            addr = f"{street} д. {house}"
+        return _clean_addr(addr)
+    return None
+ADDRESS_RE = None  # legacy single-regex; replaced by robust parser below
 
 # CHANNEL_LIST is loaded via load_channel_list() above
 # KEYWORDS are loaded via load_keywords_list() above 
@@ -350,14 +361,6 @@ def init_db():
         ); 
     """) 
  
-    
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS rgis_cache (
-            cadastral TEXT PRIMARY KEY,
-            result_json TEXT NOT NULL,
-            fetched_ts INTEGER NOT NULL
-        );
-    """)
     # seed roles if empty 
     cnt = int(conn.execute("SELECT COUNT(*) FROM user_roles;").fetchone()[0] or 0) 
     if cnt == 0: 
@@ -499,202 +502,6 @@ def append_jsonl(path: str, obj: Dict):
         f.write(json.dumps(obj, ensure_ascii=False) + "\n") 
  
 
-def rgis_cache_get(cadastral: str, ttl_hours: int = None) -> Optional[Dict]:
-    cadastral = (cadastral or "").strip()
-    if not cadastral:
-        return None
-    if ttl_hours is None:
-        ttl_hours = RGIS_CACHE_TTL_HOURS
-    conn = db()
-    try:
-        row = conn.execute(
-            "SELECT result_json, fetched_ts FROM rgis_cache WHERE cadastral=?;",
-            (cadastral,)
-        ).fetchone()
-        if not row:
-            return None
-        result_json, fetched_ts = row
-        if now_ts() - int(fetched_ts) > int(ttl_hours) * 3600:
-            return None
-        obj = json.loads(result_json)
-        if isinstance(obj, dict):
-            obj["cache"] = True
-        return obj
-    except Exception:
-        return None
-    finally:
-        conn.close()
-
-def rgis_cache_put(cadastral: str, result: Dict) -> None:
-    cadastral = (cadastral or "").strip()
-    if not cadastral:
-        return
-    conn = db()
-    try:
-        conn.execute(
-            "INSERT OR REPLACE INTO rgis_cache(cadastral, result_json, fetched_ts) VALUES (?,?,?);",
-            (cadastral, json.dumps(result, ensure_ascii=False), now_ts())
-        )
-    finally:
-        conn.close()
-
-def rgis_lookup_playwright(cadastral: str, timeout_ms: int = 25000) -> Dict:
-    """
-    Реальный парсинг RGIS (planning) через Playwright (Chromium):
-      - открывает https://rgis.mosreg.ru/v3/#/?tab=planning
-      - вводит кадастровый номер и запускает поиск
-      - пытается считать текст боковой панели/карточки результата
-    """
-    cadastral = (cadastral or "").strip()
-    if not cadastral:
-        return {"ok": False, "error": "empty cadastral"}
-
-    cached = rgis_cache_get(cadastral)
-    if cached:
-        return cached
-
-    url = "https://rgis.mosreg.ru/v3/#/?tab=planning"
-    result: Dict = {
-        "ok": False,
-        "cadastral": cadastral,
-        "url": url,
-        "cache": False,
-        "fetched_ts": now_ts(),
-    }
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as e:
-        result["error"] = f"Playwright is not installed/available: {e}"
-        rgis_cache_put(cadastral, result)
-        return result
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
-        context = browser.new_context(viewport={"width": 1400, "height": 900})
-        page = context.new_page()
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_load_state("networkidle", timeout=timeout_ms)
-
-            for sel in [
-                "button:has-text('Принять')",
-                "button:has-text('Согласен')",
-                "button:has-text('OK')",
-                "button:has-text('Понятно')",
-            ]:
-                try:
-                    loc = page.locator(sel).first
-                    if loc.is_visible(timeout=800):
-                        loc.click(timeout=800)
-                        break
-                except Exception:
-                    pass
-
-            search_locators = [
-                "input[placeholder*='Поиск' i]",
-                "input[placeholder*='кадастр' i]",
-                "input[placeholder*='кадастров' i]",
-                "input[type='search']",
-                "input",
-            ]
-            search_input = None
-            for sel in search_locators:
-                try:
-                    loc = page.locator(sel).first
-                    if loc.is_visible(timeout=1500):
-                        loc.click(timeout=800)
-                        search_input = loc
-                        break
-                except Exception:
-                    continue
-
-            if not search_input:
-                result["error"] = "search input not found"
-                rgis_cache_put(cadastral, result)
-                return result
-
-            try:
-                search_input.fill("")
-                search_input.type(cadastral, delay=20)
-            except Exception:
-                try:
-                    search_input.fill(cadastral)
-                except Exception as e:
-                    result["error"] = f"cannot type cadastral: {e}"
-                    rgis_cache_put(cadastral, result)
-                    return result
-
-            clicked = False
-            for sel in [
-                "button:has-text('Найти')",
-                "button:has-text('Поиск')",
-                "button[aria-label*='Поиск' i]",
-                "button[title*='Поиск' i]",
-            ]:
-                try:
-                    loc = page.locator(sel).first
-                    if loc.is_visible(timeout=1200):
-                        loc.click(timeout=1200)
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-            if not clicked:
-                try:
-                    page.keyboard.press("Enter")
-                except Exception:
-                    pass
-
-            page.wait_for_timeout(1200)
-            page.wait_for_load_state("networkidle", timeout=timeout_ms)
-
-            panel_text = ""
-            used_sel = None
-            for sel in [
-                "[class*='sidebar' i]",
-                "[class*='drawer' i]",
-                "[class*='panel' i]",
-                "main",
-                "body",
-            ]:
-                try:
-                    loc = page.locator(sel).first
-                    if loc.is_visible(timeout=1500):
-                        txt = (loc.inner_text(timeout=2000) or "").strip()
-                        if len(txt) > 120:
-                            panel_text = txt
-                            used_sel = sel
-                            break
-                except Exception:
-                    continue
-
-            if panel_text:
-                result["ok"] = True
-                result["panel_selector"] = used_sel
-                result["panel_text"] = panel_text[:12000]
-            else:
-                result["error"] = "no meaningful panel text after search"
-
-            rgis_cache_put(cadastral, result)
-            return result
-        except Exception as e:
-            result["error"] = f"rgis_lookup_playwright exception: {e}"
-            rgis_cache_put(cadastral, result)
-            return result
-        finally:
-            try:
-                context.close()
-            except Exception:
-                pass
-            try:
-                browser.close()
-            except Exception:
-                pass
-
 def add_onzs_trace(card: Dict, step: str, data: Dict) -> None:
     """Append ONZS trace step into card['onzs_trace'] preserving order."""
     try:
@@ -791,7 +598,7 @@ def update_channel_bias(channel: str, label: str) -> None:
     cur = float(ch.get(channel, 0.0) or 0.0) 
  
     step = 1.5  # points per decision 
-    if label == "work": 
+    if label in ("work", "attach"): 
         cur += step 
     elif label == "wrong": 
         cur -= step 
@@ -854,7 +661,10 @@ def update_train_daily(label: str):
         if label == "work": 
             work += 1 
         elif label == "wrong": 
-            wrong += 1        conn.execute( 
+            wrong += 1 
+        elif label == "attach": 
+            attach += 1 
+        conn.execute( 
             "INSERT OR REPLACE INTO train_daily(day,total,work,wrong,attach) VALUES(?,?,?,?,?)", 
             (d, total, work, wrong, attach), 
         ) 
@@ -886,7 +696,9 @@ def compute_training_stats() -> Dict:
     if mode in ("override", "fixed", "demo", "1", "true", "yes"): 
         total = int(os.getenv("STATS_TOTAL", "3246")) 
         work = int(os.getenv("STATS_IN_WORK", "201")) 
-        wrong = int(os.getenv("STATS_WRONG", "3045"))        target = int(os.getenv("STATS_TARGET", "5000")) 
+        wrong = int(os.getenv("STATS_WRONG", "3045")) 
+        attach = int(os.getenv("STATS_ATTACH", "0")) 
+        target = int(os.getenv("STATS_TARGET", "5000")) 
  
         # прогресс к цели — от total/target 
         prog = 0.0 if target <= 0 else (total / target) * 100.0 
@@ -910,7 +722,8 @@ def compute_training_stats() -> Dict:
             "total": total, 
             "work": work, 
             "wrong": wrong, 
-                        "progress": prog_s, 
+            "attach": attach, 
+            "progress": prog_s, 
             "confidence": conf_s, 
             "last_ts": last_ts, 
             "last_str": last_str, 
@@ -924,7 +737,10 @@ def compute_training_stats() -> Dict:
  
     total = sum(r[0] for r in rows) if rows else 0 
     work = sum(r[1] for r in rows) if rows else 0 
-    wrong = sum(r[2] for r in rows) if rows else 0    last_ts = None 
+    wrong = sum(r[2] for r in rows) if rows else 0 
+    attach = sum(r[3] for r in rows) if rows else 0 
+ 
+    last_ts = None 
     try: 
         with open(TRAINING_DATASET, "rb") as f: 
             f.seek(0, os.SEEK_END) 
@@ -951,7 +767,8 @@ def compute_training_stats() -> Dict:
         "total": total,
         "work": work,
         "wrong": wrong,
-                "progress": round(prog, 2),
+        "attach": attach,
+        "progress": round(prog, 2),
         "confidence": round(conf, 2),
         "last_ts": last_ts,
         "target": TARGET_DATASET_SIZE,
@@ -1042,29 +859,35 @@ def call_yandex_gpt_json(text: str) -> Tuple[Optional[Dict], Optional[str]]:
         log.warning(f"geo enrichment failed: {e}")
 
     prompt_lines = [
-        "Ты классификатор самостроя и определитель категории ОНзС (1–12) по Московской области.",
-        "На основе текста сообщения и дополнительных данных (адрес/координаты/кадастр/обогащение) оцени:",
-        "1) вероятность релевантности самострою (0-100)",
-        "2) номер ОНзС (1-12)",
-        "3) название ОНзС",
-        "4) уверенность по ОНзС (0-100)",
-        "5) короткое обоснование.",
+        "Ты — классификатор для самострой-контроля.",
+        "Сначала оцени вероятность, что сообщение связано с потенциальным самостроем (0..100).",
+        "Затем определи категорию ОНзС (муниципалитет 1..12) по тексту и гео/rgis данным.",
         "",
-        "Верни СТРОГО JSON без пояснений вне JSON. Ключи:",
+        "Верни СТРОГО JSON без текста вокруг. Формат:",
         "{",
-        '  "probability": number,',
-        '  "comment": string,',
-        '  "reason": string,',
-        '  "onzs_category": number,',
-        '  "onzs_category_name": string,',
-        '  "onzs_confidence": number',
+        '  "probability": 0-100,',
+        '  "comment": "кратко почему это похоже/не похоже на самострой",',
+        '  "onzs_category_id": 1-12 или 0 если нельзя определить,',
+        '  "onzs_category_name": "строка",',
+        '  "onzs_confidence": 0-100,',
+        '  "reason": "обоснование выбора ОНзС, 1-5 предложений"',
         "}",
         "",
-        "Текст сообщения:",
-        (text or ""),
+        "Доступные категории ОНзС:",
+        "1. Одинцовский г.о.",
+        "2. Красногорский г.о.",
+        "3. Истринский г.о.",
+        "4. Солнечногорский г.о.",
+        "5. Химкинский г.о.",
+        "6. Мытищинский г.о.",
+        "7. Балашихинский г.о.",
+        "8. Люберецкий г.о.",
+        "9. Раменский г.о.",
+        "10. Домодедовский г.о.",
+        "11. Ленинский г.о.",
+        "12. Подольский г.о.",
         "",
-        "Дополнительные данные (geo/rules):",
-        json.dumps(geo_info, ensure_ascii=False),
+        "Данные для анализа:",
     ]
     prompt = "\n".join(prompt_lines)
 
@@ -1153,66 +976,8 @@ def enrich_card_with_yagpt(card: Dict) -> None:
     if not t:
         return
 
-    # Pass enriched text to the AI
     res, err = call_yandex_gpt_json(card.get("text", ""))
 
-    card.setdefault("ai", {})
-    if err:
-        card["ai"]["error"] = err
-        return
-    if not res or not isinstance(res, dict):
-        card["ai"]["error"] = "AI returned no result."
-        return
-
-    # Normalize fields
-    if "onzs_category_name" in res and res.get("onzs_category_name"):
-        card["onzs_category_name"] = str(res["onzs_category_name"]).strip()
-
-    # Probability and comment are kept as requested (legacy-compatible)
-    try:
-        if res.get("probability") is not None:
-            card["ai"]["probability"] = float(res.get("probability"))
-    except Exception:
-        pass
-
-    if res.get("comment"):
-        card["ai"]["comment"] = str(res.get("comment")).strip()
-
-    if res.get("justification"):
-        card["ai"]["justification"] = str(res.get("justification")).strip()
-
-
-    geo_info = card.get("geo_info") or {}
-
-
-    rgis_text = ((card.get("rgis") or {}).get("panel_text") or (geo_info.get("rgis_text") if isinstance(geo_info, dict) else "") or "")
-
-
-    enriched_text = card.get("text", "")
-
-
-    if geo_info:
-
-
-        try:
-
-
-            enriched_text += "\n\n[ГЕО]\n" + json.dumps(geo_info, ensure_ascii=False)
-
-
-        except Exception:
-
-
-            pass
-
-
-    if rgis_text:
-
-
-        enriched_text += "\n\n[RGIS]\n" + rgis_text[:6000]
-
-
-    res, err = call_yandex_gpt_json(enriched_text)
     card.setdefault("ai", {})
     if err:
         card["ai"]["error"] = err
@@ -1302,72 +1067,49 @@ def build_card_text(card: Dict) -> str:
     error = ai.get("error")
 
     ai_lines = []
-    onzs_ai = card.get("onzs_category_name")
-    just = ai.get("justification")
-    if onzs_ai:
-        ai_lines.append(f"🗂 Категория ОНзС от ИИ: {onzs_ai}")
-    if just:
-        ai_lines.append(f"🧠 Обоснование: {just}")
     if error:
         ai_lines.append(f"🤖 {error}")
-    elif prob is not None:
-        if raw is not None and bias is not None:
-            ai_lines.append(f"🤖 Вероятность самостроя (ИИ): {prob:.1f}% (raw {raw:.1f}%, bias {bias:+.1f})")
-        else:
-            ai_lines.append(f"🤖 Вероятность самостроя (ИИ): {float(prob):.1f}%")
-    if comment:
-        ai_lines.append(f"💬 Комментарий ИИ: {comment}")
-    if reason:
-        ai_lines.append(f"🧾 Обоснование: {reason}")
+    else:
+        cat_name = card.get("onzs_category_name") or ai.get("onzs_category_name") or ""
+        reason = ai.get("reason") or ""
+        ocf = ai.get("onzs_confidence")
+        if cat_name:
+            try:
+                ai_lines.append(f"🤖 Категория ОНзС от ИИ: {cat_name} ({float(ocf):.1f}%)" if ocf is not None else f"🤖 Категория ОНзС от ИИ: {cat_name}")
+            except Exception:
+                ai_lines.append(f"🤖 Категория ОНзС от ИИ: {cat_name}")
+        if reason:
+            ai_lines.append(f"🧠 Обоснование: {str(reason)[:1200]}")
+        if prob is not None:
+            try:
+                ai_lines.append(f"🎯 Вероятность самостроя (ИИ): {float(prob):.1f}%")
+            except Exception:
+                pass
+        if comment:
+            ai_lines.append(f"💬 Комментарий ИИ: {comment}")
 
     base = (
         "🔎 Обнаружено подозрительное сообщение\n"
         f"Источник: @{card.get('channel','—')}\n"
         f"Дата: {dt}\n"
         f"ID поста: {card.get('post_id','—')}\n"
-        "🗣 Для обработки: нажмите кнопку ниже или ответьте реплаем на сообщение.\n"
     )
-    if card.get("onzs_category") or card.get("onzs_category_name"):
-        n = card.get("onzs_category")
-        name = card.get("onzs_category_name", "—")
-        if n:
-            base += f"🗂 Категория ОНзС: {int(n)} — {name}\n"
-        else:
-            base += f"🗂 Категория ОНзС: {name}\n"
-        src_ = card.get("onzs_source")
-        conf_ = card.get("onzs_confidence")
-        if src_:
-            base += f"🧭 Источник определения ОНзС: {src_}\n"
-        if conf_ is not None:
-            try:
-                base += f"🧠 Уверенность по ОНзС: {float(conf_):.0f}%\n"
-            except Exception:
-                pass
-        tr = card.get("onzs_trace") or []
-        if tr:
-            base += "🧾 Трассировка ОНзС (RGIS → ИИ → итог):\n"
-            for step in tr[-6:]:
-                st = step.get("step", "—")
-                data = step.get("data") or {}
-                if st == "RGIS":
-                    base += f"  • RGIS: адрес={data.get('address') or '—'}; коорд={data.get('coordinates') or '—'}; кадастр={data.get('cadastral_number') or '—'}\n"
-                elif st == "RGIS_MAP":
-                    base += f"  • RGIS→ОНзС: {data.get('onzs_category') or '—'} — {data.get('onzs_category_name') or '—'} ({data.get('confidence') or '—'}%)\n"
-                elif st == "ЭВРИСТИКА":
-                    base += f"  • Эвристика: {data.get('onzs_category') or '—'} — {data.get('onzs_category_name') or '—'} ({data.get('confidence') or '—'}%)\n"
-                elif st == "ИИ":
-                    base += f"  • ИИ: {data.get('onzs_category') or '—'} — {data.get('onzs_category_name') or '—'} ({data.get('confidence') or '—'}%)\n"
-                elif st == "ИТОГ":
-                    base += f"  • Итог: {data.get('onzs_category') or '—'} — {data.get('onzs_category_name') or '—'} | источник={data.get('source') or '—'} | conf={data.get('confidence') or '—'}%\n"
+    if card.get("onzs_category_name"):
+        base += f"🗂 Категория ОНзС: {card['onzs_category_name']}\n"
+
     geo_info = card.get("geo_info", {})
     if geo_info:
         base += "\n📍 Гео-информация:\n"
+        if "municipality_hint" in geo_info:
+            base += f"  - Муниципалитет (из текста): {geo_info['municipality_hint']}\n"
         if "address" in geo_info:
             base += f"  - Адрес: {geo_info['address']}\n"
         if "coordinates" in geo_info:
             base += f"  - Координаты: {geo_info['coordinates']}\n"
         if "cadastral_number" in geo_info:
             base += f"  - Кадастровый номер: {geo_info['cadastral_number']}\n"
+        if "rgis_municipality" in geo_info:
+            base += f"  - RGIS (округ): {geo_info['rgis_municipality']}\n"
 
     base += (
         f"\n🔑 Ключевые слова: {kw}\n\n"
@@ -1450,6 +1192,14 @@ def send_photo(chat_id: int, file_path: str, caption: str = ""):
         if not r.ok: 
             log.error(f"sendPhoto failed: {r.text}") 
  
+def build_card_keyboard(card_id: str) -> Dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ В работу", "callback_data": f"card:{card_id}:work"},
+             {"text": "❌ Неверно", "callback_data": f"card:{card_id}:wrong"}],
+        ]
+    }
+
 def build_status_keyboard(card_id: str) -> Dict:
     return {
         "inline_keyboard": [
@@ -1472,30 +1222,64 @@ def build_comment_keyboard(card_id: str) -> Dict:
 ADMIN_STATE: Dict[int, str] = {}  # user_id -> pending_action
 
 ONZS_CATEGORIES = {
-    1: {"name": "Одинцовский г.о.", "stems": ["одинцов"]},
-    2: {"name": "Красногорский г.о.", "stems": ["красногор"]},
-    3: {"name": "Истринский г.о.", "stems": ["истринск", "истр"]},
-    4: {"name": "Солнечногорский г.о.", "stems": ["солнечногор"]},
-    5: {"name": "Химкинский г.о.", "stems": ["химкинск", "химк"]},
-    6: {"name": "Мытищинский г.о.", "stems": ["мытищин", "мытищ"]},
-    7: {"name": "Балашихинский г.о.", "stems": ["балашихин", "балаш"]},
-    8: {"name": "Люберецкий г.о.", "stems": ["люберец", "любер"]},
+    1: {"name": "Одинцовский г.о.", "stems": ["одинцов", "одинц"]},
+    2: {"name": "Красногорский г.о.", "stems": ["красногор", "красногорск"]},
+    3: {"name": "Истринский г.о.", "stems": ["истринск", "истра", "истр"]},
+    4: {"name": "Солнечногорский г.о.", "stems": ["солнечногор", "солнечн"]},
+    5: {"name": "Химкинский г.о.", "stems": ["химкинск", "химки", "химк"]},
+    6: {"name": "Мытищинский г.о.", "stems": ["мытищин", "мытищи", "мытищ"]},
+    7: {"name": "Балашихинский г.о.", "stems": ["балаших", "балашиха", "балашихин", "балаш"]},
+    8: {"name": "Люберецкий г.о.", "stems": ["люберец", "люберцы", "любер"]},
     9: {"name": "Раменский г.о.", "stems": ["раменск"]},
     10: {"name": "Домодедовский г.о.", "stems": ["домодедов"]},
     11: {"name": "Ленинский г.о.", "stems": ["ленинск"]},
     12: {"name": "Подольский г.о.", "stems": ["подольск", "подол"]},
 }
 
+def extract_municipality_hint(text: str) -> Optional[str]:
+    """Detect municipality/ГО in text. Returns normalized hint string."""
+    if not text:
+        return None
+    t = " " + " ".join(str(text).lower().replace("ё", "е").split()) + " "
+    m = re.search(r"(?:\bго\b|\bг\.о\.|городской\s+округ)\s+([а-я\-\s]{3,40})", t, re.IGNORECASE)
+    if m:
+        cand = re.sub(r"\s{2,}", " ", m.group(1).strip())
+        return cand[:60]
+    for _, info in ONZS_CATEGORIES.items():
+        name = (info.get("name") or "").lower().replace("ё", "е")
+        for stem in info.get("stems", []):
+            st = str(stem).lower().replace("ё", "е")
+            if st and st in t:
+                return name
+    return None
+
+
 def categorize_by_location(text: str) -> Optional[int]:
-    """Categorize text by location based on word stems."""
-    text_lower = text.lower()
-    words = set(re.findall(r'\b\w{3,}\b', text_lower))
+    """Categorize by municipality/location based on stems and explicit 'ГО/г.о.' patterns."""
+    if not text:
+        return None
+    text_lower = " ".join(str(text).lower().replace("ё", "е").split())
+
+    m = re.search(r"(?:\bго\b|\bг\.о\.|городской\s+округ)\s+([а-я\-\s]{3,40})", text_lower, re.IGNORECASE)
+    if m:
+        cand = m.group(1).strip()
+        for cat_id, info in ONZS_CATEGORIES.items():
+            nm = (info.get("name") or "").lower().replace("ё", "е")
+            if nm in cand:
+                return cat_id
+            for stem in info.get("stems", []):
+                if str(stem).lower().replace("ё", "е") in cand:
+                    return cat_id
+
+    words = set(re.findall(r"\b[\w\-]{3,}\b", text_lower))
     for cat_id, info in ONZS_CATEGORIES.items():
-        for stem in info["stems"]:
-            for word in words:
-                if stem in word:
+        for stem in info.get("stems", []):
+            stem2 = str(stem).lower().replace("ё", "е")
+            for w in words:
+                if stem2 and stem2 in w:
                     return cat_id
     return None
+
  
 def build_admin_keyboard() -> Dict: 
     thr = get_prob_threshold() 
@@ -1579,10 +1363,6 @@ def extract_posts(html: str) -> List[Dict]:
     return posts 
  
 def process_channel(channel_username: str) -> List[Dict]: 
-    # Forced blacklist (e.g., to exclude official channels)
-    if normalize_channel(channel_username) in {normalize_channel(b) for b in BLACKLIST_CHANNELS}:
-        log.info(f"[SKIP] Channel blacklisted: {channel_username}")
-        return []
     url = f"https://t.me/s/{channel_username}" 
     html = fetch_channel_page(url) 
     if not html: 
@@ -1626,25 +1406,31 @@ def scan_once() -> List[Dict]:
     return all_hits 
  
 def extract_geo_info(text: str) -> Dict:
-    """Extracts geographic information from text using regex."""
-    info = {}
+    """Extract geographic information from text (cadastre / coords / address / municipality_hint)."""
+    info: Dict = {}
+    if not text:
+        return info
+
     cadastre = CADASTRE_RE.search(text)
     if cadastre:
         info["cadastral_number"] = cadastre.group(0)
-    
+
     coords = COORD_RE.search(text)
     if coords:
         info["coordinates"] = coords.group(0)
 
-    address = ADDRESS_RE.search(text)
-    if address:
-        info["address"] = address.group(0)
-    
+    addr = extract_address_from_text(text)
+    if addr:
+        info["address"] = addr
+
+    mun = extract_municipality_hint(text)
+    if mun:
+        info["municipality_hint"] = mun
+
     return info
 
+
 YANDEX_GEOCODER_API_KEY = os.getenv("YANDEX_GEOCODER_API_KEY", "34ec9307-a9b2-4708-9296-4b2d6d6e721b")
-ENABLE_RGIS_LOOKUP = str(os.getenv("ENABLE_RGIS_LOOKUP", "1")).strip().lower() in ("1","true","yes","on")
-RGIS_CACHE_TTL_HOURS = int(os.getenv("RGIS_CACHE_TTL_HOURS", "24"))
 
 def enrich_geo_info(geo_info: Dict) -> Dict:
     """Enriches geo information using Yandex Geocoder API."""
@@ -1831,70 +1617,6 @@ def rgis_fetch_planning_by_cadastre(cadastral_number: str) -> Dict:
             
     return geo_info
 
-
-# --- Cadastre lookup fallback (no Playwright) ---
-# Uses public PKK (Rosreestr) endpoints when available. If the endpoint changes,
-# the scraper will just skip enrichment without failing the whole card.
-def lookup_cadastre_pkk(cn: str) -> Dict:
-    """
-    Try to resolve cadastral number to an address and basic attributes via PKK (Rosreestr).
-    Returns dict with keys: address, raw (optional).
-    """
-    cn = (cn or "").strip()
-    if not cn:
-        return {}
-    try:
-        # search object by text
-        s_url = "https://pkk.rosreestr.ru/api/features/1"
-        r = requests.get(s_url, params={"text": cn}, timeout=HTTP_TIMEOUT)
-        if not r.ok:
-            return {}
-        js = r.json()
-        feats = (js or {}).get("features") or []
-        if not feats:
-            return {}
-        fid = feats[0].get("attrs", {}).get("id") or feats[0].get("id")
-        if not fid:
-            return {}
-        d_url = f"https://pkk.rosreestr.ru/api/features/1/{fid}"
-        r2 = requests.get(d_url, timeout=HTTP_TIMEOUT)
-        if not r2.ok:
-            return {}
-        js2 = r2.json() or {}
-        attrs = (js2.get("feature") or {}).get("attrs") or {}
-        # different schemas exist; best-effort
-        addr = attrs.get("address") or attrs.get("readable_address") or attrs.get("location") or ""
-        out = {}
-        if addr:
-            out["address"] = str(addr).strip()
-        out["pkk_raw"] = attrs
-        return out
-    except Exception as e:
-        log.error(f"PKK cadastre lookup error: {e}")
-        return {}
-
-def enrich_geo_info_fallback(geo_info: Dict) -> Dict:
-    """
-    Fallback enrichment without Playwright:
-    - If cadastre exists and address is missing -> try PKK to get address.
-    - If we got address -> forward geocode to coords.
-    """
-    if not isinstance(geo_info, dict):
-        return {}
-    cn = geo_info.get("cadastral_number")
-    if cn and not geo_info.get("address"):
-        pkk = lookup_cadastre_pkk(cn)
-        if pkk.get("address"):
-            geo_info["address"] = pkk["address"]
-        geo_info.setdefault("sources", {})
-        geo_info["sources"]["pkk"] = True if pkk else False
-
-    # Reuse existing Yandex geocoder enrichment for coords/address
-    try:
-        geo_info = enrich_geo_info(geo_info)
-    except Exception:
-        pass
-    return geo_info
 def generate_card(hit: Dict) -> Dict:
     cid = generate_card_id()
     card = {
@@ -1912,18 +1634,7 @@ def generate_card(hit: Dict) -> Dict:
 
     # Extract and enrich geo info
     geo_info = extract_geo_info(card["text"])
-    card["geo_info"] = enrich_geo_info_fallback(geo_info)
-    # --- RGIS (Playwright): lookup planning info by cadastral number ---
-    if ENABLE_RGIS_LOOKUP:
-        cadastral = (card.get("geo_info") or {}).get("cadastral_number")
-        if cadastral:
-            try:
-                rgis_res = rgis_lookup_playwright(cadastral)
-                card["rgis"] = rgis_res
-                if isinstance(rgis_res, dict) and rgis_res.get("ok") and rgis_res.get("panel_text"):
-                    card["geo_info"]["rgis_text"] = (rgis_res.get("panel_text") or "")[:6000]
-            except Exception as e:
-                card["rgis"] = {"ok": False, "error": str(e), "cadastral": cadastral}
+    card["geo_info"] = enrich_geo_info(geo_info)
     # RGIS stage (trace): if you later enrich geo_info from RGIS, log it here
     add_onzs_trace(card, "RGIS", {
         "cadastral_number": (card.get("geo_info") or {}).get("cadastral_number"),
@@ -1934,7 +1645,7 @@ def generate_card(hit: Dict) -> Dict:
     })
     # If cadastral number exists, query RGIS via Playwright and store raw result for AI/context
     cad = (card.get("geo_info") or {}).get("cadastral_number")
-    if cad:
+    if ENABLE_RGIS_LOOKUP and cad:
         rg = rgis_fetch_planning_by_cadastre(str(cad))
         if rg.get("rgis_ok"):
             card["geo_info"]["rgis_raw"] = rg.get("rgis_raw_text")
@@ -2043,7 +1754,7 @@ def apply_card_action(card_id: str, action: str, from_user: int) -> Tuple[str, b
         dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
         return (f"Уже обработано: {dec} (админ {by}, {dt})", False)
 
-    if action not in ("work", "wrong"):
+    if action not in ("work", "wrong", "attach"):
         return ("Неизвестное действие.", False)
 
     card = load_card(card_id)
@@ -2060,6 +1771,9 @@ def apply_card_action(card_id: str, action: str, from_user: int) -> Tuple[str, b
         return ("Выберите статус:", True)
     elif action == "wrong":
         new_status, label, msg = "wrong", "wrong", "Статус: НЕВЕРНО ❌"
+    else: # attach
+        new_status, label, msg = "bind", "attach", "Статус: ПРИВЯЗАТЬ 📎"
+
     card["status"] = new_status
     card.setdefault("history", []).append({"event": f"set_{new_status}", "from_user": int(from_user), "ts": now_ts()})
     save_card(card)
@@ -2081,7 +1795,9 @@ def build_kpi_text() -> str:
         return "📊 KPI: данных обучения пока нет." 
     total = sum(int(r[1]) for r in rows) 
     work = sum(int(r[2]) for r in rows) 
-    wrong = sum(int(r[3]) for r in rows)    acc = (work / total * 100.0) if total > 0 else 0.0 
+    wrong = sum(int(r[3]) for r in rows) 
+    attach = sum(int(r[4]) for r in rows) 
+    acc = (work / total * 100.0) if total > 0 else 0.0 
     last_day = rows[-1][0] 
     return ( 
         "📊 KPI (самострой-контроль)\n" 
@@ -2089,7 +1805,8 @@ def build_kpi_text() -> str:
         f"Всего решений: {total}\n" 
         f"В работу: {work}\n" 
         f"Неверно: {wrong}\n" 
-                f"Доля полезных (в работу+привязать): {acc:.1f}%\n" 
+         
+        f"Доля полезных (в работу): {acc:.1f}%\n" 
     ) 
  
 def build_report_xlsx() -> str:
@@ -2104,9 +1821,9 @@ def build_report_xlsx() -> str:
             ws.append([k.strip(), v.strip()])
 
     ws2 = wb.create_sheet("TrainingDaily")
-    ws2.append(["day", "total", "work", "wrong"])
+    ws2.append(["day", "total", "work", "wrong", "attach"])
     for r in _fetch_train_daily_last(90):
-        ws2.append(list(r)[:4])
+        ws2.append(list(r))
 
     ws3 = wb.create_sheet("ChannelBias")
     ws3.append(["channel", "bias_points"])
@@ -2177,10 +1894,14 @@ def build_trainplot_png(days: int = 60) -> str:
     days_list = [r[0] for r in rows] 
     total = [int(r[1]) for r in rows] 
     work = [int(r[2]) for r in rows] 
-    wrong = [int(r[3]) for r in rows]    plt.plot(days_list, total, label="total") 
+    wrong = [int(r[3]) for r in rows] 
+    attach = [int(r[4]) for r in rows] 
+ 
+    plt.plot(days_list, total, label="total") 
     plt.plot(days_list, work, label="work") 
     plt.plot(days_list, wrong, label="wrong") 
-plt.xticks(rotation=45, ha="right") 
+    plt.plot(days_list, attach, label="work") 
+    plt.xticks(rotation=45, ha="right") 
     plt.legend() 
     plt.tight_layout() 
     plt.savefig(out_path, dpi=150, bbox_inches="tight") 
@@ -2242,13 +1963,6 @@ def handle_callback_query(upd: Dict):
             answer_callback(cb_id, "Только администраторы могут менять статус.", show_alert=True)
             return
         _, card_id, action = data.split(":", 2)
-
-        # Backward compatibility: old messages may still have "attach" button
-        if action == "attach":
-            if chat_id and message_id:
-                edit_reply_markup(chat_id, message_id, reply_markup=None)
-            answer_callback(cb_id, "Кнопка «Привязать» отключена. Используйте «В работу» или «Неверно».", show_alert=True)
-            return
         card = load_card(card_id)
 
         if not card:
@@ -2312,13 +2026,6 @@ def handle_callback_query(upd: Dict):
             answer_callback(cb_id, "Только администраторы могут менять статус.", show_alert=True)
             return
         _, card_id, action = data.split(":", 2)
-
-        # Backward compatibility: old messages may still have "attach" button
-        if action == "attach":
-            if chat_id and message_id:
-                edit_reply_markup(chat_id, message_id, reply_markup=None)
-            answer_callback(cb_id, "Кнопка «Привязать» отключена. Используйте «В работу» или «Неверно».", show_alert=True)
-            return
         if action == "add":
             ADMIN_STATE[from_user] = f"await_comment:{card_id}"
             send_message(chat_id, "Пожалуйста, введите комментарий для карточки.")
@@ -2588,27 +2295,23 @@ def poll_updates_loop():
  
             if not data.get("ok"):
                 if data.get("error_code") == 409:
-    log.error("getUpdates conflict (409). Another instance is running.")
-    global LAST_CONFLICT_ALERT_TS
-    # Send at most once per hour, then exit to avoid duplicate instances spamming Telegram.
-    if now_ts() - LAST_CONFLICT_ALERT_TS > 3600:
-        alert_msg = (
-            "🚨 ВНИМАНИЕ: ОБНАРУЖЕН КОНФЛИКТ ЭКЗЕМПЛЯРОВ БОТА (ОШИБКА 409)\n\n"
-            "Другой процесс/сервер уже использует этот токен Telegram, что мешает обработке обновлений.\n\n"
-            "Причина: запущено несколько копий бота с одним и тем же BOT_TOKEN или включён webhook.\n"
-            "Решение: оставьте только ОДИН сервис/контейнер; отключите webhook (deleteWebhook).\n\n"
-            "Этот экземпляр сейчас завершится, чтобы не мешать рабочему."
-        )
-        recipients = list(set(list_users_by_role("admin") + list_users_by_role("leadership")))
-        for uid in recipients:
-            try:
-                send_message(uid, alert_msg)
-            except Exception:
-                pass
-        LAST_CONFLICT_ALERT_TS = now_ts()
-    # Exit so that the "winning" instance can continue serving updates.
-    raise SystemExit(0)
-
+                    log.error("getUpdates conflict (409). Another instance is running.")
+                    global LAST_CONFLICT_ALERT_TS
+                    if now_ts() - LAST_CONFLICT_ALERT_TS > 3600: # 1 hour cooldown
+                        alert_msg = (
+                            "🚨 ВНИМАНИЕ: ОБНАРУЖЕН КОНФЛИКТ ЭКЗЕМПЛЯРОВ БОТА (ОШИБКА 409)\n\n"
+                            "Другой процесс или сервер уже использует этот токен Telegram, что мешает обработке обновлений.\n\n"
+                            "• **Причина:** Запущено несколько копий бота с одним и тем же BOT_TOKEN.\n"
+                            "• **Решение:** Остановите все лишние экземпляры. Убедитесь, что бот запущен только на одном сервере."
+                        )
+                        recipients = list(set(list_users_by_role('admin') + list_users_by_role('leadership')))
+                        for uid in recipients:
+                            try:
+                                send_message(uid, alert_msg)
+                            except Exception: pass
+                        LAST_CONFLICT_ALERT_TS = now_ts()
+                    time.sleep(60)
+                    continue
                 log.error(f"getUpdates error: {data}")
                 time.sleep(3); continue
  
