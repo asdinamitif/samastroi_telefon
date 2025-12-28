@@ -6,7 +6,6 @@ ENV PLAYWRIGHT_BROWSERS_PATH=0
 
 WORKDIR /app
 
-# Системные зависимости для Playwright (Chromium)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     wget \
@@ -36,14 +35,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
-# Python зависимости
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Установка Chromium для Playwright
 RUN python -m playwright install chromium
 
-# Код
+# ⬇⬇⬇ КЛЮЧЕВАЯ СТРОКА
 COPY samastroi_scraper.py /app/samastroi_scraper.py
 COPY onzs_catalog.xlsx /app/onzs_catalog.xlsx
 
