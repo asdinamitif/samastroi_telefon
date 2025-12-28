@@ -1766,9 +1766,12 @@ def send_card_to_group(card: Dict) -> Optional[int]:
     return msg["message_id"] 
  
 def apply_card_action(card_id: str, action: str, from_user: int) -> Tuple[str, bool]:
-    """
-    Returns (message, decided_now).
+    """Returns (message, decided_now).
+
     decided_now=True only for the first admin that made the decision.
+
+    NOTE: Button/flow "Привязать" (attach) полностью удалён. Для старых сообщений с устаревшими callback_data
+    вернём "Неизвестное действие" и снимем клавиатуру.
     """
     existing = decision_exists(card_id)
     if existing:
@@ -1776,7 +1779,7 @@ def apply_card_action(card_id: str, action: str, from_user: int) -> Tuple[str, b
         dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
         return (f"Уже обработано: {dec} (админ {by}, {dt})", False)
 
-    if action not in ("work", "wrong", "attach"):
+    if action not in ("work", "wrong"):
         return ("Неизвестное действие.", False)
 
     card = load_card(card_id)
@@ -1788,19 +1791,20 @@ def apply_card_action(card_id: str, action: str, from_user: int) -> Tuple[str, b
         return ("Уже обработано другим администратором.", False)
 
     old_status = card.get("status", "new")
+
     if action == "work":
-        # The 'work' action now triggers the next step in the flow, handled in handle_callback_query
+        # Следующий шаг (выбор конечного статуса) обрабатывается в handle_callback_query
         return ("Выберите статус:", True)
-    elif action == "wrong":
-        new_status, label, msg = "wrong", "wrong", "Статус: НЕВЕРНО ❌"
-    else: # attach
-        new_status, label, msg = "bind", "attach", "Статус: ПРИВЯЗАТЬ 📎"
+
+    # action == "wrong"
+    new_status, label, msg = "wrong", "wrong", "Статус: НЕВЕРНО ❌"
 
     card["status"] = new_status
     card.setdefault("history", []).append({"event": f"set_{new_status}", "from_user": int(from_user), "ts": now_ts()})
     save_card(card)
 
-    append_history({"event": "status_change", "card_id": card_id, "from_user": int(from_user), "old_status": old_status, "new_status": new_status})
+    append_history({"event": "status_change", "card_id": card_id, "from_user": int(from_user),
+                    "old_status": old_status, "new_status": new_status})
     log_training_event(card_id, label, card.get("text", ""), card.get("channel", ""), admin_id=int(from_user))
     return (msg, True)
 
@@ -1818,7 +1822,7 @@ def build_kpi_text() -> str:
     total = sum(int(r[1]) for r in rows) 
     work = sum(int(r[2]) for r in rows) 
     wrong = sum(int(r[3]) for r in rows) 
-    attach = sum(int(r[4]) for r in rows) 
+    attach = 0  # attach flow removed 
     acc = (work / total * 100.0) if total > 0 else 0.0 
     last_day = rows[-1][0] 
     return ( 
@@ -1967,8 +1971,6 @@ def daily_reports_worker():
             log.exception(f"daily_reports_worker error: {e}") 
  
 UPDATE_OFFSET = get_update_offset()
-LAST_CONFLICT_ALERT_TS = 0
- 
 def handle_callback_query(upd: Dict):
     cb = upd.get("callback_query") or {}
     cb_id = cb.get("id")
@@ -2317,23 +2319,51 @@ def poll_updates_loop():
  
             if not data.get("ok"):
                 if data.get("error_code") == 409:
-                    log.error("getUpdates conflict (409). Another instance is running.")
-                    global LAST_CONFLICT_ALERT_TS
-                    if now_ts() - LAST_CONFLICT_ALERT_TS > 3600: # 1 hour cooldown
+                    log.error("getUpdates conflict (409). Another instance is running or webhook is enabled.")
+                    # Shared, cross-replica cooldown via DB (prevents spam if Railway accidentally runs >1 replica).
+                    try:
+                        mp = _get_model_param("last_conflict", {"ts": 0})
+                        last_ts = int(mp.get("ts") or 0)
+                    except Exception:
+                        last_ts = 0
+
+                    # cooldown: 12 hours
+                    if now_ts() - last_ts > 12 * 3600:
                         alert_msg = (
-                            "🚨 ВНИМАНИЕ: ОБНАРУЖЕН КОНФЛИКТ ЭКЗЕМПЛЯРОВ БОТА (ОШИБКА 409)\n\n"
-                            "Другой процесс или сервер уже использует этот токен Telegram, что мешает обработке обновлений.\n\n"
-                            "• **Причина:** Запущено несколько копий бота с одним и тем же BOT_TOKEN.\n"
-                            "• **Решение:** Остановите все лишние экземпляры. Убедитесь, что бот запущен только на одном сервере."
+                            "🚨 ВНИМАНИЕ: ОБНАРУЖЕН КОНФЛИКТ ЭКЗЕМПЛЯРОВ БОТА (ОШИБКА 409)
+
+"
+                            "Другой процесс/сервер уже использует этот BOT_TOKEN, из-за чего кнопки и команды не работают.
+
+"
+                            "Причины (типовые):
+"
+                            "• запущено 2+ деплоя/реплики Railway с одним BOT_TOKEN;
+"
+                            "• параллельно работает другой бот/скрипт (локально/на другом сервере) с тем же BOT_TOKEN;
+"
+                            "• включён webhook у этого токена.
+
+"
+                            "Что сделать: оставить только ОДИН активный экземпляр и выполнить deleteWebhook.
+"
+                            "Railway: Settings → Replicas = 1, и убедиться что нет второго проекта с тем же BOT_TOKEN."
                         )
-                        recipients = list(set(list_users_by_role('admin') + list_users_by_role('leadership')))
+                        recipients = list(set(list_users_by_role("admin") + list_users_by_role("leadership")))
                         for uid in recipients:
                             try:
                                 send_message(uid, alert_msg)
-                            except Exception: pass
-                        LAST_CONFLICT_ALERT_TS = now_ts()
-                    time.sleep(60)
-                    continue
+                            except Exception:
+                                pass
+                        try:
+                            _set_model_param("last_conflict", {"ts": now_ts(), "note": "409 conflict"})
+                        except Exception:
+                            pass
+
+                    # Stop poller to avoid endless 409 spam; scraper continues to run.
+                    log.error("Stopping updates poller due to 409 conflict. Scraper continues in background.")
+                    return
+
                 log.error(f"getUpdates error: {data}")
                 time.sleep(3); continue
  
